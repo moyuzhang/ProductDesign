@@ -1,0 +1,40 @@
+node_modules/
+dist/
+playwright-report/
+test-results/
+coverage/
+*.log
+
+# 运行时数据与备份不纳入版本控制（含数据库/敏感凭据）
+data/
+
+# 本地大目录与外部素材
+.local/
+artifacts/
+screenshots/
+vendor/
+Microi-V8-Engine/
+microi.skills/
+
+# IDE / 工具目录
+.agents/
+.codebuddy/
+.codex/
+.comate/
+.cursor/
+.qoder/
+.trae/
+.vscode/
+.workbuddy/
+.github/
+__pycache__/
+*.pyc
+
+# 临时探针与工具产物
+_probe_*.py
+_schemas.txt
+.tmp-*
+.tmp_*
+tmp_*.log
+better-sqlite3
+.DS_Store
