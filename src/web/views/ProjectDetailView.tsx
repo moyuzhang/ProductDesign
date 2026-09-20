@@ -1049,7 +1049,7 @@ function PlansTab(props: {
   );
 }
 
-function PlanDetailModal(props: {
+export function PlanDetailModal(props: {
   projectId: string;
   plan: PlanItem;
   plans: PlanItem[];
