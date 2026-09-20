@@ -32,6 +32,8 @@ import type {
   DiagramNode,
   Evidence,
   GovernanceRecord,
+  FreeformAsset,
+  FreeformDocument,
   LlmProfile,
   LlmProfileInput,
   Paginated,
@@ -49,6 +51,7 @@ import { assertNoIntroducedDiagramGroupOverlap } from "../shared/diagramGroups.j
 import { normalizeAgentId, normalizeRoleAssignments } from "../shared/planRoles.js";
 import { ensureAgentSecuritySchema } from "./agentSecurity.js";
 import { normalizePrototypePayload, prototypeFingerprint, PROTOTYPE_VERSION_LIMIT } from "../shared/prototype.js";
+import { freeformDocumentFingerprint, normalizeFreeformDocument, FREEFORM_SCHEMA_VERSION } from "../shared/freeform.js";
 
 export function nowIso(): string {
   return new Date().toISOString();
@@ -60,6 +63,13 @@ export function newId(): string {
 
 export class PrototypeDraftConflictError extends Error {}
 export class PrototypeDraftCorruptError extends Error {}
+export class FreeformDraftConflictError extends Error {
+  constructor(message: string, readonly serverUpdatedAt: string | null) { super(message); }
+}
+export class FreeformDocumentCorruptError extends Error {}
+export class FreeformAssetRejectedError extends Error {
+  constructor(message: string, readonly statusCode = 400) { super(message); }
+}
 
 /**
  * 子画布镜像根节点索引：diagramId → 指向该画布的父节点标签集合。
@@ -191,6 +201,26 @@ interface PrototypeDraftRow {
   project_id: string;
   payload: string;
   updated_at: string;
+}
+
+interface FreeformDocumentRow {
+  diagram_id: string;
+  project_id: string;
+  schema_version: number;
+  payload: string;
+  updated_at: string;
+}
+
+interface FreeformAssetRow {
+  id: string;
+  project_id: string;
+  mime: string;
+  sha256: string;
+  byte_size: number;
+  storage_path: string;
+  width: number;
+  height: number;
+  created_at: string;
 }
 
 interface DatabaseModelRow {
@@ -520,6 +550,13 @@ function mapDiagram(r: DiagramRow): Diagram {
     edges: parseArray<Diagram["edges"][number]>(r.edges) as Diagram["edges"],
     groups: parseArray<Diagram["groups"][number]>(r.groups) as Diagram["groups"],
     createdAt: r.created_at, updatedAt: r.updated_at,
+  };
+}
+
+function mapFreeformAsset(r: FreeformAssetRow): FreeformAsset {
+  return {
+    id: r.id, projectId: r.project_id, mime: r.mime, sha256: r.sha256, byteSize: r.byte_size,
+    storagePath: r.storage_path, width: r.width, height: r.height, createdAt: r.created_at,
   };
 }
 
@@ -1506,6 +1543,79 @@ export class Store {
       });
       return { ...stored, updatedAt };
     })();
+  }
+
+  // ---------- 自由层（与交付节点硬隔离：只读写自由层文档与受控资源，不触碰 diagram.nodes） ----------
+
+  getFreeformDocument(diagramId: string): FreeformDocument | undefined {
+    const row = this.db.prepare("SELECT * FROM diagram_freeform_documents WHERE diagram_id = ?").get(diagramId) as FreeformDocumentRow | undefined;
+    if (!row) return undefined;
+    try {
+      return { ...normalizeFreeformDocument(JSON.parse(row.payload), diagramId), updatedAt: row.updated_at };
+    } catch { throw new FreeformDocumentCorruptError("服务器自由层文档数据损坏"); }
+  }
+
+  upsertFreeformDocument(
+    diagramId: string,
+    payload: Pick<FreeformDocument, "schemaVersion" | "elements" | "unsupported">,
+    expectedUpdatedAt: string | null,
+  ): FreeformDocument | undefined {
+    const diagram = this.getDiagram(diagramId);
+    if (!diagram) return undefined;
+    return this.db.transaction(() => {
+      const current = this.db.prepare("SELECT * FROM diagram_freeform_documents WHERE diagram_id = ?").get(diagramId) as FreeformDocumentRow | undefined;
+      if (current ? expectedUpdatedAt !== current.updated_at : expectedUpdatedAt !== null) {
+        throw new FreeformDraftConflictError(current
+          ? `自由层草稿已被其他操作修改；当前 updatedAt=${current.updated_at}`
+          : "自由层草稿尚不存在，首次保存必须使用 expectedUpdatedAt=null", current?.updated_at ?? null);
+      }
+      const updatedAt = nextPrototypeRevision(current?.updated_at);
+      const stored: FreeformDocument = {
+        schemaVersion: FREEFORM_SCHEMA_VERSION,
+        diagramId,
+        elements: payload.elements,
+        unsupported: payload.unsupported ?? [],
+        updatedAt,
+      };
+      this.db.prepare(`INSERT INTO diagram_freeform_documents (diagram_id, project_id, schema_version, payload, updated_at)
+        VALUES (@diagramId, @projectId, @schemaVersion, @payload, @updatedAt)
+        ON CONFLICT(diagram_id) DO UPDATE SET payload=@payload, updated_at=@updatedAt, schema_version=@schemaVersion`).run({
+        diagramId, projectId: diagram.projectId, schemaVersion: FREEFORM_SCHEMA_VERSION,
+        payload: JSON.stringify(stored), updatedAt,
+      });
+      return stored;
+    })();
+  }
+
+  freeformDocumentFingerprint(diagramId: string): string | null {
+    const document = this.getFreeformDocument(diagramId);
+    return document ? freeformDocumentFingerprint(document) : null;
+  }
+
+  insertFreeformAsset(asset: FreeformAsset): FreeformAsset {
+    this.db.prepare(`INSERT INTO freeform_assets (id, project_id, mime, sha256, byte_size, storage_path, width, height, created_at)
+      VALUES (@id, @projectId, @mime, @sha256, @byteSize, @storagePath, @width, @height, @createdAt)`).run({
+      id: asset.id, projectId: asset.projectId, mime: asset.mime, sha256: asset.sha256,
+      byteSize: asset.byteSize, storagePath: asset.storagePath, width: asset.width, height: asset.height,
+      createdAt: asset.createdAt,
+    });
+    return asset;
+  }
+
+  getFreeformAsset(id: string): FreeformAsset | undefined {
+    const row = this.db.prepare("SELECT * FROM freeform_assets WHERE id = ?").get(id) as FreeformAssetRow | undefined;
+    return row ? mapFreeformAsset(row) : undefined;
+  }
+
+  findFreeformAssetBySha(projectId: string, sha256: string): FreeformAsset | undefined {
+    const row = this.db.prepare("SELECT * FROM freeform_assets WHERE project_id = ? AND sha256 = ? LIMIT 1")
+      .get(projectId, sha256) as FreeformAssetRow | undefined;
+    return row ? mapFreeformAsset(row) : undefined;
+  }
+
+  listFreeformAssets(projectId: string): FreeformAsset[] {
+    const rows = this.db.prepare("SELECT * FROM freeform_assets WHERE project_id = ? ORDER BY created_at DESC").all(projectId) as FreeformAssetRow[];
+    return rows.map(mapFreeformAsset);
   }
 
   private ensureAllProjectsHaveMainDiagrams(): void {
@@ -2619,6 +2729,26 @@ CREATE TABLE IF NOT EXISTS prototype_drafts (
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   payload TEXT NOT NULL DEFAULT '{}',
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS diagram_freeform_documents (
+  diagram_id TEXT PRIMARY KEY REFERENCES diagrams(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  schema_version INTEGER NOT NULL DEFAULT 1,
+  payload TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS freeform_assets (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  mime TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  byte_size INTEGER NOT NULL,
+  storage_path TEXT NOT NULL,
+  width INTEGER NOT NULL DEFAULT 0,
+  height INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS llm_profiles (

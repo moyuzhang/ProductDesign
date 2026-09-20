@@ -38,6 +38,8 @@ import type {
   DocumentRevision,
   Diagram,
   Evidence,
+  FreeformAssetSummary,
+  FreeformDocument,
   GovernanceRecord,
   LlmConnectionCheck,
   LlmProfile,
@@ -80,6 +82,59 @@ async function request<T>(method: string, url: string, body?: unknown): Promise<
     }
     throw new Error(`${message}（HTTP ${response.status}）`);
   }
+  return (await response.json()) as T;
+}
+
+/** 自由层保存冲突：服务端已有更新版本，调用方必须让用户选择处置方式。 */
+export class FreeformConflictError extends Error {
+  readonly serverUpdatedAt: string;
+  constructor(message: string, serverUpdatedAt: string) {
+    super(message);
+    this.name = "FreeformConflictError";
+    this.serverUpdatedAt = serverUpdatedAt;
+  }
+}
+
+async function errorMessageOf(response: Response, fallback: string): Promise<string> {
+  let message = response.statusText || fallback;
+  try {
+    const payload = (await response.json()) as { message?: string };
+    if (payload?.message) message = payload.message;
+  } catch {
+    /* ignore */
+  }
+  return message;
+}
+
+async function saveFreeformDocumentRequest<T>(id: string, body: unknown): Promise<T> {
+  const response = await fetch(`/api/diagrams/${id}/freeform`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (response.status === 409) {
+    let message = "自由层保存冲突";
+    let serverUpdatedAt = "";
+    try {
+      const payload = (await response.json()) as { message?: string; serverUpdatedAt?: string };
+      if (payload?.message) message = payload.message;
+      if (payload?.serverUpdatedAt) serverUpdatedAt = payload.serverUpdatedAt;
+    } catch {
+      /* ignore */
+    }
+    throw new FreeformConflictError(message, serverUpdatedAt);
+  }
+  if (!response.ok) throw new Error(`${await errorMessageOf(response, "请求失败")}（HTTP ${response.status}）`);
+  return (await response.json()) as T;
+}
+
+async function uploadFreeformAssetRequest<T>(projectId: string, blob: Blob, mime: string): Promise<T> {
+  const response = await fetch(`/api/projects/${projectId}/freeform-assets`, {
+    method: "POST",
+    headers: { "content-type": mime },
+    body: blob,
+  });
+  if (!response.ok) throw new Error(`${await errorMessageOf(response, "上传失败")}（HTTP ${response.status}）`);
   return (await response.json()) as T;
 }
 
@@ -236,6 +291,14 @@ export const api = {
   getPrototypeDraft: (id: string) => request<PrototypeStored | null>("GET", `/api/diagrams/${id}/prototype`),
   savePrototypeDraft: (id: string, body: Omit<PrototypeStored, "updatedAt"> & { expectedUpdatedAt: string | null }) =>
     request<PrototypeStored>("PATCH", `/api/diagrams/${id}/prototype`, body),
+  getFreeformDocument: (id: string) => request<FreeformDocument | null>("GET", `/api/diagrams/${id}/freeform`),
+  saveFreeformDocument: (
+    id: string,
+    body: { schemaVersion: 1; elements: FreeformDocument["elements"]; unsupported?: FreeformDocument["unsupported"]; expectedUpdatedAt: string | null },
+  ) => saveFreeformDocumentRequest<FreeformDocument>(id, body),
+  uploadFreeformAsset: (projectId: string, blob: Blob, mime: string) =>
+    uploadFreeformAssetRequest<FreeformAssetSummary>(projectId, blob, mime),
+  freeformAssetUrl: (assetId: string) => `/api/freeform-assets/${encodeURIComponent(assetId)}`,
 
   listDatabaseModels: (projectId?: string) => request<DatabaseModel[]>("GET", `/api/database-models${qs({ projectId })}`),
   pageDatabaseModels: (filter: { projectId?: string; q?: string; dialect?: string; offset?: number; limit?: number } = {}) =>

@@ -11,6 +11,7 @@ import { useWorkspace } from "./workspace";
 import { agentVisibleContent, useAgentUiBridge } from "./agentUiBridge";
 import { DocumentReferencePanel } from "./DocumentReferencePanel";
 import { PrototypeDesigner } from "./PrototypeDesigner";
+import { WhiteboardFreeformCanvas } from "./WhiteboardFreeformCanvas";
 
 type CanvasTemplateId = "blank" | "arch" | "flow" | "module" | "usecase";
 
@@ -501,6 +502,7 @@ function CanvasEditor(props: {
   };
   const [typeMenuOpen, setTypeMenuOpen] = useState(false);
   const [prototypeOpen, setPrototypeOpen] = useState(false);
+  const [freeformOpen, setFreeformOpen] = useState(false);
   const [renameTab, setRenameTab] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const escapedRef = useRef(false);
@@ -736,6 +738,9 @@ function CanvasEditor(props: {
         <button className="btn btn-ghost btn-sm" onClick={() => setPrototypeOpen(true)} title="打开应用页面原型设计器">
           <PenLine size={14} /> 页面原型
         </button>
+        <button className="btn btn-ghost btn-sm" onClick={() => setFreeformOpen(true)} title="打开自由创作与富媒体工具（自由元素不进入交付门禁）">
+          <Shapes size={14} /> 自由层
+        </button>
         <div className="header-actions">
           {hint ? <span className="save-hint">{hint}</span> : null}
           {props.diagram.type === "main" ? (
@@ -844,10 +849,17 @@ function CanvasEditor(props: {
           onRegisterApi={(api) => { editorApiRef.current = api; }}
           onCommit={(n, e, g) => { setNodes(n); setEdges(e); setGroups(g); }}
           onSelectionChange={setSelection}
-          keyboardDisabled={prototypeOpen}
+          keyboardDisabled={prototypeOpen || freeformOpen}
         />
       </div>
       {prototypeOpen ? <PrototypeDesigner diagramId={props.diagram.id} title={title} onClose={() => setPrototypeOpen(false)} /> : null}
+      {freeformOpen ? <WhiteboardFreeformCanvas
+        diagramId={props.diagram.id}
+        projectId={props.diagram.projectId}
+        title={title}
+        deliveryNodes={nodes.map((node) => ({ id: node.id, label: node.label }))}
+        onClose={() => setFreeformOpen(false)}
+      /> : null}
     </div>
   );
 }

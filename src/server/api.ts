@@ -1,9 +1,10 @@
 import { claimTaskPackage } from "./claimTaskPackage.js";
 import { z } from "zod";
 import type { FastifyInstance, FastifyReply } from "fastify";
-import { timingSafeEqual } from "node:crypto";
-import { statSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
+import { mkdirSync, statSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import sharp from "sharp";
 import {
   DESIGN_DOC_STATUSES,
   DESIGN_DOC_CATEGORIES,
@@ -59,8 +60,20 @@ import {
 } from "../shared/databaseSchemas.js";
 import { collectGitEvidence } from "./collectors.js";
 import { createBackupFile, loadBackupFile, storageRetentionSummary } from "./backups.js";
-import { PrototypeDraftConflictError, PrototypeDraftCorruptError, Store, nowIso } from "./db.js";
+import { PrototypeDraftConflictError, PrototypeDraftCorruptError, FreeformDraftConflictError, FreeformDocumentCorruptError, FreeformAssetRejectedError, Store, nowIso } from "./db.js";
 import { prototypeSaveSchema } from "../shared/prototype.js";
+import {
+  applyFreeformAssetSecurityHeaders,
+  assertNoDeliveryFieldLeak,
+  freeformAssetMimeFromMagic,
+  freeformSaveSchema,
+  isFreeformAssetMimeAllowed,
+  isFreeformAssetMimeDenied,
+  normalizeFreeformAssetMime,
+  FREEFORM_ASSET_ID_PREFIX,
+  FREEFORM_ASSET_MAX_BYTES,
+  FREEFORM_ASSET_MIME_WHITELIST,
+} from "../shared/freeform.js";
 import { DISPLAY_TIME_ZONE, formatInstantAsShanghaiIso } from "../shared/time.js";
 import { validateDiagramDeliveryTransition, validateDocumentNodeBinding, validateDocumentReferenceTarget } from "./domain.js";
 import {
@@ -2314,6 +2327,109 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       if (cause instanceof PrototypeDraftCorruptError) return reply.code(500).send({ message: cause.message });
       throw cause;
     }
+  });
+
+  // ---------- 自由创作层（与交付节点硬隔离，见设计 R1–R6） ----------
+
+  app.get("/api/diagrams/:id/freeform", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const diagram = store.getDiagram(id);
+    if (!diagram) return reply.code(404).send({ message: "画布不存在" });
+    try {
+      const document = store.getFreeformDocument(id);
+      return document ?? null;
+    } catch (cause) {
+      if (cause instanceof FreeformDocumentCorruptError) return reply.code(500).send({ message: cause.message });
+      throw cause;
+    }
+  });
+
+  app.patch("/api/diagrams/:id/freeform", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const diagram = store.getDiagram(id);
+    if (!diagram) return reply.code(404).send({ message: "画布不存在" });
+    // 自由元素不得携带任何交付状态字段：命中即 400，绝不静默忽略。
+    assertNoDeliveryFieldLeak({ elements: (request.body as { elements?: unknown })?.elements, unsupported: (request.body as { unsupported?: unknown })?.unsupported });
+    const body = parse(freeformSaveSchema, request.body);
+    try {
+      const next = store.upsertFreeformDocument(id, {
+        schemaVersion: body.schemaVersion, elements: body.elements, unsupported: body.unsupported,
+      }, body.expectedUpdatedAt);
+      if (!next) return reply.code(404).send({ message: "画布不存在" });
+      audit(store, request.body as ActorHint, {
+        projectId: diagram.projectId, entityType: "freeformDocument", entityId: id, action: "update",
+        before: null, after: { updatedAt: next.updatedAt, elementCount: next.elements.length },
+      });
+      return next;
+    } catch (cause) {
+      if (cause instanceof FreeformDraftConflictError) {
+        return reply.code(409).send({ code: "FREEFORM_DRAFT_CONFLICT", message: cause.message, serverUpdatedAt: cause.serverUpdatedAt });
+      }
+      if (cause instanceof FreeformDocumentCorruptError) return reply.code(500).send({ message: cause.message });
+      throw cause;
+    }
+  });
+
+  // 上传只接受白名单图片的原始二进制；multipart 之外的一切载体都被显式拒绝。
+  for (const mime of FREEFORM_ASSET_MIME_WHITELIST) {
+    app.addContentTypeParser(mime, { parseAs: "buffer" }, (_request, body, done) => done(null, body));
+  }
+  app.addContentTypeParser(["image/svg+xml", "text/html", "application/javascript", "text/javascript", "application/xhtml+xml"],
+    { parseAs: "buffer" }, (_request, body, done) => done(Object.assign(
+      new Error("该类型可携带脚本或可执行内容，禁止作为自由层图片资源上传"), { statusCode: 400, code: "FREEFORM_ASSET_MIME_FORBIDDEN" }), undefined));
+
+  app.post("/api/projects/:id/freeform-assets", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在" });
+    try {
+      const declared = normalizeFreeformAssetMime(String(request.headers["content-type"] ?? ""));
+      if (isFreeformAssetMimeDenied(declared)) {
+        throw new FreeformAssetRejectedError("该类型可携带脚本或可执行内容，禁止作为自由层图片资源上传");
+      }
+      if (!isFreeformAssetMimeAllowed(declared) || !declared) {
+        throw new FreeformAssetRejectedError(`自由层图片只接受 ${FREEFORM_ASSET_MIME_WHITELIST.join(" / ")}，当前为 ${declared || "(未声明)"}`);
+      }
+      const buffer = Buffer.isBuffer(request.body) ? request.body : Buffer.alloc(0);
+      if (!buffer.length) throw new FreeformAssetRejectedError("上传内容为空");
+      if (buffer.length > FREEFORM_ASSET_MAX_BYTES) throw new FreeformAssetRejectedError(`单文件不得超过 ${FREEFORM_ASSET_MAX_BYTES} 字节`, 413);
+      const magic = freeformAssetMimeFromMagic(buffer);
+      if (!magic) throw new FreeformAssetRejectedError("文件头无法识别为受支持的图片格式");
+      if (magic !== declared) throw new FreeformAssetRejectedError(`声明 MIME（${declared}）与真实文件头（${magic}）不一致`);
+      const metadata = await sharp(buffer).metadata();
+      const width = metadata.width ?? 0;
+      const height = metadata.height ?? 0;
+      const sha256 = createHash("sha256").update(buffer).digest("hex");
+      const existing = store.findFreeformAssetBySha(id, sha256);
+      if (existing) {
+        return { id: existing.id, mime: existing.mime, width: existing.width, height: existing.height, sha256: existing.sha256 };
+      }
+      const assetId = `${FREEFORM_ASSET_ID_PREFIX}${randomUUID().replace(/-/g, "")}`;
+      const directory = join(dataDir, "freeform-assets", id);
+      mkdirSync(directory, { recursive: true });
+      const storagePath = join(directory, `${assetId}.bin`);
+      writeFileSync(storagePath, buffer);
+      const asset = store.insertFreeformAsset({
+        id: assetId, projectId: id, mime: declared, sha256, byteSize: buffer.length,
+        storagePath, width, height, createdAt: nowIso(),
+      });
+      audit(store, request.body as ActorHint, {
+        projectId: id, entityType: "freeformAsset", entityId: asset.id, action: "create",
+        before: null, after: { mime: asset.mime, byteSize: asset.byteSize, sha256: asset.sha256 },
+      });
+      return { id: asset.id, mime: asset.mime, width: asset.width, height: asset.height, sha256: asset.sha256 };
+    } catch (cause) {
+      if (cause instanceof FreeformAssetRejectedError) return reply.code(cause.statusCode).send({ message: cause.message });
+      throw cause;
+    }
+  });
+
+  app.get("/api/freeform-assets/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const asset = store.getFreeformAsset(id);
+    if (!asset) return reply.code(404).send({ message: "受控资源不存在" });
+    if (!existsSync(asset.storagePath)) return reply.code(410).send({ message: "受控资源已丢失" });
+    for (const [key, value] of Object.entries(applyFreeformAssetSecurityHeaders())) reply.header(key, value);
+    return reply.type(asset.mime).send(readFileSync(asset.storagePath));
   });
 
   app.post("/api/diagrams", async (request) => {

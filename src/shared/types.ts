@@ -790,6 +790,92 @@ export interface PrototypeStored {
   updatedAt: string;
 }
 
+export const FREEFORM_ELEMENT_KINDS = ["text", "sticky", "rect", "ellipse", "arrow", "ink", "image"] as const;
+export type FreeformElementKind = (typeof FREEFORM_ELEMENT_KINDS)[number];
+
+export const FREEFORM_TONES = ["neutral", "info", "warn", "success"] as const;
+export type FreeformTone = (typeof FREEFORM_TONES)[number];
+
+export interface FreeformStyle {
+  fill?: string;
+  strokeColor?: string;
+  strokeWidth?: number;
+  borderRadius?: number;
+  opacity?: number;
+  textColor?: string;
+  fontSize?: number;
+  fontWeight?: "normal" | "bold";
+  align?: "left" | "center" | "right";
+}
+
+/** 自由元素：只存在于自由层文档，永不写入 diagram.nodes。 */
+export interface FreeformElement {
+  id: string;
+  kind: FreeformElementKind;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rotation: number;
+  groupId: string | null;
+  style: FreeformStyle;
+  locked: boolean;
+  hidden: boolean;
+  createdAt: string;
+  updatedAt: string;
+  text?: string;
+  autoHeight?: boolean;
+  tone?: FreeformTone;
+  cornerStyle?: "sharp" | "rounded";
+  dx?: number;
+  dy?: number;
+  arrowStart?: "none" | "triangle";
+  arrowEnd?: "none" | "triangle";
+  lineStyle?: "solid" | "dashed" | "dotted";
+  points?: Array<{ x: number; y: number }>;
+  pressure?: number[];
+  strokeWidth?: number;
+  assetRef?: string;
+  imageFit?: "contain" | "cover";
+  alt?: string;
+  sourceWidth?: number;
+  sourceHeight?: number;
+}
+
+/** 未知 kind / 未知字段的历史元素，原样保留、不静默删除。 */
+export interface FreeformUnknownElement {
+  id: string;
+  raw: Record<string, unknown>;
+}
+
+export interface FreeformDocument {
+  schemaVersion: 1;
+  diagramId: string;
+  elements: FreeformElement[];
+  unsupported: FreeformUnknownElement[];
+  updatedAt: string;
+}
+
+export interface FreeformAsset {
+  id: string;
+  projectId: string;
+  mime: string;
+  sha256: string;
+  byteSize: number;
+  storagePath: string;
+  width: number;
+  height: number;
+  createdAt: string;
+}
+
+export interface FreeformAssetSummary {
+  id: string;
+  mime: string;
+  width: number;
+  height: number;
+  sha256: string;
+}
+
 export type DiagramInput = Omit<Diagram, "id" | "createdAt" | "updatedAt" | "type"> & { id?: string; type?: DiagramType };
 
 export const PROJECT_WORKFLOW_PHASES = [

@@ -488,6 +488,183 @@ input[type="text"], input:not([type]), input[type="date"], input[type="number"],
   .prototype-stage-scroll { padding: 24px; }
 }
 
+/* ---------- freeform authoring layer ---------- */
+
+.freeform-overlay {
+  position: fixed; inset: 0; z-index: 80; display: flex; flex-direction: column;
+  min-width: 0; color: #e8f3fb; background: #09131b; isolation: isolate;
+}
+.freeform-topbar {
+  display: flex; align-items: center; gap: 14px; min-height: 58px; padding: 0 16px;
+  border-bottom: 1px solid #243746; background: linear-gradient(180deg, #142430, #0f1c26);
+}
+.freeform-title { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.freeform-title span { color: #6da9c5; font: 10px "JetBrains Mono", monospace; letter-spacing: .14em; }
+.freeform-title strong { overflow: hidden; color: #eaf7ff; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.freeform-save-state { padding: 4px 8px; border: 1px solid #2d4655; border-radius: 999px; color: #8fa7b5; font: 10px "JetBrains Mono", monospace; }
+.freeform-save-state[data-state="dirty"] { border-color: #8d6b2e; color: #f2c76d; }
+.freeform-save-state[data-state="saving"] { border-color: #336f8e; color: #81cdf3; }
+.freeform-save-state[data-state="conflict"] { border-color: #9b4848; color: #ffaaaa; }
+.freeform-actions { display: flex; align-items: center; gap: 6px; }
+
+.freeform-body {
+  display: grid; min-height: 0; flex: 1;
+  grid-template-columns: 60px 268px minmax(0, 1fr) 300px;
+}
+.freeform-toolbar,
+.freeform-layer-panel,
+.freeform-inspector { min-width: 0; overflow: auto; padding: 12px; background: #101b25; }
+.freeform-toolbar { order: 1; display: flex; flex-direction: column; gap: 6px; padding: 10px 6px; border-right: 1px solid #243746; }
+.freeform-layer-panel { order: 2; border-right: 1px solid #243746; }
+.freeform-stage { order: 3; }
+.freeform-inspector { order: 4; border-left: 1px solid #243746; }
+.freeform-file-input { display: none; }
+
+.freeform-tool {
+  display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%;
+  padding: 8px 2px; border: 1px solid #263d4c; border-radius: 6px;
+  color: #b9cfdc; background: #142430; font: inherit; font-size: 10px; cursor: pointer;
+}
+.freeform-tool:hover:not(:disabled) { border-color: #35617a; color: #e3f4fd; }
+.freeform-tool.active { border-color: #4d93b8; color: #eaf8ff; background: #17384c; }
+.freeform-tool:disabled { cursor: not-allowed; opacity: .45; }
+
+.freeform-panel-heading {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin: 8px 0 8px; color: #9bb5c5; font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+}
+.freeform-panel-heading:first-child { margin-top: 2px; }
+.freeform-panel-heading small { color: #587382; font-size: 9px; letter-spacing: 0; text-transform: none; }
+.freeform-layer-group { display: grid; gap: 5px; margin-bottom: 14px; }
+.freeform-layer-empty { padding: 10px 2px; color: #6d8998; font-size: 11px; }
+.freeform-layer-item {
+  display: flex; align-items: center; gap: 8px; min-height: 32px;
+  padding: 5px 8px; border: 1px solid #263d4c; border-radius: 6px;
+  color: #c8dce8; background: #142430; font-size: 11px; cursor: pointer;
+}
+.freeform-layer-item:hover { border-color: #35617a; }
+.freeform-layer-item.active { border-color: #4d93b8; background: #17384c; }
+.freeform-layer-item.is-hidden { opacity: .55; font-style: italic; }
+.freeform-layer-item.is-locked { border-style: dashed; }
+.freeform-layer-item.is-delivery { cursor: default; border-color: #3d5262; background: #0f1a23; color: #93a9b7; }
+.freeform-layer-item.is-delivery code { color: #6b8798; font: 10px "JetBrains Mono", monospace; }
+.freeform-layer-item.is-unsupported { border-color: #6b5a30; background: #221d12; color: #d8c68f; }
+.freeform-layer-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.freeform-layer-badge {
+  flex: 0 0 auto; padding: 1px 6px; border-radius: 999px;
+  color: #0c1620; background: #7fb6d2; font-size: 9px; letter-spacing: .04em;
+}
+.freeform-layer-badge.kind-text { background: #8fc6e0; }
+.freeform-layer-badge.kind-sticky { background: #e8c56a; }
+.freeform-layer-badge.kind-rect { background: #9fc9a8; }
+.freeform-layer-badge.kind-ellipse { background: #b6a9de; }
+.freeform-layer-badge.kind-arrow { background: #d89f9f; }
+.freeform-layer-badge.kind-ink { background: #8fb9c9; }
+.freeform-layer-badge.kind-image { background: #cfa9d8; }
+.freeform-layer-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; }
+.freeform-layer-actions button {
+  display: grid; width: 22px; height: 22px; place-items: center;
+  border: 0; border-radius: 4px; color: #8fa7b5; background: transparent; cursor: pointer;
+}
+.freeform-layer-actions button:hover:not(:disabled) { color: #e6f4fc; background: #1d3443; }
+.freeform-layer-actions button:disabled { cursor: not-allowed; opacity: .4; }
+
+.freeform-stage { position: relative; display: flex; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; background: #0d1821; }
+.freeform-stage-toolbar {
+  display: flex; align-items: center; gap: 12px; min-height: 44px; padding: 0 14px;
+  border-bottom: 1px solid #203440; color: #8ea9b8; background: #101e28; font-size: 11px;
+}
+.freeform-stage-toolbar strong { color: #dcecf4; font-size: 13px; }
+.freeform-status-readout { flex: 1; }
+.freeform-zoom { display: flex; align-items: center; gap: 4px; }
+.freeform-zoom button {
+  display: grid; min-width: 28px; height: 26px; place-items: center;
+  border: 1px solid #2b4658; border-radius: 5px; color: #cfe4ef; background: #142430;
+  font: inherit; font-size: 11px; cursor: pointer;
+}
+.freeform-zoom button:hover { border-color: #35617a; }
+.freeform-stage-scroll {
+  min-width: 0; min-height: 0; flex: 1; overflow: auto; background-color: #09131b;
+  background-image: linear-gradient(rgba(65, 93, 110, .07) 1px, transparent 1px), linear-gradient(90deg, rgba(65, 93, 110, .07) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+.freeform-viewport { position: relative; width: 100%; height: 100%; min-height: 520px; }
+.freeform-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.freeform-element { outline: none; }
+.freeform-element:focus-visible > * { filter: drop-shadow(0 0 4px #6fc0e6); }
+.freeform-element-legacy { pointer-events: none; }
+.freeform-selection-outline { fill: none; stroke: #5fb6e0; stroke-width: 1; stroke-dasharray: 5 4; }
+.freeform-marquee { position: absolute; border: 1px dashed #5fb6e0; background: rgba(95, 182, 224, .14); pointer-events: none; }
+.freeform-draw-preview { position: absolute; border: 1px dashed #e8c56a; background: rgba(232, 197, 106, .12); pointer-events: none; }
+.freeform-handles { position: absolute; border: 1px solid #5fb6e0; pointer-events: none; }
+.freeform-handle {
+  position: absolute; width: 11px; height: 11px; border: 1px solid #0b1a23;
+  border-radius: 2px; background: #7fc6e8; pointer-events: auto; cursor: pointer;
+}
+.freeform-handle.handle-nw { left: -6px; top: -6px; cursor: nwse-resize; }
+.freeform-handle.handle-n { left: calc(50% - 5.5px); top: -6px; cursor: ns-resize; }
+.freeform-handle.handle-ne { right: -6px; top: -6px; cursor: nesw-resize; }
+.freeform-handle.handle-e { right: -6px; top: calc(50% - 5.5px); cursor: ew-resize; }
+.freeform-handle.handle-se { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.freeform-handle.handle-s { left: calc(50% - 5.5px); bottom: -6px; cursor: ns-resize; }
+.freeform-handle.handle-sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.freeform-handle.handle-w { left: -6px; top: calc(50% - 5.5px); cursor: ew-resize; }
+.freeform-handle.handle-rotate {
+  left: calc(50% - 9px); top: -30px; display: grid; width: 18px; height: 18px;
+  place-items: center; border-radius: 999px; color: #0b1a23; cursor: grab;
+}
+.freeform-text-editor {
+  position: absolute; z-index: 2; box-sizing: border-box; padding: 5px 7px;
+  border: 1px solid #5fb6e0; border-radius: 5px; color: #eaf7ff; background: #10222e;
+  font: inherit; font-size: 13px; line-height: 1.5; resize: none;
+}
+.freeform-announcer {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+}
+.freeform-loading { display: grid; min-height: 240px; place-items: center; color: #8ea9b8; font-size: 12px; }
+
+.freeform-banner {
+  display: flex; z-index: 2; align-items: center; gap: 8px; min-height: 38px;
+  padding: 6px 12px; border-bottom: 1px solid #35556a; color: #bfe1f2; background: #123145; font-size: 11px;
+}
+.freeform-banner span { flex: 1; }
+.freeform-banner.is-error { border-color: #8e464d; color: #ffd1d1; background: #3a1b23; }
+
+.freeform-inspector label { display: grid; gap: 5px; margin-bottom: 11px; color: #91aaba; font-size: 11px; }
+.freeform-inspector input, .freeform-inspector select, .freeform-inspector textarea {
+  box-sizing: border-box; width: 100%; min-height: 32px; padding: 6px 8px;
+  border: 1px solid #2b4658; border-radius: 5px; color: #e5f3fa; background: #0d1a24; font: inherit;
+}
+.freeform-inspector textarea { min-height: 64px; resize: vertical; }
+.freeform-inspector label.has-error input, .freeform-inspector label.has-error textarea { border-color: #c86161; }
+.freeform-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+.freeform-field-grid label { margin-bottom: 9px; }
+.freeform-field-error { color: #ffb3b3; font-size: 10px; }
+.freeform-inspector-empty { padding: 18px 4px; color: #6d8998; font-size: 12px; line-height: 1.6; }
+.freeform-inspector-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
+.freeform-inspector-actions button { min-height: 30px; }
+.freeform-asset-preview {
+  display: block; width: 100%; max-height: 132px; margin-bottom: 11px;
+  border: 1px solid #2b4658; border-radius: 5px; background: #0d1a24; object-fit: contain;
+}
+
+@media (max-width: 1180px) {
+  .freeform-body { display: flex; flex-direction: column; overflow: auto; }
+  .freeform-toolbar { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid #243746; }
+  .freeform-tool { width: 76px; }
+  .freeform-layer-panel { max-height: 220px; border-right: 0; border-bottom: 1px solid #243746; }
+  .freeform-stage { order: 2; min-height: 480px; }
+  .freeform-inspector { border-left: 0; border-top: 1px solid #243746; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .freeform-tool, .freeform-layer-item, .freeform-handle, .freeform-zoom button,
+  .freeform-layer-actions button, .freeform-text-editor {
+    transition: none !important; animation: none !important;
+  }
+}
+
 /* ---------- governed design change ---------- */
 
 .design-change-form { display: grid; gap: 18px; }
