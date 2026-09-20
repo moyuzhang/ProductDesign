@@ -2,6 +2,7 @@ import type { Diagram, DocumentReferenceTargetType } from "../shared/types.js";
 import type { Store } from "./db.js";
 import { inspectNodeWorkflow, inspectProjectFoundation, isWorkflowDeliveryNode } from "./workflow.js";
 import { isExecutableDeliveryPlan } from "./planPolicy.js";
+import { buildChildRootLabelIndex, isChildDiagramRootNode } from "./db.js";
 
 /**
  * Delivery state is persisted inside diagram nodes. Validate only state changes so
@@ -9,6 +10,7 @@ import { isExecutableDeliveryPlan } from "./planPolicy.js";
  */
 export function validateDiagramDeliveryTransition(store: Store, before: Diagram, after: Diagram): string | undefined {
   const previous = new Map(before.nodes.map((node) => [node.id, node]));
+  const childRootLabels = buildChildRootLabelIndex(store.listDiagrams(after.projectId));
   for (const node of after.nodes) {
     if (!isWorkflowDeliveryNode(after, node)) continue;
     const old = previous.get(node.id);
@@ -24,6 +26,10 @@ export function validateDiagramDeliveryTransition(store: Store, before: Diagram,
     if (controlledPlans.length > 0 && (developmentChanged || acceptanceChanged)) {
       return `节点“${node.label}”的开发与验收状态由施工计划自动汇总，请使用计划交付流转`;
     }
+
+    // 子画布镜像根节点是父侧入口节点在子画布内的占位副本，本身不承载交付，
+    // 其开发/验收状态随父侧节点同步，因此不受节点开发门禁约束。
+    if (isChildDiagramRootNode(childRootLabels, after, node)) continue;
 
     if (requirementChanged && node.requirementStatus === "已批准") {
       if (!inspection.descriptionReady) return `节点“${node.label}”需求批准前必须填写功能说明`;

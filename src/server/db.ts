@@ -61,6 +61,29 @@ export function newId(): string {
 export class PrototypeDraftConflictError extends Error {}
 export class PrototypeDraftCorruptError extends Error {}
 
+/**
+ * 子画布镜像根节点索引：diagramId → 指向该画布的父节点标签集合。
+ * 子画布入口节点与父侧入口节点同名，属占位节点，交付状态由父侧节点承载。
+ */
+export function buildChildRootLabelIndex(diagrams: Diagram[]): Map<string, Set<string>> {
+  const index = new Map<string, Set<string>>();
+  for (const diagram of diagrams) {
+    for (const node of diagram.nodes) {
+      for (const childId of node.linkDiagramIds ?? []) {
+        const labels = index.get(childId) ?? new Set<string>();
+        labels.add(node.label.trim().toLowerCase());
+        index.set(childId, labels);
+      }
+    }
+  }
+  return index;
+}
+
+/** 该节点是否为子画布镜像根节点（占位节点，不参与交付门禁）。 */
+export function isChildDiagramRootNode(index: Map<string, Set<string>>, diagram: Diagram, node: DiagramNode): boolean {
+  return Boolean(index.get(diagram.id)?.has(node.label.trim().toLowerCase()));
+}
+
 function nextPrototypeRevision(previous?: string): string {
   const now = Date.now();
   const previousTime = previous ? Date.parse(previous) : Number.NaN;
@@ -938,16 +961,7 @@ export class Store {
       const current = latestPlanByNode.get(plan.diagramNodeId);
       if (!current || current.updatedAt.localeCompare(plan.updatedAt) < 0) latestPlanByNode.set(plan.diagramNodeId, plan);
     }
-    const childRootLabels = new Map<string, Set<string>>();
-    for (const diagram of diagrams) {
-      for (const node of diagram.nodes) {
-        for (const childId of node.linkDiagramIds ?? []) {
-          const labels = childRootLabels.get(childId) ?? new Set<string>();
-          labels.add(node.label.trim().toLowerCase());
-          childRootLabels.set(childId, labels);
-        }
-      }
-    }
+    const childRootLabels = buildChildRootLabelIndex(diagrams);
     const trackedKinds = new Set<string>(PROJECT_WORKFLOW_POLICY.deliveryNodeKinds);
     const trackedDiagramTypes = new Set<string>(PROJECT_WORKFLOW_POLICY.deliveryDiagramTypes);
     const refs: ProjectWorkspaceNode[] = [];
@@ -955,7 +969,7 @@ export class Store {
       if (!trackedDiagramTypes.has(diagram.type)) continue;
       for (const node of diagram.nodes) {
         if (!trackedKinds.has(node.kind)) continue;
-        if (childRootLabels.get(diagram.id)?.has(node.label.trim().toLowerCase())) continue;
+        if (isChildDiagramRootNode(childRootLabels, diagram, node)) continue;
         refs.push({
           diagramId: diagram.id,
           diagramTitle: diagram.title,

@@ -161,6 +161,45 @@ describe("project workflow", () => {
     expect(buildProjectWorkflow(store, projectId)?.nextAction?.code).toBe("start_development");
   });
 
+  it("syncs a child-diagram mirror root node without demanding a development plan", () => {
+    const { store, projectId } = setup();
+    const main = store.listDiagrams(projectId).find((diagram) => diagram.type === "main")!;
+    const parent = {
+      id: "module-orders", kind: "module" as const, label: "订单服务",
+      description: "订单域", owner: "team-a", acceptanceCriteria: "订单可创建",
+      requirementStatus: "已批准" as const, designStatus: "已批准" as const,
+      developmentStatus: "已完成" as const, acceptanceStatus: "已通过" as const,
+      x: 100, y: 100,
+    };
+    const child = store.insertDiagram({
+      projectId, title: "订单服务子画布", type: "functional", edges: [],
+      nodes: [{
+        id: "mirror-orders", kind: "module" as const, label: "订单服务",
+        description: "订单域", owner: "team-a", acceptanceCriteria: "订单可创建",
+        requirementStatus: "已批准" as const, designStatus: "已批准" as const,
+        developmentStatus: "未开发" as const, acceptanceStatus: "未验收" as const,
+        x: 100, y: 100,
+      }],
+    });
+    const withParent = store.updateDiagram(main.id, {
+      nodes: [...main.nodes, { ...parent, linkDiagramIds: [child.id] }],
+    })!;
+    // 镜像根节点被排除在交付节点之外，因此不受"至少需要一个开发计划"门禁约束
+    expect(store.listProjectWorkspaceNodes(projectId, { diagrams: store.listDiagrams(projectId) })
+      .some((item) => item.node.id === "mirror-orders")).toBe(false);
+    const before = store.getDiagram(child.id)!;
+    const after = { ...before, nodes: before.nodes.map((item) => item.id === "mirror-orders"
+      ? { ...item, developmentStatus: "已完成" as const, acceptanceStatus: "已通过" as const }
+      : item) };
+    expect(validateDiagramDeliveryTransition(store, before, after)).toBeUndefined();
+
+    // 非镜像节点仍受开发门禁约束
+    const stillBlocked = { ...withParent, nodes: withParent.nodes.map((item) => item.id === parent.id
+      ? { ...item, developmentStatus: "开发中" as const }
+      : item) };
+    expect(validateDiagramDeliveryTransition(store, withParent, stillBlocked)).toBeTruthy();
+  });
+
   it("routes a completed legacy plan without formal trace back to plan submission", () => {
     const { store, projectId } = setup();
     const brief = store.insertDesignDoc({
