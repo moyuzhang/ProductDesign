@@ -39,6 +39,7 @@ import {
   diagramPolylinePath,
   routeDiagramEdges,
 } from "../../shared/diagramRouting";
+import { PROJECT_WORKFLOW_POLICY } from "../../shared/workflowPolicy";
 import { Badge, formatDateTime } from "../ui";
 import { layoutDiagram } from "./elkLayout";
 import { clampFloatingPanelPosition, createMiniMapProjection, getDiagramBounds, rankDiagramNodes, relatedDiagramNodeIds, resolveDiagramSnap, snapFloatingPanelToCorner, type AlignmentGuides, type FloatingPanelPosition, type FloatingPanelRect } from "./diagramWorkbench";
@@ -77,8 +78,8 @@ const ACCEPTANCE_STATUS_META: Record<DiagramAcceptanceStatus, { color: string; s
   已通过: { color: "#3fb96f", short: "已通过" },
   未通过: { color: "#e05d5d", short: "未通过" },
 };
-const DELIVERY_DIAGRAM_TYPES = new Set(["main", "functional", "deployment"]);
-const DELIVERY_NODE_KINDS = new Set(["module", "feature", "requirement", "interface", "data"]);
+const DELIVERY_DIAGRAM_TYPES = new Set<string>(PROJECT_WORKFLOW_POLICY.deliveryDiagramTypes);
+const DELIVERY_NODE_KINDS = new Set<string>(PROJECT_WORKFLOW_POLICY.deliveryNodeKinds);
 
 const KIND_LABELS: Record<DiagramNodeKind, string> = {
   system: "系统",
@@ -696,7 +697,7 @@ export function buildDiagramSvg(
     }
     const labelY = diagramType === "usecase" && useCaseTypeOf(n) === "actor" ? h / 2 - 5 : diagramType === "usecase" && useCaseTypeOf(n) === "boundary" ? -h / 2 + 20 : 1;
     P.push(`<text x="0" y="${labelY}" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="600" fill="${st.text}">${escXml(n.label)}</text>`);
-    if (diagramType !== "flow" && diagramType !== "usecase" && n.kind !== "system") {
+    if (DELIVERY_DIAGRAM_TYPES.has(diagramType) && DELIVERY_NODE_KINDS.has(n.kind)) {
       const developmentStatus = n.developmentStatus ?? "未开发";
       const acceptanceStatus = n.acceptanceStatus ?? "未验收";
       const developmentMeta = DEVELOPMENT_STATUS_META[developmentStatus];

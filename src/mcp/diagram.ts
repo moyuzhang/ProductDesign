@@ -35,6 +35,7 @@ import {
   moveDiagramManualRoute,
   routeDiagramEdges,
 } from "../shared/diagramRouting.js";
+import { PROJECT_WORKFLOW_POLICY } from "../shared/workflowPolicy.js";
 import { newId, nowIso } from "../server/db.js";
 
 export const diagramNodeSchema = z.object({
@@ -483,6 +484,8 @@ const NODE_STYLE: Record<DiagramNodeKind, { fill: string; stroke: string; text: 
 const KIND_LABELS: Record<DiagramNodeKind, string> = { system: "系统", module: "模块", feature: "功能", requirement: "需求", interface: "接口", data: "数据", note: "备注" };
 const DEVELOPMENT_COLORS = { 未开发: "#718596", 开发中: "#4da3ff", 待验收: "#e2a33c", 已完成: "#3fb96f", 已阻塞: "#e05d5d" } as const;
 const ACCEPTANCE_COLORS = { 未验收: "#718596", 验收中: "#a878eb", 已通过: "#3fb96f", 未通过: "#e05d5d" } as const;
+const DELIVERY_DIAGRAM_TYPES = new Set<string>(PROJECT_WORKFLOW_POLICY.deliveryDiagramTypes);
+const DELIVERY_NODE_KINDS = new Set<string>(PROJECT_WORKFLOW_POLICY.deliveryNodeKinds);
 
 const nodeW = (node: DiagramNode): number => node.w ?? DEFAULT_W;
 const nodeH = (node: DiagramNode): number => node.h ?? DEFAULT_H;
@@ -569,7 +572,7 @@ export function buildDiagramSvg(diagram: Diagram): string {
     if (diagram.type !== "flow" && diagram.type !== "usecase") parts.push(`<text x="${-w / 2 + 10}" y="${-h / 2 + 11}" font-size="9" fill="${style.text}" opacity="0.7">${KIND_LABELS[node.kind]}</text>`);
     const labelY = diagram.type === "usecase" && useCaseTypeOf(node) === "actor" ? h / 2 - 5 : diagram.type === "usecase" && useCaseTypeOf(node) === "boundary" ? -h / 2 + 20 : 1;
     parts.push(`<text x="0" y="${labelY}" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="600" fill="${style.text}">${xml(node.label)}</text>`);
-    if (diagram.type !== "flow" && diagram.type !== "usecase") {
+    if (DELIVERY_DIAGRAM_TYPES.has(diagram.type) && DELIVERY_NODE_KINDS.has(node.kind)) {
       const development = node.developmentStatus ?? "未开发", acceptance = node.acceptanceStatus ?? "未验收";
       parts.push(`<circle cx="${-w / 2 + 11}" cy="${h / 2 - 7}" r="3.2" fill="${DEVELOPMENT_COLORS[development]}"/><text x="${-w / 2 + 18}" y="${h / 2 - 4}" font-size="8.5" fill="#9fb0bf">开发 · ${development}</text>`);
       parts.push(`<circle cx="${w / 2 - 65}" cy="${h / 2 - 7}" r="3.2" fill="${ACCEPTANCE_COLORS[acceptance]}"/><text x="${w / 2 - 58}" y="${h / 2 - 4}" font-size="8.5" fill="#9fb0bf">验收 · ${acceptance}</text>`);

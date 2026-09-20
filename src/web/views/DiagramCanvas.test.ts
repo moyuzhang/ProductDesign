@@ -51,6 +51,57 @@ describe("system root delivery presentation", () => {
     expect(svg).not.toContain("验收 ·");
   });
 
+  it("omits delivery chips for placeholder kinds that carry stale status fields", () => {
+    const nodes: Diagram["nodes"] = [
+      {
+        id: "menu-entry",
+        kind: "note",
+        label: "个人设置与安全",
+        x: 120,
+        y: 80,
+        requirementStatus: "已批准",
+        designStatus: "已批准",
+        developmentStatus: "未开发",
+        acceptanceStatus: "未验收",
+      },
+      {
+        id: "shared-lib",
+        kind: "system",
+        label: "公共组件库",
+        x: 360,
+        y: 80,
+        developmentStatus: "未开发",
+        acceptanceStatus: "未验收",
+      },
+    ];
+    const diagram: Diagram = {
+      id: "diagram",
+      projectId: "project",
+      title: "占位节点",
+      type: "functional",
+      nodes,
+      edges: [],
+      groups: [],
+      createdAt: "2026-09-02T00:00:00.000Z",
+      updatedAt: "2026-09-02T00:00:00.000Z",
+    };
+
+    // 浏览器导出与 MCP 导出必须一致：占位节点不画出交付状态
+    for (const svg of [buildDiagramSvg(nodes, [], [], "functional"), buildMcpDiagramSvg(diagram)]) {
+      expect(svg).not.toContain("开发 ·");
+      expect(svg).not.toContain("验收 ·");
+      expect(svg).toContain("个人设置与安全");
+      expect(svg).toContain("公共组件库");
+    }
+
+    // 交付节点仍保留交付状态
+    const delivery = buildDiagramSvg([
+      { id: "module-a", kind: "module", label: "订单服务", x: 80, y: 80, developmentStatus: "已完成", acceptanceStatus: "已通过" },
+    ], [], [], "functional");
+    expect(delivery).toContain("开发 · 已完成");
+    expect(delivery).toContain("验收 · 已通过");
+  });
+
   it("exports professional edge styling without dropping its visual contract", () => {
     const svg = buildDiagramSvg([
       { id: "a", kind: "feature", label: "A", x: 80, y: 80 },
