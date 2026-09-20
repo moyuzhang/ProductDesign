@@ -284,6 +284,18 @@ describe("REST API", () => {
     expect(patched.statusCode).toBe(200);
     expect(patched.json().riskSummary).toBe("风险待评估");
 
+    // 局部更新必须保持“缺省即不改动”，未提交的字段不得被重置为默认值
+    const detailPatch = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${projectId}`,
+      payload: { summary: "项目目标与范围" },
+    });
+    expect(detailPatch.statusCode, detailPatch.body).toBe(200);
+    // code/name/health/riskSummary 均未被本次请求提交，必须原样保留
+    expect(detailPatch.json()).toMatchObject({
+      summary: "项目目标与范围", code: "TEST1", name: "测试项目", health: "正常", riskSummary: "风险待评估",
+    });
+
     const invalid = await app.inject({
       method: "PATCH",
       url: `/api/projects/${projectId}`,

@@ -246,6 +246,17 @@ function parse<T>(schema: z.ZodType<T>, payload: unknown): T {
   return result.data;
 }
 
+/**
+ * 局部更新必须保持“缺省即不改动”。字段上的 .default() 被 .partial() 包裹后仍会填入默认值，
+ * 会把请求里没提交的字段一并重置（曾导致项目 summary/stage/progress 被静默清空）。
+ * 这里按原始请求体出现过的键裁剪解析结果，恢复真正的局部更新语义。
+ */
+function parsePatch<T>(schema: z.ZodType<T>, payload: unknown): Partial<T> {
+  const parsed = parse(schema, payload) as Record<string, unknown>;
+  const present = new Set(Object.keys((payload ?? {}) as Record<string, unknown>));
+  return Object.fromEntries(Object.entries(parsed).filter(([key]) => present.has(key))) as Partial<T>;
+}
+
 interface PageQuery {
   limit?: string;
   offset?: string;
@@ -584,7 +595,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id } = request.params as { id: string };
     const before = store.getLlmProfile(id);
     if (!before) return reply.code(404).send({ message: "LLM 配置不存在" });
-    const patch = parse(z.object(llmProfileFields).partial(), request.body);
+    const patch = parsePatch(z.object(llmProfileFields).partial(), request.body);
     const next = { ...before, ...patch, models: patch.models ? [...new Set(patch.models)] : before.models };
     if (!next.models.includes(next.defaultModel)) return reply.code(400).send({ message: "默认模型必须包含在模型列表中" });
     if (store.listLlmProfiles().some((item) => item.id !== id && item.name.toLocaleLowerCase() === next.name.toLocaleLowerCase())) {
@@ -1251,7 +1262,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id } = request.params as { id: string };
     const before = store.getProject(id);
     if (!before) return reply.code(404).send({ message: "项目不存在" });
-    const patch = parse(z.object({
+    const patch = parsePatch(z.object({
       ...projectCore,
       repositoryPath: z.string().trim().max(2000),
     }).partial(), request.body);
@@ -1328,7 +1339,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id } = request.params as { id: string };
     const before = store.getNode(id);
     if (!before) return reply.code(404).send({ message: "工作节点不存在" });
-    const patch = parse(z.object(nodeBody).partial().omit({ projectId: true }), request.body);
+    const patch = parsePatch(z.object(nodeBody).partial().omit({ projectId: true }), request.body);
     const node = store.updateNode(id, patch);
     audit(store, request.body as ActorHint, {
       projectId: before.projectId, entityType: "node", entityId: id,
