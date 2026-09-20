@@ -92,6 +92,7 @@ const PLAN_AUDIT_LABELS: Record<PlanItem["auditStatus"], string> = {
 const MANAGER_DECISION_LABELS: Record<PlanItem["managerDecision"], string> = {
   pending: "等待管理员决定", approved: "管理员已批准", rejected: "管理员已拒绝",
 };
+const EXECUTABLE_PLAN_KINDS = new Set<string>(PROJECT_WORKFLOW_POLICY.executablePlanKinds);
 
 function tabFrom(value?: string): TabKey {
   return TAB_LABELS.some(([key]) => key === value) ? value as TabKey : "nodes";
@@ -985,7 +986,7 @@ function PlansTab(props: {
                   <Badge tone={p.status === "已完成" ? "good" : p.status === "已阻塞" ? "bad" : p.status === "进行中" ? "warn" : "muted"}>
                     {p.status}
                   </Badge>
-                  {p.diagramId && p.diagramNodeId ? <Badge tone={p.lifecycleStatus === "accepted" ? "good" : p.lifecycleStatus === "audit_failed" ? "bad" : "neutral"}>{PLAN_LIFECYCLE_LABELS[p.lifecycleStatus]}</Badge> : null}
+                  {EXECUTABLE_PLAN_KINDS.has(p.kind) && p.diagramId && p.diagramNodeId ? <Badge tone={p.lifecycleStatus === "accepted" ? "good" : p.lifecycleStatus === "audit_failed" ? "bad" : "neutral"}>{PLAN_LIFECYCLE_LABELS[p.lifecycleStatus]}</Badge> : null}
                 </td>
                 <td><span className={`plan-pill plan-pill-${PLAN_PRIORITY_TONE[p.priority]}`}>{p.priority}</span></td>
                 <td style={{ minWidth: 100 }}><ProgressBar value={p.progress} /></td>

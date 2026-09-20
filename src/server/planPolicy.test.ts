@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { PlanItem } from "../shared/types.js";
-import { decideDependencyEdit } from "./planPolicy.js";
+import { PROJECT_WORKFLOW_POLICY } from "../shared/workflowPolicy.js";
+import { decideDependencyEdit, isExecutableDeliveryPlan } from "./planPolicy.js";
 
 function plan(overrides: Partial<PlanItem> = {}): PlanItem {
   return {
@@ -51,6 +52,20 @@ function plan(overrides: Partial<PlanItem> = {}): PlanItem {
     ...overrides,
   };
 }
+
+describe("isExecutableDeliveryPlan", () => {
+  // 交付节点/计划种类必须以共享策略为唯一来源，避免各视图手写副本再次漂移
+  it("follows the shared workflow policy instead of a local copy", () => {
+    const executable = new Set<string>(PROJECT_WORKFLOW_POLICY.executablePlanKinds);
+
+    expect(executable).toEqual(new Set(["task"]));
+    for (const kind of ["goal", "milestone", "version"] as const) {
+      expect(executable.has(kind)).toBe(false);
+      expect(isExecutableDeliveryPlan({ kind })).toBe(false);
+    }
+    expect(isExecutableDeliveryPlan({ kind: "task" })).toBe(true);
+  });
+});
 
 describe("decideDependencyEdit", () => {
   it("moves an approved but unstarted task back to rework and invalidates the old approval", () => {

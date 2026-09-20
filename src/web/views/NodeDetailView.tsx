@@ -59,11 +59,13 @@ import { agentVisibleContent, useAgentUiBridge } from "./agentUiBridge";
 import { DocumentReferencePanel } from "./DocumentReferencePanel";
 import { PlanDeliveryPanel } from "./PlanDeliveryPanel";
 import { PLAN_LIFECYCLE_LABELS } from "../../shared/planDelivery";
+import { PROJECT_WORKFLOW_POLICY } from "../../shared/workflowPolicy";
 
 type DetailTab = "overview" | "development" | "delivery" | "documents" | "relations";
 const DETAIL_TABS: DetailTab[] = ["overview", "development", "delivery", "documents", "relations"];
-const DELIVERY_DIAGRAM_TYPES = new Set(["main", "functional", "deployment"]);
-const DELIVERY_NODE_KINDS = new Set(["module", "feature", "requirement", "interface", "data"]);
+const DELIVERY_DIAGRAM_TYPES = new Set<string>(PROJECT_WORKFLOW_POLICY.deliveryDiagramTypes);
+const DELIVERY_NODE_KINDS = new Set<string>(PROJECT_WORKFLOW_POLICY.deliveryNodeKinds);
+const EXECUTABLE_PLAN_KINDS = new Set<string>(PROJECT_WORKFLOW_POLICY.executablePlanKinds);
 
 const DATABASE_OPERATION_LABEL: Record<NodeDatabaseOperation, string> = {
   read: "查询",
@@ -422,8 +424,11 @@ export function NodeDetailView(props: { diagramId: string; nodeId: string; initi
   const visibleTabs = deliveryTracked
     ? DETAIL_TABS
     : DETAIL_TABS.filter((item) => item !== "development" && item !== "delivery");
-  const selectedPlan = plans.find((plan) => plan.id === selectedPlanId)
-    ?? plans.find((plan) => plan.lifecycleStatus !== "accepted")
+  // 施工交付面板只面向可执行施工计划；绑定到本节点的里程碑等层级计划不应抢占选中态
+  const executablePlans = plans.filter((plan) => EXECUTABLE_PLAN_KINDS.has(plan.kind));
+  const selectedPlan = executablePlans.find((plan) => plan.id === selectedPlanId)
+    ?? executablePlans.find((plan) => plan.lifecycleStatus !== "accepted")
+    ?? executablePlans[0]
     ?? plans[0]
     ?? null;
   const nodeLayer = workflow?.nodes.find((node) => node.diagramId === diagram.id && node.nodeId === draft.id);
@@ -706,7 +711,7 @@ export function NodeDetailView(props: { diagramId: string; nodeId: string; initi
                         </div>
                         <div className="development-plan-badges">
                           <Badge tone={plan.status === "已完成" ? "good" : plan.status === "已阻塞" ? "bad" : plan.status === "进行中" ? "warn" : "muted"}>{plan.status}</Badge>
-                          <Badge tone={plan.lifecycleStatus === "accepted" ? "good" : plan.lifecycleStatus === "audit_failed" ? "bad" : plan.lifecycleStatus === "in_progress" ? "info" : "neutral"}>{PLAN_LIFECYCLE_LABELS[plan.lifecycleStatus]}</Badge>
+                          {EXECUTABLE_PLAN_KINDS.has(plan.kind) ? <Badge tone={plan.lifecycleStatus === "accepted" ? "good" : plan.lifecycleStatus === "audit_failed" ? "bad" : plan.lifecycleStatus === "in_progress" ? "info" : "neutral"}>{PLAN_LIFECYCLE_LABELS[plan.lifecycleStatus]}</Badge> : null}
                           {layerByPlanId.get(plan.id) ? <Badge tone={layerByPlanId.get(plan.id)?.locked ? "muted" : "info"}>第 {layerByPlanId.get(plan.id)?.layer} 层{layerByPlanId.get(plan.id)?.locked ? " · 未解锁" : ""}</Badge> : null}
                           <div className="development-plan-rail">
                             <span className="development-plan-percent">{plan.progress}%</span>

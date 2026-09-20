@@ -5,6 +5,8 @@ export const PROJECT_WORKFLOW_POLICY = {
   deliveryDiagramTypes: ["main", "functional", "deployment"],
   exemptDiagramTypes: ["flow", "usecase", "free"],
   deliveryNodeKinds: ["module", "feature", "requirement", "interface", "data"],
+  /** 只有 task 是可执行的施工计划；goal/milestone/version 仅用于计划层级，不进施工交付流程。 */
+  executablePlanKinds: ["task"],
   phaseLabels: {
     discovery: "了解项目",
     "functional-design": "系统与功能设计",

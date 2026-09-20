@@ -1,8 +1,11 @@
 import type { PlanItem } from "../shared/types.js";
+import { PROJECT_WORKFLOW_POLICY } from "../shared/workflowPolicy.js";
+
+const EXECUTABLE_PLAN_KINDS = new Set<string>(PROJECT_WORKFLOW_POLICY.executablePlanKinds);
 
 /** Only task plans are executable delivery work. Goals, milestones, and versions are hierarchy only. */
 export function isExecutableDeliveryPlan(plan: Pick<PlanItem, "kind">): boolean {
-  return plan.kind === "task";
+  return EXECUTABLE_PLAN_KINDS.has(plan.kind);
 }
 
 export interface DependencyEditDecision {
