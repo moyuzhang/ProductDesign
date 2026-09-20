@@ -1323,7 +1323,11 @@ export class Store {
 
   deletePlan(id: string): boolean {
     const current = this.getPlan(id);
-    if (current) this.deleteDocumentReferencesForTarget(current.projectId, "plan", id);
+    if (!current) return false;
+    this.deleteDocumentReferencesForTarget(current.projectId, "plan", id);
+    // 子计划上提一级继承被删计划的上级，避免留下指向已删除计划的悬空 parent_id。
+    this.db.prepare("UPDATE plan_items SET parent_id = ?, updated_at = ? WHERE parent_id = ?")
+      .run(current.parentId, nowIso(), id);
     return this.db.prepare("DELETE FROM plan_items WHERE id = ?").run(id).changes > 0;
   }
 

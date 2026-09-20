@@ -71,7 +71,7 @@ import {
 } from "./projectFiles.js";
 import { buildProjectWorkflow } from "./workflow.js";
 import { getProjectedProjectWorkspace, listProjectedProjects } from "./projectProjection.js";
-import { decideDependencyEdit } from "./planPolicy.js";
+import { decideDependencyEdit, isExecutableDeliveryPlan } from "./planPolicy.js";
 import { AgentTaskPackageError, buildAgentOrchestration } from "./orchestration.js";
 import {
   AgentTaskLeaseError,
@@ -1494,7 +1494,10 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       const roleErrors = roleAssignmentErrors(patch.roleAssignments, false);
       if (roleErrors.length > 0) throw httpError(409, roleErrors.join("；"));
     }
-    const controlled = Boolean(diagramId && diagramNodeId);
+    // 该守卫只保护可执行的开发计划（task）：它们的交付状态必须由施工交付流程汇总。
+    // goal/milestone/version 仅用于计划层级，无法进入施工交付流程（见 transitionPlanLifecycle），
+    // 若一并拦截会使其状态再无合法更新入口。
+    const controlled = Boolean(diagramId && diagramNodeId) && isExecutableDeliveryPlan(before);
     if (controlled && (patch.status !== undefined || patch.progress !== undefined || patch.completedAt !== undefined)) {
       throw httpError(409, "绑定画布节点的开发计划必须通过施工交付流程推进状态");
     }

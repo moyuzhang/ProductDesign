@@ -930,6 +930,62 @@ describe("REST API", () => {
     expect(delNode.statusCode).toBe(200);
   });
 
+  it("patches hierarchy-only plans bound to a canvas node but still guards tasks", async () => {
+    const diagrams = await app.inject({ method: "GET", url: `/api/diagrams?projectId=${projectId}` });
+    const main = diagrams.json().find((item: { type: string }) => item.type === "main");
+    const seeded = await app.inject({
+      method: "PATCH", url: `/api/diagrams/${main.id}`,
+      payload: { nodes: [...main.nodes, { id: "plan-status-node", kind: "feature", label: "计划状态节点", x: 900, y: 160 }] },
+    });
+    expect(seeded.statusCode, seeded.body).toBe(200);
+    const binding = { projectId, diagramId: main.id, diagramNodeId: "plan-status-node" };
+
+    const milestone = await app.inject({
+      method: "POST", url: "/api/plans",
+      payload: { ...binding, kind: "milestone", title: "汇总里程碑", owner: "manager" },
+    });
+    expect(milestone.statusCode, milestone.body).toBe(200);
+
+    // 里程碑等层级计划无法进入施工交付流程，必须保留 REST 状态更新入口，否则状态永久僵死
+    const completedMilestone = await app.inject({
+      method: "PATCH", url: `/api/plans/${milestone.json().id}`, payload: { status: "已完成" },
+    });
+    expect(completedMilestone.statusCode, completedMilestone.body).toBe(200);
+    expect(completedMilestone.json()).toMatchObject({ status: "已完成", progress: 100 });
+
+    // 可执行的施工任务仍必须由施工交付流程汇总
+    const task = await app.inject({
+      method: "POST", url: "/api/plans",
+      payload: { ...binding, kind: "task", title: "受控任务" },
+    });
+    expect(task.statusCode, task.body).toBe(200);
+    const blockedTask = await app.inject({
+      method: "PATCH", url: `/api/plans/${task.json().id}`, payload: { status: "已完成" },
+    });
+    expect(blockedTask.statusCode).toBe(409);
+    expect(blockedTask.json().message).toContain("施工交付流程");
+  });
+
+  it("promotes child plans when their parent is deleted", async () => {
+    const parent = await app.inject({
+      method: "POST", url: "/api/plans",
+      payload: { projectId, kind: "goal", title: "被删除的目标" },
+    });
+    const child = await app.inject({
+      method: "POST", url: "/api/plans",
+      payload: { projectId, kind: "milestone", title: "子里程碑", parentId: parent.json().id },
+    });
+    expect(child.json().parentId).toBe(parent.json().id);
+
+    const removed = await app.inject({ method: "DELETE", url: `/api/plans/${parent.json().id}` });
+    expect(removed.statusCode).toBe(200);
+
+    // 上级计划删除后子计划上提为顶层，不应残留指向已删除计划的 parentId
+    const after = await app.inject({ method: "GET", url: `/api/plans/${child.json().id}` });
+    expect(after.statusCode).toBe(200);
+    expect(after.json().parentId).toBeNull();
+  });
+
   it("manual evidence and git collect validation", async () => {
     const longRevision = `working-tree:${"x".repeat(105)}`;
     const longRevisionEvidence = await app.inject({
