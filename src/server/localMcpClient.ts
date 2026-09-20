@@ -123,6 +123,18 @@ export const AGENT_MCP_TOOL_NAMES = new Set([
   "list_evidence",
   "create_evidence",
   "update_project_status",
+  "get_diagram_layers",
+  "update_diagram_layers",
+  "list_diagram_components",
+  "create_diagram_component",
+  "instantiate_diagram_component",
+  "delete_diagram_component",
+  "list_diagram_templates",
+  "get_diagram_template",
+  "create_diagram_template",
+  "update_diagram_template",
+  "revoke_diagram_template",
+  "apply_diagram_template",
 ]);
 
 export const MUTATING_AGENT_MCP_TOOLS = new Set([
@@ -160,6 +172,14 @@ export const MUTATING_AGENT_MCP_TOOLS = new Set([
   "report_design_gap", "dismiss_design_gap",
   "create_evidence",
   "update_project_status",
+  "update_diagram_layers",
+  "create_diagram_component",
+  "instantiate_diagram_component",
+  "delete_diagram_component",
+  "create_diagram_template",
+  "update_diagram_template",
+  "revoke_diagram_template",
+  "apply_diagram_template",
 ]);
 
 export class LocalMcpClient {

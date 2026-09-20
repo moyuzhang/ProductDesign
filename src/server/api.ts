@@ -61,6 +61,24 @@ import {
 import { collectGitEvidence } from "./collectors.js";
 import { createBackupFile, loadBackupFile, storageRetentionSummary } from "./backups.js";
 import { PrototypeDraftConflictError, PrototypeDraftCorruptError, FreeformDraftConflictError, FreeformDocumentCorruptError, FreeformAssetRejectedError, Store, nowIso } from "./db.js";
+import {
+  type ServiceResult,
+  type WhiteboardAuditContext,
+  type WhiteboardServiceContext,
+  applyDiagramTemplate,
+  createComponentInstances,
+  createDiagramComponent,
+  createDiagramTemplate,
+  listDiagramTemplates,
+  readDiagramComponents,
+  readDiagramLayers,
+  readDiagramTemplate,
+  removeDiagramComponent,
+  revokeDiagramTemplateRecord,
+  saveDiagramLayers,
+  updateDiagramComponent,
+  updateDiagramTemplateRecord,
+} from "./whiteboard.js";
 import { prototypeSaveSchema } from "../shared/prototype.js";
 import {
   applyFreeformAssetSecurityHeaders,
@@ -2431,6 +2449,105 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     for (const [key, value] of Object.entries(applyFreeformAssetSecurityHeaders())) reply.header(key, value);
     return reply.type(asset.mime).send(readFileSync(asset.storagePath));
   });
+
+// ---------- 图层、组件与模板（节点 whiteboard-layers-templates） ----------
+  // 旁路载荷：图层/组件落 diagrams.layers / diagrams.components，模板落绑定表 diagram_templates；
+  // 三者都不进入交付门禁统计（workflow.ts / planLayers.ts / planPolicy.ts 均不读取）。
+  // 业务逻辑唯一实现于 src/server/whiteboard.ts：REST 端点与 MCP 工具是同一服务函数的两个薄入口（设计第 7 节）。
+
+  const webActor = (request: { body?: unknown; query?: unknown }): WhiteboardAuditContext => {
+    const hint = (request.body ?? request.query) as ActorHint | undefined;
+    return {
+      actor: hint?.actor?.trim() || "user",
+      source: hint?.source ?? "web",
+      correlationId: hint?.correlationId,
+      clientId: hint?.clientId,
+      sessionId: hint?.sessionId,
+      model: hint?.model,
+    };
+  };
+  const sendService = (reply: FastifyReply, result: ServiceResult): FastifyReply => reply.code(result.status).send(result.body);
+  const whiteboardContext: WhiteboardServiceContext = { store, dataDir };
+
+  app.get("/api/diagrams/:id/layers", async (request, reply) =>
+    sendService(reply, readDiagramLayers(whiteboardContext, { diagramId: (request.params as { id: string }).id })));
+
+  app.patch("/api/diagrams/:id/layers", async (request, reply) =>
+    sendService(reply, saveDiagramLayers(whiteboardContext, {
+      diagramId: (request.params as { id: string }).id, payload: request.body, audit: webActor(request),
+    })));
+
+  app.get("/api/diagrams/:id/components", async (request, reply) =>
+    sendService(reply, readDiagramComponents(whiteboardContext, { diagramId: (request.params as { id: string }).id })));
+
+  app.post("/api/diagrams/:id/components", async (request, reply) =>
+    sendService(reply, createDiagramComponent(whiteboardContext, {
+      diagramId: (request.params as { id: string }).id, payload: request.body, audit: webActor(request),
+    })));
+
+  app.patch("/api/diagrams/:id/components/:componentId", async (request, reply) =>
+    sendService(reply, updateDiagramComponent(whiteboardContext, {
+      diagramId: (request.params as { id: string }).id,
+      componentId: (request.params as { componentId: string }).componentId,
+      payload: request.body, audit: webActor(request),
+    })));
+
+  app.delete("/api/diagrams/:id/components/:componentId", async (request, reply) =>
+    sendService(reply, removeDiagramComponent(whiteboardContext, {
+      diagramId: (request.params as { id: string }).id,
+      componentId: (request.params as { componentId: string }).componentId,
+      audit: webActor(request),
+    })));
+
+  app.post("/api/diagrams/:id/components/:componentId/instances", async (request, reply) =>
+    sendService(reply, createComponentInstances(whiteboardContext, {
+      diagramId: (request.params as { id: string }).id,
+      componentId: (request.params as { componentId: string }).componentId,
+      payload: request.body, audit: webActor(request),
+    })));
+
+  app.get("/api/projects/:id/diagram-templates", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const query = request.query as { scope?: string; schemaVersion?: string; limit?: string; offset?: string };
+    const window = wantsPage(query) ? pageWindow(query) : undefined;
+    return sendService(reply, listDiagramTemplates(whiteboardContext, {
+      projectId: id,
+      scope: query.scope === undefined ? undefined : (query.scope as "system" | "project"),
+      schemaVersion: query.schemaVersion || undefined,
+      ...(window ? { offset: window.offset, limit: window.limit } : {}),
+    }));
+  });
+
+  app.get("/api/diagram-templates/:templateId", async (request, reply) => {
+    const { templateId } = request.params as { templateId: string };
+    const query = request.query as { include?: string; projectId?: string };
+    return sendService(reply, readDiagramTemplate(whiteboardContext, { templateId, include: query.include, projectId: query.projectId }));
+  });
+
+  app.post("/api/projects/:id/diagram-templates", async (request, reply) =>
+    sendService(reply, createDiagramTemplate(whiteboardContext, {
+      projectId: (request.params as { id: string }).id, payload: request.body, audit: webActor(request),
+    })));
+
+  app.patch("/api/diagram-templates/:templateId", async (request, reply) =>
+    sendService(reply, updateDiagramTemplateRecord(whiteboardContext, {
+      templateId: (request.params as { templateId: string }).templateId, payload: request.body, audit: webActor(request),
+    })));
+
+  app.post("/api/diagram-templates/:templateId/revoke", async (request, reply) =>
+    sendService(reply, revokeDiagramTemplateRecord(whiteboardContext, {
+      templateId: (request.params as { templateId: string }).templateId, payload: request.body, audit: webActor(request),
+    })));
+
+  app.delete("/api/diagram-templates/:templateId", async (request, reply) =>
+    sendService(reply, revokeDiagramTemplateRecord(whiteboardContext, {
+      templateId: (request.params as { templateId: string }).templateId, audit: webActor(request),
+    })));
+
+  app.post("/api/diagrams/:id/template-applications", async (request, reply) =>
+    sendService(reply, applyDiagramTemplate(whiteboardContext, {
+      diagramId: (request.params as { id: string }).id, payload: request.body, audit: webActor(request),
+    })));
 
   app.post("/api/diagrams", async (request) => {
     const body = parse(z.object({

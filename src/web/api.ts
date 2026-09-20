@@ -37,6 +37,12 @@ import type {
   DocumentReferenceInput,
   DocumentRevision,
   Diagram,
+  DiagramComponentDefinition,
+  DiagramComponentLibrary,
+  DiagramLayerState,
+  DiagramTemplate,
+  DiagramTemplateContent,
+  DiagramTemplateSummary,
   Evidence,
   FreeformAssetSummary,
   FreeformDocument,
@@ -136,6 +142,75 @@ async function uploadFreeformAssetRequest<T>(projectId: string, blob: Blob, mime
   });
   if (!response.ok) throw new Error(`${await errorMessageOf(response, "上传失败")}（HTTP ${response.status}）`);
   return (await response.json()) as T;
+}
+
+/**
+ * 图层/组件/模板写接口的统一冲突错误（设计 8.1：CAS 失败 → 409 + serverUpdatedAt）。
+ * 与 FreeformConflictError 同构，额外携带契约错误码，供 UI 区分"版本冲突"与"业务拒绝"。
+ */
+export class WhiteboardConflictError extends Error {
+  readonly serverUpdatedAt: string;
+  readonly code: string;
+  constructor(message: string, code: string, serverUpdatedAt: string) {
+    super(message);
+    this.name = "WhiteboardConflictError";
+    this.code = code;
+    this.serverUpdatedAt = serverUpdatedAt;
+  }
+}
+
+/** 图层/组件/模板请求封装：409 且带 serverUpdatedAt 时抛 WhiteboardConflictError，其余按普通错误处理。 */
+async function whiteboardRequest<T>(method: string, url: string, body?: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method,
+    headers: body !== undefined ? { "content-type": "application/json" } : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (response.status === 409) {
+    let message = "内容已被其他操作修改";
+    let code = "";
+    let serverUpdatedAt = "";
+    try {
+      const payload = (await response.json()) as { message?: string; code?: string; serverUpdatedAt?: string };
+      if (payload?.message) message = payload.message;
+      if (payload?.code) code = payload.code;
+      if (payload?.serverUpdatedAt) serverUpdatedAt = payload.serverUpdatedAt;
+    } catch {
+      /* ignore */
+    }
+    if (serverUpdatedAt) throw new WhiteboardConflictError(message, code, serverUpdatedAt);
+    throw new Error(`${message}（HTTP ${response.status}）`);
+  }
+  if (!response.ok) throw new Error(`${await errorMessageOf(response, "请求失败")}（HTTP ${response.status}）`);
+  return (await response.json()) as T;
+}
+
+/** 图层读取响应：图层状态 + 画布 updatedAt（作为下一次保存的 CAS 基准）。 */
+export type DiagramLayerReadResponse = DiagramLayerState & { diagramUpdatedAt: string };
+export type DiagramComponentReadResponse = DiagramComponentLibrary & { diagramUpdatedAt: string };
+export interface DiagramComponentWriteResponse {
+  component: DiagramComponentDefinition;
+  droppedEdgeIds: string[];
+  diagramUpdatedAt: string;
+}
+export interface DiagramComponentInstanceResponse {
+  diagram: Diagram;
+  createdNodeIds: string[];
+  createdEdgeIds: string[];
+  createdFreeformIds: string[];
+  droppedEdgeIds: string[];
+  diagramUpdatedAt: string;
+}
+export type DiagramTemplateReadResponse = DiagramTemplateSummary & { content?: DiagramTemplateContent };
+export interface DiagramTemplateApplyResponse {
+  diagram: Diagram;
+  createdNodeIds: string[];
+  createdEdgeIds: string[];
+  createdFreeformIds: string[];
+  droppedLinkDiagramIds: string[];
+  migrated: boolean;
+  thumbnailApplied: boolean;
+  diagramUpdatedAt: string;
 }
 
 function qs(params: Record<string, string | number | undefined>): string {
@@ -299,6 +374,34 @@ export const api = {
   uploadFreeformAsset: (projectId: string, blob: Blob, mime: string) =>
     uploadFreeformAssetRequest<FreeformAssetSummary>(projectId, blob, mime),
   freeformAssetUrl: (assetId: string) => `/api/freeform-assets/${encodeURIComponent(assetId)}`,
+
+  // ---------- 图层、组件与模板（节点 whiteboard-layers-templates，设计 6.2/6.3/6.4） ----------
+  getDiagramLayers: (id: string) => whiteboardRequest<DiagramLayerReadResponse>("GET", `/api/diagrams/${id}/layers`),
+  updateDiagramLayers: (id: string, body: { schemaVersion: 1; layers: DiagramLayerState["layers"]; itemOverrides: DiagramLayerState["itemOverrides"]; expectedUpdatedAt: string | null }) =>
+    whiteboardRequest<DiagramLayerReadResponse>("PATCH", `/api/diagrams/${id}/layers`, body),
+
+  listDiagramComponents: (id: string) => whiteboardRequest<DiagramComponentReadResponse>("GET", `/api/diagrams/${id}/components`),
+  createDiagramComponent: (id: string, body: { name: string; selection: { nodeIds: string[]; edgeIds: string[]; freeformIds: string[] }; expectedUpdatedAt: string | null }) =>
+    whiteboardRequest<DiagramComponentWriteResponse>("POST", `/api/diagrams/${id}/components`, body),
+  updateDiagramComponent: (id: string, componentId: string, body: { name?: string; selection?: { nodeIds: string[]; edgeIds: string[]; freeformIds: string[] }; expectedUpdatedAt: string | null }) =>
+    whiteboardRequest<DiagramComponentWriteResponse>("PATCH", `/api/diagrams/${id}/components/${encodeURIComponent(componentId)}`, body),
+  deleteDiagramComponent: (id: string, componentId: string) =>
+    whiteboardRequest<{ ok: boolean; diagramUpdatedAt: string }>("DELETE", `/api/diagrams/${id}/components/${encodeURIComponent(componentId)}`),
+  instantiateDiagramComponent: (id: string, componentId: string, body: { offsetX?: number; offsetY?: number; expectedUpdatedAt: string | null }) =>
+    whiteboardRequest<DiagramComponentInstanceResponse>("POST", `/api/diagrams/${id}/components/${encodeURIComponent(componentId)}/instances`, body),
+
+  listDiagramTemplates: (projectId: string, filter: { scope?: "system" | "project"; schemaVersion?: string; offset?: number; limit?: number } = {}) =>
+    request<DiagramTemplateSummary[] | Paginated<DiagramTemplateSummary>>("GET", `/api/projects/${projectId}/diagram-templates${qs(filter)}`),
+  getDiagramTemplate: (templateId: string, filter: { include?: string; projectId?: string } = {}) =>
+    whiteboardRequest<DiagramTemplateReadResponse>("GET", `/api/diagram-templates/${encodeURIComponent(templateId)}${qs(filter)}`),
+  createDiagramTemplate: (projectId: string, body: { name: string; scope?: "project"; schemaVersion?: string; content: unknown; thumbnailMeta?: unknown }) =>
+    whiteboardRequest<DiagramTemplate & { thumbnailWarning?: string }>("POST", `/api/projects/${projectId}/diagram-templates`, body),
+  updateDiagramTemplate: (templateId: string, patch: { name?: string; schemaVersion?: string; content?: unknown; thumbnailMeta?: unknown; expectedUpdatedAt: string | null }) =>
+    whiteboardRequest<DiagramTemplate & { thumbnailWarning?: string }>("PATCH", `/api/diagram-templates/${encodeURIComponent(templateId)}`, patch),
+  revokeDiagramTemplate: (templateId: string, body: { actor?: string } = {}) =>
+    whiteboardRequest<DiagramTemplateSummary>("POST", `/api/diagram-templates/${encodeURIComponent(templateId)}/revoke`, body),
+  applyDiagramTemplate: (diagramId: string, body: { templateId: string; mode: "append" | "replace"; expectedUpdatedAt: string | null }) =>
+    whiteboardRequest<DiagramTemplateApplyResponse>("POST", `/api/diagrams/${diagramId}/template-applications`, body),
 
   listDatabaseModels: (projectId?: string) => request<DatabaseModel[]>("GET", `/api/database-models${qs({ projectId })}`),
   pageDatabaseModels: (filter: { projectId?: string; q?: string; dialect?: string; offset?: number; limit?: number } = {}) =>

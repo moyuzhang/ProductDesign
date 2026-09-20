@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
-import { BookOpen, Check, ChevronDown, ChevronLeft, CornerUpLeft, Database, LayoutGrid, LockKeyhole, PenLine, Pencil, Plus, Search, Shapes, Trash2 } from "lucide-react";
+import { BookOpen, Check, ChevronDown, ChevronLeft, CornerUpLeft, Database, LayoutGrid, Layers, LockKeyhole, PenLine, Pencil, Plus, Search, Shapes, Trash2 } from "lucide-react";
 import { DIAGRAM_TYPES, type DesignDoc, type Diagram, type DiagramEdge, type DiagramFlowNodeType, type DiagramGroup, type DiagramNode, type DiagramNodeKind, type DiagramType, type DiagramUseCaseNodeType, type NodeShape, type PlanItem, type Project } from "../../shared/types";
 import { api } from "../api";
 import { navigate } from "../App";
@@ -12,6 +12,9 @@ import { agentVisibleContent, useAgentUiBridge } from "./agentUiBridge";
 import { DocumentReferencePanel } from "./DocumentReferencePanel";
 import { PrototypeDesigner } from "./PrototypeDesigner";
 import { WhiteboardFreeformCanvas } from "./WhiteboardFreeformCanvas";
+import { DiagramLayerPanel } from "./DiagramLayerPanel";
+import { DiagramComponentLibrary } from "./DiagramComponentLibrary";
+import { DiagramTemplateLibrary } from "./DiagramTemplateLibrary";
 
 type CanvasTemplateId = "blank" | "arch" | "flow" | "module" | "usecase";
 
@@ -503,6 +506,8 @@ function CanvasEditor(props: {
   const [typeMenuOpen, setTypeMenuOpen] = useState(false);
   const [prototypeOpen, setPrototypeOpen] = useState(false);
   const [freeformOpen, setFreeformOpen] = useState(false);
+  const [layersOpen, setLayersOpen] = useState(false);
+  const [templatesOpen, setTemplatesOpen] = useState(false);
   const [renameTab, setRenameTab] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const escapedRef = useRef(false);
@@ -741,6 +746,12 @@ function CanvasEditor(props: {
         <button className="btn btn-ghost btn-sm" onClick={() => setFreeformOpen(true)} title="打开自由创作与富媒体工具（自由元素不进入交付门禁）">
           <Shapes size={14} /> 自由层
         </button>
+        <button className="btn btn-ghost btn-sm" onClick={() => setLayersOpen((open) => !open)} title="图层面板与组件库：命名/排序/锁定/隐藏、批量选择、可复用组件（不进交付门禁）">
+          <Layers size={14} /> 图层/组件
+        </button>
+        <button className="btn btn-ghost btn-sm" onClick={() => setTemplatesOpen(true)} title="模板库：系统内置与项目级模板（落 diagram_templates）">
+          <LayoutGrid size={14} /> 模板
+        </button>
         <div className="header-actions">
           {hint ? <span className="save-hint">{hint}</span> : null}
           {props.diagram.type === "main" ? (
@@ -860,6 +871,31 @@ function CanvasEditor(props: {
         deliveryNodes={nodes.map((node) => ({ id: node.id, label: node.label }))}
         onClose={() => setFreeformOpen(false)}
       /> : null}
+      {layersOpen ? (
+        <div className="whiteboard-panel-dock" aria-label="图层与组件面板">
+          <DiagramLayerPanel
+            diagramId={props.diagram.id}
+            diagram={{ nodes, edges }}
+            onClose={() => setLayersOpen(false)}
+          />
+          <DiagramComponentLibrary
+            diagramId={props.diagram.id}
+            diagramUpdatedAt={props.diagram.updatedAt}
+            selection={{ nodeIds: selection.nodeIds, edgeIds: selection.edgeIds, freeformIds: [] }}
+          />
+        </div>
+      ) : null}
+      {templatesOpen ? (
+        <DiagramTemplateLibrary
+          projectId={props.diagram.projectId}
+          currentDiagram={props.diagram}
+          diagrams={props.allDiagrams.filter((diagram) => diagram.projectId === props.diagram.projectId)}
+          onClose={() => setTemplatesOpen(false)}
+          // 应用成功后不关闭对话框：设计 9.3 要求把“已应用模板…新增 N 节点”的结果提示留给用户阅读；
+          // 只刷新画布列表，使目标画布的 updatedAt 成为后续 CAS 基准。
+          onApplied={() => { props.onExternalRefresh(); }}
+        />
+      ) : null}
     </div>
   );
 }

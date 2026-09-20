@@ -66,6 +66,7 @@ import {
   exportDiagram,
   validateDiagram,
 } from "./diagram.js";
+import { registerWhiteboardTools } from "./whiteboard.js";
 
 export interface FullToolOptions {
   store: Store;
@@ -231,6 +232,9 @@ function createBackup(store: Store, dataDir: string, label: string, reason: stri
 
 export function registerFullTools(server: McpServer, options: FullToolOptions): void {
   const { store, dataDir, harness } = options;
+
+  // 图层、组件与模板工具（设计第 7 节）：与 REST 端点共用 src/server/whiteboard.ts 服务层。
+  registerWhiteboardTools(server, { store, dataDir });
 
   server.registerTool("service_health", {
     title: "服务健康检查",

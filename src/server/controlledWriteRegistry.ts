@@ -10,6 +10,8 @@ const READ_MCP = new Set([
   "check_database_connection", "generate_database_code", "get_database_model", "inspect_database_schema", "list_database_models",
   "list_node_database_bindings", "preview_database_deploy", "preview_database_reverse", "validate_database_model", "validate_diagram",
   "list_coordination_leases", "list_child_task_dispatches",
+  // 图层、组件与模板的只读工具（设计第 7 节）。
+  "get_diagram_layers", "list_diagram_components", "list_diagram_templates", "get_diagram_template",
 ]);
 const CONTROLLED_MCP = new Set([
   "create_product_design_project", "update_project", "update_project_status", "create_work_node", "update_work_node", "create_plan_item",
@@ -27,6 +29,9 @@ const CONTROLLED_MCP = new Set([
   "test_llm_profile", "create_database_model", "update_database_model", "auto_layout_database_model", "import_database_schema_as_model",
   "reverse_database_into_model", "create_node_database_binding", "update_node_database_binding", "request_design_change",
   "submit_design_change_intent", "request_evidence_repair_assessment", "dismiss_design_change_intent",
+  // 图层、组件与模板的写工具（设计第 7 节）：登记为受控写，由 MCP 网关注入租约上下文。
+  "update_diagram_layers", "create_diagram_component", "instantiate_diagram_component", "delete_diagram_component",
+  "create_diagram_template", "update_diagram_template", "revoke_diagram_template", "apply_diagram_template",
 ]);
 const CONTROL_EXCEPTIONS = new Set(["begin_agent_auth", "complete_agent_auth", "ack_agent_policy", "issue_agent_write_nonce", "claim_next_agent_task", "get_agent_task_package", "claim_coordination_lease", "claim_dispatched_child_task"]);
 const HIGH_RISK_MCP = new Set([

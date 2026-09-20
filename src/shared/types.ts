@@ -746,9 +746,137 @@ export interface Diagram {
   nodes: DiagramNode[];
   edges: DiagramEdge[];
   groups: DiagramGroup[];
+  /** 图层状态旁路载荷（见节点 whiteboard-layers-templates 设计 3.6）；缺省不写、读取时派生。 */
+  layers?: DiagramLayerState;
+  /** 组件库旁路载荷（见设计 4.1）；缺省不写、读取时派生。 */
+  components?: DiagramComponentLibrary;
   createdAt: string;
   updatedAt: string;
 }
+
+// ---------- 图层（节点 whiteboard-layers-templates 设计 3.1） ----------
+
+export const DIAGRAM_LAYER_SCHEMA_VERSION = 1 as const;
+export const DIAGRAM_LAYER_KINDS = ["system", "custom"] as const;
+export type DiagramLayerKind = (typeof DIAGRAM_LAYER_KINDS)[number];
+export const DIAGRAM_LAYER_MEMBER_KINDS = ["node", "edge", "freeform", "mixed"] as const;
+export type DiagramLayerMemberKind = (typeof DIAGRAM_LAYER_MEMBER_KINDS)[number];
+export type DiagramLayerItemKind = "node" | "edge" | "freeform";
+
+export interface DiagramLayer {
+  id: string;
+  name: string;
+  kind: DiagramLayerKind;
+  memberKind: DiagramLayerMemberKind;
+  locked: boolean;
+  hidden: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DiagramItemOverride {
+  locked?: boolean;
+  hidden?: boolean;
+  layerId?: string;
+}
+
+export interface DiagramLayerState {
+  schemaVersion: typeof DIAGRAM_LAYER_SCHEMA_VERSION;
+  layers: DiagramLayer[];
+  itemOverrides: Record<string, DiagramItemOverride>;
+}
+
+// ---------- 组件（设计 4.1） ----------
+
+export const DIAGRAM_COMPONENT_SCHEMA_VERSION = 1 as const;
+
+/** 组件快照中的交付节点：已剥离全部交付状态字段。 */
+export type DiagramComponentNode = Omit<DiagramNode,
+  "requirementStatus" | "designStatus" | "developmentStatus" | "acceptanceStatus"
+  | "owner" | "acceptanceCriteria" | "requiresDatabase" | "blockedReason" | "deliveryUpdatedAt">;
+
+export interface DiagramComponentPayload {
+  nodes: DiagramComponentNode[];
+  edges: DiagramEdge[];
+  groups: DiagramGroup[];
+  freeform: { elements: FreeformElement[] } | null;
+  layers: { layers: DiagramLayer[]; itemOverrides: Record<string, DiagramItemOverride> } | null;
+}
+
+export interface DiagramComponentSourceSelection {
+  nodeIds: string[];
+  edgeIds: string[];
+  freeformIds: string[];
+}
+
+export interface DiagramComponentDefinition {
+  id: string;
+  name: string;
+  payload: DiagramComponentPayload;
+  sourceSelection: DiagramComponentSourceSelection;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DiagramComponentLibrary {
+  schemaVersion: typeof DIAGRAM_COMPONENT_SCHEMA_VERSION;
+  components: DiagramComponentDefinition[];
+}
+
+/** 实例自带溯源信息（写在 layers 辅助映射中，不建立运行时联动）。 */
+export interface DiagramComponentInstanceLink {
+  itemKey: string;
+  sourceComponentId: string;
+}
+
+// ---------- 模板（设计 5.1） ----------
+
+export const DIAGRAM_TEMPLATE_SCOPES = ["system", "project"] as const;
+export type DiagramTemplateScope = (typeof DIAGRAM_TEMPLATE_SCOPES)[number];
+
+/** 模板载荷契约版本。格式必须为设计 5.4 规定的 `whiteboard.template/<major>.<minor>`。 */
+export const DIAGRAM_TEMPLATE_SCHEMA_VERSION = "whiteboard.template/1.0";
+
+export interface DiagramTemplateThumbnailMeta {
+  kind: "none" | "svg";
+  width: number;
+  height: number;
+  viewBox: string;
+  content?: string;
+  generatedAt: string;
+  source: "auto" | "custom";
+}
+
+export interface DiagramTemplateContent {
+  schemaVersion: string;
+  diagram: {
+    nodes: DiagramNode[];
+    edges: DiagramEdge[];
+    groups: DiagramGroup[];
+    layers?: DiagramLayerState;
+  };
+  freeform?: { elements: FreeformElement[]; unsupported: FreeformUnknownElement[] };
+  components?: DiagramComponentLibrary;
+}
+
+export interface DiagramTemplate {
+  id: string;
+  /** 系统内置模板为 null；项目级模板为所属项目 id。 */
+  projectId: string | null;
+  scope: DiagramTemplateScope;
+  name: string;
+  schemaVersion: string;
+  content: DiagramTemplateContent;
+  thumbnailMeta: DiagramTemplateThumbnailMeta;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  revokedAt: string | null;
+}
+
+/** 列表投影：不回传 content，避免列表体积膨胀。 */
+export type DiagramTemplateSummary = Omit<DiagramTemplate, "content"> & { contentBytes: number };
 
 export type PrototypeKind = "text" | "button" | "input" | "card" | "image";
 export interface PrototypeComponent {

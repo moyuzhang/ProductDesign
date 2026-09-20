@@ -30,6 +30,10 @@ import type {
   Diagram,
   DiagramInput,
   DiagramNode,
+  DiagramTemplate,
+  DiagramTemplateContent,
+  DiagramTemplateScope,
+  DiagramTemplateThumbnailMeta,
   Evidence,
   GovernanceRecord,
   FreeformAsset,
@@ -52,6 +56,8 @@ import { normalizeAgentId, normalizeRoleAssignments } from "../shared/planRoles.
 import { ensureAgentSecuritySchema } from "./agentSecurity.js";
 import { normalizePrototypePayload, prototypeFingerprint, PROTOTYPE_VERSION_LIMIT } from "../shared/prototype.js";
 import { freeformDocumentFingerprint, normalizeFreeformDocument, FREEFORM_SCHEMA_VERSION } from "../shared/freeform.js";
+import { normalizeLayerState } from "../shared/layers.js";
+import { normalizeComponentLibrary } from "../shared/components.js";
 
 export function nowIso(): string {
   return new Date().toISOString();
@@ -70,6 +76,11 @@ export class FreeformDocumentCorruptError extends Error {}
 export class FreeformAssetRejectedError extends Error {
   constructor(message: string, readonly statusCode = 400) { super(message); }
 }
+export class DiagramTemplateNameConflictError extends Error {}
+export class DiagramTemplateRevisionConflictError extends Error {
+  constructor(message: string, readonly serverUpdatedAt: string | null) { super(message); }
+}
+export class DiagramTemplateRevokedError extends Error {}
 
 /**
  * 子画布镜像根节点索引：diagramId → 指向该画布的父节点标签集合。
@@ -94,7 +105,8 @@ export function isChildDiagramRootNode(index: Map<string, Set<string>>, diagram:
   return Boolean(index.get(diagram.id)?.has(node.label.trim().toLowerCase()));
 }
 
-function nextPrototypeRevision(previous?: string): string {
+/** 单调递增的修订时间戳：保证同一毫秒内的连续写入仍严格递增，供 CAS 与列表排序使用。 */
+export function nextPrototypeRevision(previous?: string): string {
   const now = Date.now();
   const previousTime = previous ? Date.parse(previous) : Number.NaN;
   return new Date(Number.isFinite(previousTime) && previousTime >= now ? previousTime + 1 : now).toISOString();
@@ -193,7 +205,14 @@ interface DocumentReferenceRow {
 
 interface DiagramRow {
   id: string; project_id: string; title: string; type: string; nodes: string; edges: string;
-  groups: string; created_at: string; updated_at: string;
+  groups: string; layers: string | null; components: string | null; created_at: string; updated_at: string;
+}
+
+/** 模板绑定表行（diagram_templates，见节点 whiteboard-layers-templates 设计 5.1）。 */
+interface DiagramTemplateRow {
+  id: string; project_id: string | null; scope: string; name: string; schema_version: string;
+  content: string; thumbnail_meta: string; created_by: string; created_at: string; updated_at: string;
+  revoked_at: string | null;
 }
 
 interface PrototypeDraftRow {
@@ -544,12 +563,47 @@ function legacyEvidenceFromDiagrams(diagrams: Diagram[]): Evidence[] {
 }
 
 function mapDiagram(r: DiagramRow): Diagram {
-  return {
+  const diagram: Diagram = {
     id: r.id, projectId: r.project_id, title: r.title, type: r.type as Diagram["type"],
     nodes: (parseArray<Diagram["nodes"][number]>(r.nodes) as Diagram["nodes"]).map(normalizeDiagramNodeLinks),
     edges: parseArray<Diagram["edges"][number]>(r.edges) as Diagram["edges"],
     groups: parseArray<Diagram["groups"][number]>(r.groups) as Diagram["groups"],
     createdAt: r.created_at, updatedAt: r.updated_at,
+  };
+  // 图层/组件是旁路载荷：仅在物理列有值时挂载，且读取即归一化（不写库）。
+  // 逐类传入 nodeIds/edgeIds：避免只传一类时连带丢弃其他类的元素级覆盖（自由元素 id 由自由层文档权威，
+  // 在 API 层用 layerStateFor 传入完整三类 id 完成孤儿过滤）。
+  const layers = parseNullableObject(r.layers ?? null);
+  if (layers) diagram.layers = normalizeLayerState(layers, {
+    nodeIds: diagram.nodes.map((node) => node.id),
+    edgeIds: diagram.edges.map((edge) => edge.id),
+  }).state;
+  const components = parseNullableObject(r.components ?? null);
+  if (components) diagram.components = normalizeComponentLibrary(components);
+  return diagram;
+}
+
+function parseNullableObject(raw: string | null): Record<string, unknown> | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch { return null; }
+}
+
+function mapDiagramTemplate(r: DiagramTemplateRow): DiagramTemplate {
+  return {
+    id: r.id,
+    projectId: r.project_id,
+    scope: r.scope as DiagramTemplate["scope"],
+    name: r.name,
+    schemaVersion: r.schema_version,
+    content: JSON.parse(r.content) as DiagramTemplate["content"],
+    thumbnailMeta: JSON.parse(r.thumbnail_meta) as DiagramTemplate["thumbnailMeta"],
+    createdBy: r.created_by,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    revokedAt: r.revoked_at,
   };
 }
 
@@ -792,6 +846,8 @@ export class Store {
     try { this.db.exec("ALTER TABLE design_docs ADD COLUMN decision_ids TEXT NOT NULL DEFAULT '[]'"); } catch { /* column exists */ }
     try { this.db.exec("ALTER TABLE design_docs ADD COLUMN current_revision_id TEXT NOT NULL DEFAULT ''"); } catch { /* column exists */ }
     try { this.db.exec("ALTER TABLE agent_sessions ADD COLUMN control_mode TEXT NOT NULL DEFAULT 'restricted'"); } catch { /* column exists */ }
+    try { this.db.exec("ALTER TABLE diagrams ADD COLUMN layers TEXT"); } catch { /* column exists */ }
+    try { this.db.exec("ALTER TABLE diagrams ADD COLUMN components TEXT"); } catch { /* column exists */ }
     let addedReasoningEffort = false;
     try {
       this.db.exec("ALTER TABLE llm_profiles ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'none'");
@@ -1592,6 +1648,119 @@ export class Store {
     return document ? freeformDocumentFingerprint(document) : null;
   }
 
+  // ---------- 模板（绑定表 diagram_templates；与图层/组件旁路载荷硬隔离，不参与交付门禁） ----------
+
+  listDiagramTemplates(
+    projectId: string,
+    options: { scope?: DiagramTemplateScope; schemaVersion?: string; offset?: number; limit?: number } = {},
+  ): DiagramTemplate[] {
+    const conditions = ["revoked_at IS NULL", "(project_id = @projectId OR project_id IS NULL)"];
+    const params: Record<string, unknown> = { projectId };
+    if (options.scope) { conditions.push("scope = @scope"); params.scope = options.scope; }
+    if (options.schemaVersion) { conditions.push("schema_version = @schemaVersion"); params.schemaVersion = options.schemaVersion; }
+    const rows = this.db.prepare(
+      `SELECT * FROM diagram_templates WHERE ${conditions.join(" AND ")} ORDER BY scope DESC, updated_at DESC`,
+    ).all(params) as DiagramTemplateRow[];
+    const offset = Math.max(options.offset ?? 0, 0);
+    const limit = options.limit ?? 50;
+    return rows.slice(offset, offset + limit).map(mapDiagramTemplate);
+  }
+
+  /** 直读（含已撤销）；用于 403/409 判定与撤销幂等。 */
+  findDiagramTemplate(templateId: string): DiagramTemplate | undefined {
+    const row = this.db.prepare("SELECT * FROM diagram_templates WHERE id = ?").get(templateId) as DiagramTemplateRow | undefined;
+    return row ? mapDiagramTemplate(row) : undefined;
+  }
+
+  /** 读取路径统一带 revoked_at IS NULL：已撤销模板按 404 处理，不返回内容。 */
+  getDiagramTemplate(templateId: string): DiagramTemplate | undefined {
+    const template = this.findDiagramTemplate(templateId);
+    return template && !template.revokedAt ? template : undefined;
+  }
+
+  findDiagramTemplateByName(projectId: string | null, name: string): DiagramTemplate | undefined {
+    const rows = this.db.prepare("SELECT * FROM diagram_templates WHERE revoked_at IS NULL AND name = ?").all(name) as DiagramTemplateRow[];
+    const row = rows.find((item) => (item.project_id ?? null) === projectId);
+    return row ? mapDiagramTemplate(row) : undefined;
+  }
+
+  insertDiagramTemplate(input: {
+    projectId: string | null;
+    scope: DiagramTemplateScope;
+    name: string;
+    schemaVersion: string;
+    content: DiagramTemplateContent;
+    thumbnailMeta: DiagramTemplateThumbnailMeta;
+    createdBy: string;
+  }): DiagramTemplate {
+    return this.db.transaction(() => {
+      if (this.findDiagramTemplateByName(input.projectId, input.name)) {
+        throw new DiagramTemplateNameConflictError(`模板名称已存在：${input.name}`);
+      }
+      const ts = nowIso();
+      const row: DiagramTemplateRow = {
+        id: newId(), project_id: input.projectId, scope: input.scope, name: input.name,
+        schema_version: input.schemaVersion, content: JSON.stringify(input.content),
+        thumbnail_meta: JSON.stringify(input.thumbnailMeta), created_by: input.createdBy,
+        created_at: ts, updated_at: ts, revoked_at: null,
+      };
+      this.db.prepare(
+        `INSERT INTO diagram_templates (id, project_id, scope, name, schema_version, content, thumbnail_meta, created_by, created_at, updated_at, revoked_at)
+         VALUES (@id, @project_id, @scope, @name, @schema_version, @content, @thumbnail_meta, @created_by, @created_at, @updated_at, @revoked_at)`,
+      ).run(row);
+      return mapDiagramTemplate(row);
+    })();
+  }
+
+  /** CAS 更新（模板 updated_at）；已撤销 → DiagramTemplateRevokedError，版本不符 → DiagramTemplateRevisionConflictError。 */
+  updateDiagramTemplate(
+    templateId: string,
+    patch: { name?: string; schemaVersion?: string; content?: DiagramTemplateContent; thumbnailMeta?: DiagramTemplateThumbnailMeta },
+    expectedUpdatedAt: string | null,
+  ): DiagramTemplate | undefined {
+    return this.db.transaction(() => {
+      const current = this.findDiagramTemplate(templateId);
+      if (!current) return undefined;
+      if (current.revokedAt) throw new DiagramTemplateRevokedError("模板已撤销，不可更新");
+      if (expectedUpdatedAt !== current.updatedAt) {
+        throw new DiagramTemplateRevisionConflictError(`模板已被其他操作修改；当前 updatedAt=${current.updatedAt}`, current.updatedAt);
+      }
+      const name = patch.name ?? current.name;
+      if (name !== current.name) {
+        const existing = this.findDiagramTemplateByName(current.projectId, name);
+        if (existing && existing.id !== templateId) throw new DiagramTemplateNameConflictError(`模板名称已存在：${name}`);
+      }
+      const next: DiagramTemplate = {
+        ...current,
+        name,
+        schemaVersion: patch.schemaVersion ?? current.schemaVersion,
+        content: patch.content ?? current.content,
+        thumbnailMeta: patch.thumbnailMeta ?? current.thumbnailMeta,
+        updatedAt: nextPrototypeRevision(current.updatedAt),
+      };
+      this.db.prepare(
+        `UPDATE diagram_templates SET name=@name, schema_version=@schema_version, content=@content, thumbnail_meta=@thumbnail_meta, updated_at=@updated_at WHERE id=@id`,
+      ).run({
+        id: templateId, name: next.name, schema_version: next.schemaVersion,
+        content: JSON.stringify(next.content), thumbnail_meta: JSON.stringify(next.thumbnailMeta), updated_at: next.updatedAt,
+      });
+      return next;
+    })();
+  }
+
+  /** 软撤销（delete 操作映射）；幂等：重复撤销返回当前状态。 */
+  revokeDiagramTemplate(templateId: string): DiagramTemplate | undefined {
+    return this.db.transaction(() => {
+      const current = this.findDiagramTemplate(templateId);
+      if (!current) return undefined;
+      if (current.revokedAt) return current;
+      const revokedAt = nextPrototypeRevision(current.updatedAt);
+      this.db.prepare("UPDATE diagram_templates SET revoked_at=@revokedAt, updated_at=@updatedAt WHERE id=@id")
+        .run({ id: templateId, revokedAt, updatedAt: revokedAt });
+      return { ...current, revokedAt, updatedAt: revokedAt };
+    })();
+  }
+
   insertFreeformAsset(asset: FreeformAsset): FreeformAsset {
     this.db.prepare(`INSERT INTO freeform_assets (id, project_id, mime, sha256, byte_size, storage_path, width, height, created_at)
       VALUES (@id, @projectId, @mime, @sha256, @byteSize, @storagePath, @width, @height, @createdAt)`).run({
@@ -1658,11 +1827,13 @@ export class Store {
       nodes: JSON.stringify((input.nodes ?? []).map(normalizeDiagramNodeLinks)),
       edges: JSON.stringify(input.edges ?? []),
       groups: JSON.stringify(input.groups ?? []),
+      layers: input.layers ? JSON.stringify(input.layers) : null,
+      components: input.components ? JSON.stringify(input.components) : null,
       created_at: ts, updated_at: ts,
     };
     this.db.prepare(
-      `INSERT INTO diagrams (id, project_id, title, type, nodes, edges, groups, created_at, updated_at)
-       VALUES (@id, @project_id, @title, @type, @nodes, @edges, @groups, @created_at, @updated_at)`
+      `INSERT INTO diagrams (id, project_id, title, type, nodes, edges, groups, layers, components, created_at, updated_at)
+       VALUES (@id, @project_id, @title, @type, @nodes, @edges, @groups, @layers, @components, @created_at, @updated_at)`
     ).run(row);
     return mapDiagram(row);
   }
@@ -1680,12 +1851,15 @@ export class Store {
     next.nodes = (next.nodes ?? []).map(normalizeDiagramNodeLinks);
     assertNoIntroducedDiagramGroupOverlap(current, next);
     this.db.prepare(
-      `UPDATE diagrams SET title=@title, type=@type, nodes=@nodesJson, edges=@edgesJson, groups=@groupsJson, updated_at=@updatedAt WHERE id=@id`
+      `UPDATE diagrams SET title=@title, type=@type, nodes=@nodesJson, edges=@edgesJson, groups=@groupsJson,
+         layers=@layersJson, components=@componentsJson, updated_at=@updatedAt WHERE id=@id`
     ).run({
       ...next,
       nodesJson: JSON.stringify(next.nodes ?? []),
       edgesJson: JSON.stringify(next.edges ?? []),
       groupsJson: JSON.stringify(next.groups ?? []),
+      layersJson: next.layers ? JSON.stringify(next.layers) : null,
+      componentsJson: next.components ? JSON.stringify(next.components) : null,
     });
     const nextNodeIds = new Set(next.nodes.map((node) => node.id));
     for (const node of current.nodes) {
@@ -2720,8 +2894,24 @@ CREATE TABLE IF NOT EXISTS diagrams (
   nodes TEXT NOT NULL DEFAULT '[]',
   edges TEXT NOT NULL DEFAULT '[]',
   groups TEXT NOT NULL DEFAULT '[]',
+  layers TEXT,
+  components TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS diagram_templates (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  scope TEXT NOT NULL,
+  name TEXT NOT NULL,
+  schema_version TEXT NOT NULL,
+  content TEXT NOT NULL,
+  thumbnail_meta TEXT NOT NULL DEFAULT '{}',
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  revoked_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prototype_drafts (
@@ -2903,6 +3093,8 @@ CREATE INDEX IF NOT EXISTS idx_document_references_document ON document_referenc
 CREATE INDEX IF NOT EXISTS idx_document_references_target ON document_references(project_id, target_type, target_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_document_references_unique ON document_references(document_id, target_type, target_id, relation_type);
 CREATE INDEX IF NOT EXISTS idx_diagrams_project ON diagrams(project_id);
+CREATE INDEX IF NOT EXISTS idx_diagram_templates_project_name ON diagram_templates(project_id, name);
+CREATE INDEX IF NOT EXISTS idx_diagram_templates_scope_updated ON diagram_templates(scope, updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_profiles_name ON llm_profiles(name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_project ON agent_sessions(project_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, created_at);
