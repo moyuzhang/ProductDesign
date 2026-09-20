@@ -967,7 +967,7 @@ function PlansTab(props: {
                   <button className="plan-title-link" onClick={() => setDetailPlan(p)}>{p.title}</button>
                   {p.kind === "task" ? <div className="cell-sub">设计 {displayAssignment(p.roleAssignments.designer)} · 施工 {displayAssignment(p.roleAssignments.builder)} · 审计 {displayAssignment(p.roleAssignments.auditor)}</div> : p.owner ? <div className="cell-sub">{p.owner}</div> : null}
                   {p.versionTag ? <div className="cell-sub mono">{p.versionTag}</div> : null}
-                  {p.diagramId && p.diagramNodeId ? (
+                  {EXECUTABLE_PLAN_KINDS.has(p.kind) && p.diagramId && p.diagramNodeId ? (
                     <button className="plan-node-link" onClick={() => navigate(planDeliveryHref(p)!)}>
                       进入实施流程
                     </button>
@@ -1087,7 +1087,9 @@ function PlanDetailModal(props: {
     return () => { active = false; };
   }, [props.plans, relationIds]);
 
-  const deliveryHref = planDeliveryHref(props.plan);
+  // 层级计划（goal/milestone/version）不进入施工交付流程，因此不展示生命周期与实施流程入口
+  const executablePlan = EXECUTABLE_PLAN_KINDS.has(props.plan.kind);
+  const deliveryHref = executablePlan ? planDeliveryHref(props.plan) : null;
   const currentStep = planLifecycleStep(props.plan.lifecycleStatus);
   const parent = props.plan.parentId ? relatedPlans[props.plan.parentId] : null;
   const dependencies = props.plan.dependencyIds.map((id) => relatedPlans[id] ?? id);
@@ -1116,7 +1118,7 @@ function PlanDetailModal(props: {
         </div>
         <div className="plan-detail-status">
           <Badge tone={props.plan.status === "已完成" ? "good" : props.plan.status === "已阻塞" ? "bad" : props.plan.status === "进行中" ? "warn" : "muted"}>{props.plan.status}</Badge>
-          <Badge tone={props.plan.lifecycleStatus === "accepted" ? "good" : props.plan.lifecycleStatus === "audit_failed" ? "bad" : "neutral"}>{PLAN_LIFECYCLE_LABELS[props.plan.lifecycleStatus]}</Badge>
+          {executablePlan ? <Badge tone={props.plan.lifecycleStatus === "accepted" ? "good" : props.plan.lifecycleStatus === "audit_failed" ? "bad" : "neutral"}>{PLAN_LIFECYCLE_LABELS[props.plan.lifecycleStatus]}</Badge> : null}
           <strong>{props.plan.progress}%</strong>
         </div>
       </section>
@@ -1128,16 +1130,22 @@ function PlanDetailModal(props: {
       <section className="plan-detail-section plan-detail-flow">
         <div className="plan-detail-section-heading">
           <div><h3>实施流程</h3><p>详情页展示进度；正式动作、证据和决定仍在节点施工单中完成。</p></div>
-          <Badge tone={deliveryHref ? "info" : "muted"}>{deliveryHref ? "已绑定画布节点" : "未绑定画布节点"}</Badge>
+          {executablePlan ? <Badge tone={deliveryHref ? "info" : "muted"}>{deliveryHref ? "已绑定画布节点" : "未绑定画布节点"}</Badge> : null}
         </div>
-        <div className="plan-delivery-stepper">
-          {PLAN_DELIVERY_STEPS.map((label, index) => {
-            const step = index + 1;
-            const state = currentStep > step ? "done" : currentStep === step ? "current" : "pending";
-            return <div className={`plan-delivery-step ${state}`} key={label}><span>{state === "done" ? "✓" : String(step).padStart(2, "0")}</span><strong>{label}</strong></div>;
-          })}
-        </div>
-        {!deliveryHref ? <div className="plan-detail-note">该计划尚未绑定画布交付节点，因此只能维护计划信息，不能进入正式施工流转。</div> : null}
+        {executablePlan ? (
+          <>
+            <div className="plan-delivery-stepper">
+              {PLAN_DELIVERY_STEPS.map((label, index) => {
+                const step = index + 1;
+                const state = currentStep > step ? "done" : currentStep === step ? "current" : "pending";
+                return <div className={`plan-delivery-step ${state}`} key={label}><span>{state === "done" ? "✓" : String(step).padStart(2, "0")}</span><strong>{label}</strong></div>;
+              })}
+            </div>
+            {!deliveryHref ? <div className="plan-detail-note">该计划尚未绑定画布交付节点，因此只能维护计划信息，不能进入正式施工流转。</div> : null}
+          </>
+        ) : (
+          <div className="plan-detail-note">该计划为{PLAN_KIND_LABELS[props.plan.kind]}，仅用于计划层级，不进入施工交付流程。</div>
+        )}
       </section>
 
       <div className="plan-detail-grid">

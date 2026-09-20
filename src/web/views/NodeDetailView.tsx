@@ -424,12 +424,11 @@ export function NodeDetailView(props: { diagramId: string; nodeId: string; initi
   const visibleTabs = deliveryTracked
     ? DETAIL_TABS
     : DETAIL_TABS.filter((item) => item !== "development" && item !== "delivery");
-  // 施工交付面板只面向可执行施工计划；绑定到本节点的里程碑等层级计划不应抢占选中态
+  // 施工交付面板只面向可执行施工计划；里程碑等层级计划既不进选中态，也不提供施工单入口
   const executablePlans = plans.filter((plan) => EXECUTABLE_PLAN_KINDS.has(plan.kind));
   const selectedPlan = executablePlans.find((plan) => plan.id === selectedPlanId)
     ?? executablePlans.find((plan) => plan.lifecycleStatus !== "accepted")
     ?? executablePlans[0]
-    ?? plans[0]
     ?? null;
   const nodeLayer = workflow?.nodes.find((node) => node.diagramId === diagram.id && node.nodeId === draft.id);
   const layerByPlanId = new Map(workflow?.layerGate.plans.map((state) => [state.planId, state]) ?? []);
@@ -699,7 +698,7 @@ export function NodeDetailView(props: { diagramId: string; nodeId: string; initi
                         <div className="development-plan-title">
                           <strong title={plan.title}>{plan.title}</strong>
                           <div className="development-plan-actions">
-                            <button className="btn btn-primary btn-sm" onClick={() => selectPlan(plan.id)}>打开施工单</button>
+                            {EXECUTABLE_PLAN_KINDS.has(plan.kind) ? <button className="btn btn-primary btn-sm" onClick={() => selectPlan(plan.id)}>打开施工单</button> : null}
                             <button className="btn btn-ghost btn-icon" title="编辑计划" onClick={() => setPlanEditor({ plan })}><Pencil size={13} /></button>
                             <button className="btn btn-ghost btn-icon btn-danger" title="删除计划" onClick={() => {
                               if (window.confirm(`确认删除开发动作「${plan.title}」？`)) {
