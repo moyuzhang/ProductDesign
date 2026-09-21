@@ -50,6 +50,29 @@ function fixture() {
 }
 
 describe("Main Agent coordination lease", () => {
+  it("resumes implementation rework at the builder stage without skipping design rework", () => {
+    const { store, projectId, planId } = fixture();
+    store.updatePlan(planId, { lifecycleStatus: "rework", managerDecision: "rejected", rejectionReason: "真实验收未闭环" });
+    const implementation = claimCoordinationLease(store, {
+      projectId, planId, mainAgentId: "Main Agent", workerId: "implementation-rework", idempotencyKey: "coord-implementation-rework",
+    });
+    expect(implementation.stage).toBe("implementation");
+    releaseCoordinationLease(store, { projectId, coordinationLeaseId: implementation.id, leaseToken: implementation.leaseToken, mainAgentId: "Main Agent" });
+
+    store.updatePlan(planId, { lifecycleStatus: "rework", managerDecision: "pending", auditStatus: "failed" });
+    const auditRework = claimCoordinationLease(store, {
+      projectId, planId, mainAgentId: "Main Agent", workerId: "audit-rework", idempotencyKey: "coord-audit-rework",
+    });
+    expect(auditRework.stage).toBe("implementation");
+    releaseCoordinationLease(store, { projectId, coordinationLeaseId: auditRework.id, leaseToken: auditRework.leaseToken, mainAgentId: "Main Agent" });
+
+    store.updatePlan(planId, { lifecycleStatus: "rework", managerDecision: "pending", auditStatus: "not_requested" });
+    const design = claimCoordinationLease(store, {
+      projectId, planId, mainAgentId: "Main Agent", workerId: "design-rework", idempotencyKey: "coord-design-rework",
+    });
+    expect(design.stage).toBe("design");
+  });
+
   it("binds the parent lease to one plan and rejects an exact task from another plan", () => {
     const { store, projectId, planId } = fixture();
     const project = store.getProject(projectId)!;
