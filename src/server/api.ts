@@ -40,6 +40,7 @@ import {
   type AgentPageContext,
   type AgentBlueprintKey,
   type DatabaseModel,
+  type Diagram,
   type Evidence,
   type NodeDatabaseBinding,
   type Paginated,
@@ -47,6 +48,7 @@ import {
   type ProjectWorkspaceNode,
   type PlanItem,
 } from "../shared/types.js";
+import { componentLibrarySchema, normalizeComponentLibrary } from "../shared/components.js";
 import { roleAssignmentErrors } from "../shared/planRoles.js";
 import { autoLayoutDatabaseModel, generateDatabaseCode, validateDatabaseModel } from "../shared/databaseModel.js";
 import { assertNoIntroducedDiagramGroupOverlap } from "../shared/diagramGroups.js";
@@ -70,6 +72,7 @@ import {
   createDiagramComponent,
   createDiagramTemplate,
   listDiagramTemplates,
+  normalizeDiagramLayerField,
   readDiagramComponents,
   readDiagramLayers,
   readDiagramTemplate,
@@ -2590,7 +2593,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id } = request.params as { id: string };
     const before = store.getDiagram(id);
     if (!before) return reply.code(404).send({ message: "画布不存在" });
-    const patch = parse(z.object({
+    const rawPatch = parse(z.object({
       title: z.string().trim().min(1).max(200).optional(),
       type: z.enum(DIAGRAM_TYPES).optional(),
       nodes: z.array(diagramNodeSchema).optional(),
@@ -2607,7 +2610,21 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       groups: z.array(z.object({
         id: z.string().min(1), name: z.string().max(200), nodeIds: z.array(z.string()),
       })).optional(),
+      // 设计 3.6：diagrams patch schema 增加可选 layers/components 旁路载荷（缺省不写、读取时派生）。
+      // 这里只收口字段存在性；真正的字段校验随后走与专用端点同源的 strict schema + validateLayerState。
+      layers: z.unknown().optional(),
+      components: z.unknown().optional(),
     }), request.body);
+    const { layers: rawLayers, components: rawComponents, ...patchFields } = rawPatch;
+    const write: Partial<Diagram> = { ...patchFields };
+    if (rawLayers !== undefined) {
+      const normalized = normalizeDiagramLayerField(whiteboardContext, before, rawLayers);
+      if ("result" in normalized) return reply.code(normalized.result.status).send(normalized.result.body);
+      write.layers = normalized.state;
+    }
+    // 组件同样先走与专用端点同源的 strict schema（未知字段 400），再归一化为规范载荷。
+    if (rawComponents !== undefined) write.components = normalizeComponentLibrary(parse(componentLibrarySchema, rawComponents));
+    const patch = write;
     if (before.type === "main" && patch.type !== undefined && patch.type !== "main") {
       throw httpError(409, "系统主画布是项目固定入口，不能修改为其他类型");
     }

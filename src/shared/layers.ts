@@ -91,10 +91,12 @@ export const diagramLayerStateSchema = z.object({
   itemOverrides: z.record(z.string().max(LAYER_ITEM_KEY_MAX), diagramItemOverrideSchema),
 }).strict();
 
-export const layerSaveSchema = z.object({
-  schemaVersion: z.literal(LAYER_SCHEMA_VERSION),
-  layers: z.array(diagramLayerSchema).max(LAYER_MAX),
-  itemOverrides: z.record(z.string().max(LAYER_ITEM_KEY_MAX), diagramItemOverrideSchema),
+/**
+ * 专用写端点的 body（状态 + CAS）。
+ * 与 diagramLayerStateSchema **同源派生**（设计 3.6「同一合成函数」）：字段校验规则不可能漂移，
+ * 故 diagrams PATCH 的可选 layers 字段与 PATCH /api/diagrams/:id/layers 走同一套字段判定。
+ */
+export const layerSaveSchema = diagramLayerStateSchema.extend({
   expectedUpdatedAt: z.string().max(64).nullable(),
   actor: z.string().trim().max(120).optional(),
 }).strict();

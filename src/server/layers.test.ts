@@ -279,4 +279,37 @@ describe("交付门禁隔离与既有规则（LAY-43 / 设计 10.4）", () => {
     const after = await deliveryGateSnapshot();
     expect(after).toEqual(before);
   });
+
+  it("组件实例引入重叠组合区域时返回 409 且画布零变化（CMP-31）", async () => {
+    const created = await app.inject({
+      method: "POST", url: "/api/diagrams",
+      payload: {
+        projectId, title: "组件重叠隔离", type: "free",
+        nodes: [
+          { id: "cmp-a", kind: "feature", label: "A", x: 0, y: 0 },
+          { id: "cmp-b", kind: "feature", label: "B", x: 120, y: 0 },
+        ],
+        edges: [], groups: [{ id: "cmp-group", name: "既有组", nodeIds: ["cmp-a", "cmp-b"] }],
+      },
+    });
+    expect(created.statusCode, created.body).toBe(200);
+    const targetId = created.json().id;
+    const component = await app.inject({
+      method: "POST", url: `/api/diagrams/${targetId}/components`,
+      payload: {
+        name: "重叠组件", expectedUpdatedAt: created.json().updatedAt,
+        selection: { nodeIds: ["cmp-a", "cmp-b"], edgeIds: [], freeformIds: [] },
+      },
+    });
+    expect(component.statusCode, component.body).toBe(201);
+    const before = await app.inject({ method: "GET", url: `/api/diagrams/${targetId}` });
+    const instantiate = await app.inject({
+      method: "POST", url: `/api/diagrams/${targetId}/components/${component.json().component.id}/instances`,
+      payload: { offsetX: 0, offsetY: 0, expectedUpdatedAt: component.json().diagramUpdatedAt },
+    });
+    expect(instantiate.statusCode, instantiate.body).toBe(409);
+    expect(instantiate.json().code).toBe("COMPONENT_GROUP_OVERLAP");
+    const after = await app.inject({ method: "GET", url: `/api/diagrams/${targetId}` });
+    expect(after.json()).toEqual(before.json());
+  });
 });

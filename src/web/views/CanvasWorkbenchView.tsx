@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { BookOpen, Check, ChevronDown, ChevronLeft, CornerUpLeft, Database, LayoutGrid, Layers, LockKeyhole, PenLine, Pencil, Plus, Search, Shapes, Trash2 } from "lucide-react";
-import { DIAGRAM_TYPES, type DesignDoc, type Diagram, type DiagramEdge, type DiagramFlowNodeType, type DiagramGroup, type DiagramNode, type DiagramNodeKind, type DiagramType, type DiagramUseCaseNodeType, type NodeShape, type PlanItem, type Project } from "../../shared/types";
+import { DIAGRAM_TYPES, type DesignDoc, type Diagram, type DiagramEdge, type DiagramFlowNodeType, type DiagramGroup, type DiagramLayerState, type DiagramNode, type DiagramNodeKind, type DiagramType, type DiagramUseCaseNodeType, type NodeShape, type PlanItem, type Project } from "../../shared/types";
 import { api } from "../api";
 import { navigate } from "../App";
 import { Badge, EmptyState, ErrorBanner, Field, Modal, Pagination, Spinner, StatCard, formatDateTime } from "../ui";
-import { DiagramCanvas, type DiagramPlanSummary } from "./DiagramCanvas";
+import { DiagramCanvas, type DiagramCanvasApi, type DiagramPlanSummary } from "./DiagramCanvas";
 import { DatabaseWorkbenchView } from "./DatabaseWorkbenchView";
 import { ShapePalette } from "./ShapePalette";
 import { useWorkspace } from "./workspace";
@@ -486,6 +486,8 @@ function CanvasEditor(props: {
   const [nodes, setNodes] = useState<DiagramNode[]>(props.diagram.nodes);
   const [edges, setEdges] = useState<DiagramEdge[]>(props.diagram.edges);
   const [groups, setGroups] = useState<DiagramGroup[]>(props.diagram.groups ?? []);
+  const [layerState, setLayerState] = useState<DiagramLayerState | null>(props.diagram.layers ?? null);
+  const [diagramUpdatedAt, setDiagramUpdatedAt] = useState(props.diagram.updatedAt);
   const [selection, setSelection] = useState<{ nodeIds: string[]; edgeIds: string[]; groupIds: string[] }>({ nodeIds: [], edgeIds: [], groupIds: [] });
   const [plans, setPlans] = useState<PlanItem[]>([]);
   const [documents, setDocuments] = useState<DesignDoc[]>([]);
@@ -513,7 +515,7 @@ function CanvasEditor(props: {
   const escapedRef = useRef(false);
   const hintTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const typePickerRef = useRef<HTMLDivElement>(null);
-  const editorApiRef = useRef<{ insertNode: (kind: DiagramNodeKind, shape?: NodeShape, label?: string, flowType?: DiagramFlowNodeType, useCaseType?: DiagramUseCaseNodeType) => void } | null>(null);
+  const editorApiRef = useRef<DiagramCanvasApi | null>(null);
   const { setPageContextDetail, lastEntityChange } = useAgentUiBridge();
   const dirty = useMemo(() => title !== props.diagram.title
     || diagramType !== props.diagram.type
@@ -590,6 +592,20 @@ function CanvasEditor(props: {
       .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "开发计划加载失败"); });
     return () => { active = false; };
   }, [props.diagram.id, props.diagram.projectId]);
+
+  useEffect(() => {
+    let active = true;
+    setLayerState(props.diagram.layers ?? null);
+    setDiagramUpdatedAt(props.diagram.updatedAt);
+    api.getDiagramLayers(props.diagram.id)
+      .then((response) => {
+        if (!active) return;
+        setLayerState({ schemaVersion: response.schemaVersion, layers: response.layers, itemOverrides: response.itemOverrides });
+        setDiagramUpdatedAt(response.diagramUpdatedAt);
+      })
+      .catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : "图层读取失败"); });
+    return () => { active = false; };
+  }, [props.diagram.id, props.diagram.layers, props.diagram.updatedAt]);
 
   const planSummaries = nodes.reduce<Record<string, DiagramPlanSummary>>((summaries, node) => {
     const items = plans
@@ -860,6 +876,7 @@ function CanvasEditor(props: {
           onRegisterApi={(api) => { editorApiRef.current = api; }}
           onCommit={(n, e, g) => { setNodes(n); setEdges(e); setGroups(g); }}
           onSelectionChange={setSelection}
+          layerState={layerState}
           keyboardDisabled={prototypeOpen || freeformOpen}
         />
       </div>
@@ -877,10 +894,12 @@ function CanvasEditor(props: {
             diagramId={props.diagram.id}
             diagram={{ nodes, edges }}
             onClose={() => setLayersOpen(false)}
+            onSelectionChange={(itemKeys) => editorApiRef.current?.selectItems(itemKeys)}
+            onLayersChanged={(state, updatedAt) => { setLayerState(state); setDiagramUpdatedAt(updatedAt); }}
           />
           <DiagramComponentLibrary
             diagramId={props.diagram.id}
-            diagramUpdatedAt={props.diagram.updatedAt}
+            diagramUpdatedAt={diagramUpdatedAt}
             selection={{ nodeIds: selection.nodeIds, edgeIds: selection.edgeIds, freeformIds: [] }}
           />
         </div>

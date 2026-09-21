@@ -15,6 +15,7 @@ import {
   type DiagramEdge,
   type DiagramFlowNodeType,
   type DiagramGroup,
+  type DiagramLayerState,
   type DiagramNode,
   type DiagramNodeKind,
   type DiagramPoint,
@@ -26,6 +27,7 @@ import {
   type NodeShape,
   type RequirementStatus,
 } from "../../shared/types";
+import { buildLayerIndex, effectiveHidden, effectiveLocked, itemKeyOf } from "../../shared/layers";
 import {
   diagramGroupBounds,
   diagramGroupOverlapMessage,
@@ -759,6 +761,11 @@ export function resolveSubCanvasOpenIntent(
   return { directId: choices.length === 1 ? choices[0].id : null, choices };
 }
 
+export interface DiagramCanvasApi {
+  insertNode: (kind: DiagramNodeKind, shape?: NodeShape, label?: string, flowType?: DiagramFlowNodeType, useCaseType?: DiagramUseCaseNodeType) => void;
+  selectItems: (itemKeys: string[]) => void;
+}
+
 export function DiagramCanvas(props: {
   initial: Pick<Diagram, "nodes" | "edges" | "groups">;
   diagramType: DiagramType;
@@ -771,13 +778,38 @@ export function DiagramCanvas(props: {
   onOpenNodeDetails: (id: string, tab?: string) => void;
   titleForExport?: string;
   onExtractToNewCanvas?: (payload: { nodes: DiagramNode[]; edges: DiagramEdge[]; title: string; sourceNodeIds: string[] }) => void;
-  onRegisterApi?: (api: { insertNode: (kind: DiagramNodeKind, shape?: NodeShape, label?: string, flowType?: DiagramFlowNodeType, useCaseType?: DiagramUseCaseNodeType) => void }) => void;
+  onRegisterApi?: (api: DiagramCanvasApi) => void;
   onSelectionChange?: (selection: { nodeIds: string[]; edgeIds: string[]; groupIds: string[] }) => void;
+  layerState?: DiagramLayerState | null;
   keyboardDisabled?: boolean;
 }): ReactElement {
   const [nodes, setNodes] = useState<DiagramNode[]>(props.initial.nodes);
   const [edges, setEdges] = useState<DiagramEdge[]>(props.initial.edges);
   const [groups, setGroups] = useState<DiagramGroup[]>(props.initial.groups ?? []);
+  const layerIndex = useMemo(() => buildLayerIndex({ diagram: { nodes, edges } }), [nodes, edges]);
+  const layerAccess = useMemo(() => {
+    const hiddenNodeIds = new Set<string>(), lockedNodeIds = new Set<string>();
+    const hiddenEdgeIds = new Set<string>(), lockedEdgeIds = new Set<string>();
+    if (!props.layerState) return { hiddenNodeIds, lockedNodeIds, hiddenEdgeIds, lockedEdgeIds };
+    for (const node of nodes) {
+      const key = itemKeyOf("node", node.id);
+      if (effectiveHidden(props.layerState, layerIndex, key)) hiddenNodeIds.add(node.id);
+      if (effectiveLocked(props.layerState, layerIndex, key)) lockedNodeIds.add(node.id);
+    }
+    for (const edge of edges) {
+      const key = itemKeyOf("edge", edge.id);
+      if (effectiveHidden(props.layerState, layerIndex, key)) hiddenEdgeIds.add(edge.id);
+      if (effectiveLocked(props.layerState, layerIndex, key)) lockedEdgeIds.add(edge.id);
+    }
+    return { hiddenNodeIds, lockedNodeIds, hiddenEdgeIds, lockedEdgeIds };
+  }, [edges, layerIndex, nodes, props.layerState]);
+  const visibleNodes = useMemo(() => nodes.filter((node) => !layerAccess.hiddenNodeIds.has(node.id)), [layerAccess.hiddenNodeIds, nodes]);
+  const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
+  const visibleEdges = useMemo(() => edges.filter((edge) => !layerAccess.hiddenEdgeIds.has(edge.id)
+    && visibleNodeIds.has(edge.from) && visibleNodeIds.has(edge.to)), [edges, layerAccess.hiddenEdgeIds, visibleNodeIds]);
+  const visibleGroups = useMemo(() => groups
+    .map((group) => ({ ...group, nodeIds: group.nodeIds.filter((id) => visibleNodeIds.has(id)) }))
+    .filter((group) => group.nodeIds.length > 0), [groups, visibleNodeIds]);
   const [selectedIds, setSelectedIds] = useState<string[]>(() =>
     props.initialSelectedNodeId && props.initial.nodes.some((node) => node.id === props.initialSelectedNodeId)
       ? [props.initialSelectedNodeId]
@@ -874,6 +906,11 @@ export function DiagramCanvas(props: {
       groupIds: selectedGroupId ? [selectedGroupId] : [],
     });
   }, [props.onSelectionChange, selectedEdgeId, selectedGroupId, selectedIds]);
+
+  useEffect(() => {
+    setSelectedIds((current) => current.filter((id) => !layerAccess.hiddenNodeIds.has(id)));
+    setSelectedEdgeId((current) => current && layerAccess.hiddenEdgeIds.has(current) ? null : current);
+  }, [layerAccess.hiddenEdgeIds, layerAccess.hiddenNodeIds]);
 
   useEffect(() => {
     setSubCanvasPicker(null);
@@ -1071,15 +1108,15 @@ export function DiagramCanvas(props: {
 
   const hitNode = useCallback((wx: number, wy: number): string | null => {
     const candidates = props.diagramType === "usecase"
-      ? [...nodes.filter((node) => useCaseTypeOf(node) !== "boundary").reverse(), ...nodes.filter((node) => useCaseTypeOf(node) === "boundary").reverse()]
-      : [...nodes].reverse();
+      ? [...visibleNodes.filter((node) => useCaseTypeOf(node) !== "boundary").reverse(), ...visibleNodes.filter((node) => useCaseTypeOf(node) === "boundary").reverse()]
+      : [...visibleNodes].reverse();
     for (const n of candidates) {
       if (wx >= n.x - nodeW(n) / 2 && wx <= n.x + nodeW(n) / 2 && wy >= n.y - nodeH(n) / 2 && wy <= n.y + nodeH(n) / 2) {
         return n.id;
       }
     }
     return null;
-  }, [nodes, props.diagramType]);
+  }, [props.diagramType, visibleNodes]);
 
   const commit = useCallback((nextNodes: DiagramNode[], nextEdges: DiagramEdge[], nextGroups: DiagramGroup[]) => {
     props.onCommit(nextNodes, nextEdges, nextGroups);
@@ -1087,6 +1124,7 @@ export function DiagramCanvas(props: {
 
   type Snapshot = { nodes: DiagramNode[]; edges: DiagramEdge[]; groups: DiagramGroup[] };
   const historyRef = useRef<{ past: Snapshot[]; future: Snapshot[] }>({ past: [], future: [] });
+  useEffect(() => { historyRef.current = { past: [], future: [] }; }, [props.layerState]);
   const dragBefore = useRef<Snapshot | null>(null);
   const snapshot = useCallback((): Snapshot => ({ nodes, edges, groups }), [nodes, edges, groups]);
   const recordHistory = useCallback((before: Snapshot) => {
@@ -1163,14 +1201,14 @@ export function DiagramCanvas(props: {
   // ---------- selection actions ----------
 
   const applyAlign = useCallback((kind: AlignKind) => {
-    const sel = nodes.filter((n) => selectedIds.includes(n.id));
+    const sel = nodes.filter((n) => selectedIds.includes(n.id) && !layerAccess.lockedNodeIds.has(n.id));
     if (sel.length < 2) return;
     const xs = sel.map((n) => n.x);
     const ys = sel.map((n) => n.y);
     const minX = Math.min(...xs), maxX = Math.max(...xs);
     const minY = Math.min(...ys), maxY = Math.max(...ys);
     const midX = (minX + maxX) / 2, midY = (minY + maxY) / 2;
-    const set = new Set(selectedIds);
+    const set = new Set(sel.map((node) => node.id));
     let next: DiagramNode[];
     if (kind === "distH" || kind === "distV") {
       const axis = kind === "distH" ? "x" : "y";
@@ -1194,11 +1232,13 @@ export function DiagramCanvas(props: {
       });
     }
     applyChange(next, clearEdgePoints(edges), groups, snapshot());
-  }, [nodes, edges, selectedIds, groups, applyChange, snapshot]);
+  }, [nodes, edges, selectedIds, groups, applyChange, snapshot, layerAccess.lockedNodeIds]);
 
   const deleteSelected = useCallback(() => {
     if (selectedIds.length === 0) return;
-    const set = new Set(selectedIds);
+    const set = new Set(selectedIds.filter((id) => !layerAccess.lockedNodeIds.has(id)
+      && !edges.some((edge) => layerAccess.lockedEdgeIds.has(edge.id) && (edge.from === id || edge.to === id))));
+    if (set.size === 0) return;
     const nextNodes = nodes.filter((n) => !set.has(n.id));
     const nextEdges = edges.filter((e) => !set.has(e.from) && !set.has(e.to));
     const nextGroups = groups
@@ -1208,15 +1248,17 @@ export function DiagramCanvas(props: {
     setSelectedEdgeId(null);
     setSelectedGroupId(null);
     applyChange(nextNodes, nextEdges, nextGroups, snapshot());
-  }, [nodes, edges, groups, selectedIds, applyChange, snapshot]);
+  }, [nodes, edges, groups, selectedIds, applyChange, snapshot, layerAccess.lockedEdgeIds, layerAccess.lockedNodeIds]);
 
   const deleteEdge = useCallback((id: string) => {
+    if (layerAccess.lockedEdgeIds.has(id)) return;
     const nextEdges = edges.filter((e) => e.id !== id);
     setSelectedEdgeId((x) => (x === id ? null : x));
     applyChange(nodes, nextEdges, groups, snapshot());
-  }, [edges, nodes, groups, applyChange, snapshot]);
+  }, [edges, nodes, groups, applyChange, snapshot, layerAccess.lockedEdgeIds]);
 
   const updateEdge = useCallback((id: string, patch: Partial<DiagramEdge>) => {
+    if (layerAccess.lockedEdgeIds.has(id)) return;
     const routeChanged = patch.style !== undefined || patch.sourcePort !== undefined || patch.targetPort !== undefined;
     const hasPointsPatch = Object.prototype.hasOwnProperty.call(patch, "points");
     const next = edges.map((e) => (e.id === id ? {
@@ -1227,7 +1269,7 @@ export function DiagramCanvas(props: {
       routeVersion: routeChanged ? 1 : patch.routeVersion ?? e.routeVersion,
     } : e));
     applyChange(nodes, next, groups, snapshot());
-  }, [edges, groups, applyChange, snapshot]);
+  }, [edges, groups, applyChange, snapshot, layerAccess.lockedEdgeIds]);
 
   // ---------- global pointer handlers ----------
 
@@ -1373,7 +1415,7 @@ export function DiagramCanvas(props: {
         const bw = Math.abs(w.x - g.startWorld.x), bh = Math.abs(w.y - g.startWorld.y);
         setBoxState(null);
         if (bw < 6 && bh < 6) { clearSelected(); return; }
-        const ids = nodes
+        const ids = visibleNodes
           .filter((n) => n.x >= x && n.x <= x + bw && n.y >= y && n.y <= y + bh)
           .map((n) => n.id);
         setSelectedIds((prev) => Array.from(new Set([...prev, ...ids])));
@@ -1414,7 +1456,7 @@ export function DiagramCanvas(props: {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [toWorld, hitNode, commit, nodes, edges, groups, clearSelected, recordHistory, snapEnabled]);
+  }, [toWorld, hitNode, commit, nodes, edges, groups, clearSelected, recordHistory, snapEnabled, visibleNodes]);
 
   // ---------- node ops ----------
 
@@ -1444,10 +1486,20 @@ export function DiagramCanvas(props: {
   };
 
   useEffect(() => {
-    props.onRegisterApi?.({ insertNode: (kind, shape, label, flowType, useCaseType) => addNode(kind, undefined, shape, label, flowType, useCaseType) });
+    props.onRegisterApi?.({
+      insertNode: (kind, shape, label, flowType, useCaseType) => addNode(kind, undefined, shape, label, flowType, useCaseType),
+      selectItems: (itemKeys) => {
+        const nodeIds = itemKeys.filter((key) => key.startsWith("node:")).map((key) => key.slice(5)).filter((id) => nodes.some((node) => node.id === id));
+        const edgeIds = itemKeys.filter((key) => key.startsWith("edge:")).map((key) => key.slice(5)).filter((id) => edges.some((edge) => edge.id === id));
+        setSelectedIds(nodeIds);
+        setSelectedEdgeId(edgeIds.at(-1) ?? null);
+        setSelectedGroupId(null);
+      },
+    });
   });
 
   const updateNode = (id: string, patch: Partial<DiagramNode>) => {
+    if (layerAccess.lockedNodeIds.has(id)) return;
     const next = nodes.map((n) => (n.id === id ? { ...n, ...patch, deliveryUpdatedAt: new Date().toISOString() } : n));
     const geometryChanged = patch.x !== undefined || patch.y !== undefined || patch.w !== undefined || patch.h !== undefined;
     applyChange(next, geometryChanged ? clearEdgePoints(edges) : edges, groups, snapshot());
@@ -1467,8 +1519,9 @@ export function DiagramCanvas(props: {
     return name;
   };
   const groupSelected = () => {
-    if (selectedIds.length < 2) return;
-    const g: DiagramGroup = { id: uid(), name: groupNameUnique(), nodeIds: [...selectedIds] };
+    const nodeIds = selectedIds.filter((id) => !layerAccess.lockedNodeIds.has(id));
+    if (nodeIds.length < 2) return;
+    const g: DiagramGroup = { id: uid(), name: groupNameUnique(), nodeIds };
     if (applyChange(nodes, edges, [...groups, g], snapshot())) setSelectedGroupId(g.id);
   };
   const ungroup = (id: string) => {
@@ -1576,12 +1629,13 @@ export function DiagramCanvas(props: {
     setSelectedGroupId(null);
     setGroupCollision(null);
     setInspectorError("");
+    if (layerAccess.lockedNodeIds.has(id)) { gesture.current = { type: "none" }; return; }
     dragBefore.current = snapshot();
     const w = toWorld(e.clientX, e.clientY);
     gesture.current = {
       type: "move",
       fromWorld: w,
-      startNodes: base.map((bid) => {
+      startNodes: base.filter((bid) => !layerAccess.lockedNodeIds.has(bid)).map((bid) => {
         const n = nodes.find((m) => m.id === bid);
         return { id: bid, x: n?.x ?? 0, y: n?.y ?? 0 };
       }),
@@ -1591,6 +1645,7 @@ export function DiagramCanvas(props: {
   const dragEdge = (e: React.PointerEvent, id: string, sourcePort: DiagramPort, defaultLabel?: string) => {
     e.stopPropagation();
     e.preventDefault();
+    if (layerAccess.lockedNodeIds.has(id)) return;
     setSelectedEdgeId(null);
     dragBefore.current = snapshot();
     const w = toWorld(e.clientX, e.clientY);
@@ -1606,7 +1661,7 @@ export function DiagramCanvas(props: {
   const dragEdgeEndpoint = (e: React.PointerEvent, edgeId: string, endpoint: "source" | "target") => {
     e.stopPropagation();
     e.preventDefault();
-    if (!edges.some((edge) => edge.id === edgeId)) return;
+    if (layerAccess.lockedEdgeIds.has(edgeId) || !edges.some((edge) => edge.id === edgeId)) return;
     setSelectedIds([]);
     setSelectedGroupId(null);
     setSelectedEdgeId(edgeId);
@@ -1620,7 +1675,7 @@ export function DiagramCanvas(props: {
   const dragEdgeBend = (e: React.PointerEvent, edgeId: string, pointIndex: number, route: DiagramPoint[]) => {
     e.stopPropagation();
     e.preventDefault();
-    if (pointIndex <= 0 || pointIndex >= route.length - 1) return;
+    if (layerAccess.lockedEdgeIds.has(edgeId) || pointIndex <= 0 || pointIndex >= route.length - 1) return;
     dragBefore.current = snapshot();
     const points = route.map((point) => ({ ...point }));
     setEdges((current) => current.map((edge) => edge.id === edgeId ? { ...edge, points, routingMode: "manual", routeVersion: 1 } : edge));
@@ -1630,6 +1685,7 @@ export function DiagramCanvas(props: {
   const resizeNode = (e: React.PointerEvent, id: string) => {
     e.stopPropagation();
     e.preventDefault();
+    if (layerAccess.lockedNodeIds.has(id)) return;
     const n = nodes.find((m) => m.id === id);
     if (!n) return;
     dragBefore.current = snapshot();
@@ -1694,8 +1750,8 @@ export function DiagramCanvas(props: {
       return;
     }
     // 进入全屏后布局更新，等一帧再适配内容，保证“整个页面显示画布”时内容完整可见。
-    const currentNodes = nodes;
-    const currentEdges = edges;
+    const currentNodes = visibleNodes;
+    const currentEdges = visibleEdges;
     const request = el.requestFullscreen?.();
     if (request) {
       void request.then(() => requestAnimationFrame(() => fitView(currentNodes, currentEdges))).catch(() => {});
@@ -1710,6 +1766,10 @@ export function DiagramCanvas(props: {
 
   const autoArrange = async () => {
     if (layoutBusy || nodes.length === 0) return;
+    if (layerAccess.lockedNodeIds.size || layerAccess.hiddenNodeIds.size || layerAccess.hiddenEdgeIds.size) {
+      setLayoutError("存在已锁定或已隐藏图层内容，自动整理已停止，避免改动不可编辑元素");
+      return;
+    }
     setLayoutBusy(true);
     setLayoutError("");
     try {
@@ -1724,7 +1784,7 @@ export function DiagramCanvas(props: {
 
   const baseName = () => props.titleForExport?.trim() || "diagram";
   const exportPng = () => {
-    const svgStr = buildDiagramSvg(nodes, edges, groups, props.diagramType);
+    const svgStr = buildDiagramSvg(visibleNodes, visibleEdges, visibleGroups, props.diagramType);
     if (!svgStr) return;
     const blob = new Blob([svgStr], { type: "image/svg+xml;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -1750,7 +1810,7 @@ export function DiagramCanvas(props: {
     img.src = url;
   };
   const exportSvg = () => {
-    const svgStr = buildDiagramSvg(nodes, edges, groups, props.diagramType);
+    const svgStr = buildDiagramSvg(visibleNodes, visibleEdges, visibleGroups, props.diagramType);
     if (!svgStr) return;
     const blob = new Blob([svgStr], { type: "image/svg+xml;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -1772,7 +1832,7 @@ export function DiagramCanvas(props: {
   const selectedShowsDelivery = Boolean(selectedNode && DELIVERY_DIAGRAM_TYPES.has(props.diagramType) && DELIVERY_NODE_KINDS.has(selectedNode.kind));
   const selectedPlanSummary = selectedNode ? props.planSummaries?.[selectedNode.id] : undefined;
   const selectedEdge = edges.find((e) => e.id === selectedEdgeId) ?? null;
-  const routeResults = useMemo(() => routeDiagramEdges(nodes, edges, { zoom }), [nodes, edges, zoom]);
+  const routeResults = useMemo(() => routeDiagramEdges(visibleNodes, visibleEdges, { zoom }), [visibleNodes, visibleEdges, zoom]);
   const selectedRoute = selectedEdge ? routeResults.get(selectedEdge.id) : undefined;
   const selectedGroup = groups.find((g) => g.id === selectedGroupId) ?? null;
   const hasInspector = Boolean(selectedEdge || selectedGroup || selectedNode);
@@ -1797,7 +1857,7 @@ export function DiagramCanvas(props: {
       const mod = event.ctrlKey || event.metaKey;
       if (mod && event.key === "0") {
         event.preventDefault();
-        fitView(nodes, edges);
+        fitView(visibleNodes, visibleEdges);
         return;
       }
       if (!mod && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "f") {
@@ -1807,7 +1867,7 @@ export function DiagramCanvas(props: {
     };
     window.addEventListener("keydown", onViewShortcut);
     return () => window.removeEventListener("keydown", onViewShortcut);
-  }, [edges, fitView, focusSelection, nodes, props.keyboardDisabled]);
+  }, [fitView, focusSelection, props.keyboardDisabled, visibleEdges, visibleNodes]);
   const existingGroupOverlaps = listDiagramGroupOverlaps({ nodes, groups });
   const groupConflictIds = new Set([
     ...existingGroupOverlaps.flatMap((overlap) => [overlap.first.id, overlap.second.id]),
@@ -1865,9 +1925,9 @@ export function DiagramCanvas(props: {
     ? nodeMoveDeltas(activeGesture.startNodes, nodes)
     : new Map<string, NodeDelta>();
   const resizingNodeId = activeGesture.type === "resize" ? activeGesture.id : null;
-  const relatedNodeIds = relatedDiagramNodeIds(hoveredNodeId, edges);
-  const commandResults = rankDiagramNodes(nodes, commandQuery);
-  const miniMapBounds = getDiagramBounds(nodes, 56);
+  const relatedNodeIds = relatedDiagramNodeIds(hoveredNodeId, visibleEdges);
+  const commandResults = rankDiagramNodes(visibleNodes, commandQuery);
+  const miniMapBounds = getDiagramBounds(visibleNodes, 56);
   const miniMapWidth = 190;
   const miniMapHeight = 118;
   const miniMapProjection = createMiniMapProjection(miniMapBounds, miniMapWidth, miniMapHeight, 9);
@@ -1936,7 +1996,7 @@ export function DiagramCanvas(props: {
           <button className="btn btn-ghost btn-icon" onClick={() => setZoom((z) => Math.max(0.3, z - 0.15))} title="缩小">−</button>
           <span className="mono" style={{ width: 44, textAlign: "center" }}>{Math.round(zoom * 100)}%</span>
           <button className="btn btn-ghost btn-icon" onClick={() => setZoom((z) => Math.min(2.5, z + 0.15))} title="放大">+</button>
-          <button className="btn btn-ghost btn-sm" onClick={() => fitView(nodes, edges)} title="适配全部内容（Ctrl/⌘+0）">适配</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => fitView(visibleNodes, visibleEdges)} title="适配全部可见内容（Ctrl/⌘+0）">适配</button>
           <button className="btn btn-ghost btn-sm" onClick={focusSelection} disabled={!hasInspector} title="聚焦选中内容（F）"><LocateFixed size={14} /> F</button>
           <button className={`btn btn-ghost btn-sm ${focusMode ? "active" : ""}`} onClick={() => setFocusMode((value) => !value)} aria-pressed={focusMode} title="专注模式；Esc 退出">{focusMode ? "退出专注" : "专注"}</button>
         </div>
@@ -1972,7 +2032,7 @@ export function DiagramCanvas(props: {
       >
         <svg
           ref={svgRef}
-          className={`canvas-svg ${nodes.length >= 500 || edges.length >= 1000 ? "large-graph" : ""}`}
+          className={`canvas-svg ${visibleNodes.length >= 500 || visibleEdges.length >= 1000 ? "large-graph" : ""}`}
           onPointerDown={(e) => {
             if (e.button === 1) { startPan(e); return; }
             if (e.button !== 0) return;
@@ -2017,8 +2077,8 @@ export function DiagramCanvas(props: {
             {alignmentGuides.x !== undefined ? <line className="canvas-alignment-guide" x1={alignmentGuides.x} x2={alignmentGuides.x} y1={-6000} y2={6000} /> : null}
             {alignmentGuides.y !== undefined ? <line className="canvas-alignment-guide" y1={alignmentGuides.y} y2={alignmentGuides.y} x1={-6000} x2={6000} /> : null}
 
-            {groups.map((g) => {
-              const bounds = diagramGroupBounds(g, nodes);
+            {visibleGroups.map((g) => {
+              const bounds = diagramGroupBounds(g, visibleNodes);
               if (!bounds) return null;
               const isSel = selectedGroupId === g.id;
               const isConflict = groupConflictIds.has(g.id);
@@ -2046,7 +2106,7 @@ export function DiagramCanvas(props: {
               );
             })}
 
-            {edges.map((edge) => {
+            {visibleEdges.map((edge) => {
               const from = edgeFromNode(edge.from);
               const to = edgeFromNode(edge.to);
               if (!from || !to) return null;
@@ -2158,7 +2218,7 @@ export function DiagramCanvas(props: {
               />
             ) : null}
 
-            {[...nodes].sort((a, b) => Number(useCaseTypeOf(a) !== "boundary") - Number(useCaseTypeOf(b) !== "boundary")).map((node) => {
+            {[...visibleNodes].sort((a, b) => Number(useCaseTypeOf(a) !== "boundary") - Number(useCaseTypeOf(b) !== "boundary")).map((node) => {
               const style = NODE_STYLE[node.kind];
               const w = nodeW(node), h = nodeH(node);
               const isSel = selectedIds.includes(node.id);
@@ -2486,13 +2546,13 @@ export function DiagramCanvas(props: {
                 setPan({ x: viewportWidth / 2 - worldX * zoom, y: viewportHeight / 2 - worldY * zoom });
               }}
             >
-              {edges.map((edge) => {
-                const from = nodes.find((node) => node.id === edge.from);
-                const to = nodes.find((node) => node.id === edge.to);
+              {visibleEdges.map((edge) => {
+                const from = visibleNodes.find((node) => node.id === edge.from);
+                const to = visibleNodes.find((node) => node.id === edge.to);
                 if (!from || !to) return null;
                 return <line key={edge.id} x1={miniMapProjection.projectX(from.x)} y1={miniMapProjection.projectY(from.y)} x2={miniMapProjection.projectX(to.x)} y2={miniMapProjection.projectY(to.y)} stroke="#476276" strokeWidth={0.8} />;
               })}
-              {nodes.map((node) => (
+              {visibleNodes.map((node) => (
                 <rect
                   key={node.id}
                   x={miniMapProjection.projectX(node.x - nodeW(node) / 2)}
@@ -2541,7 +2601,7 @@ export function DiagramCanvas(props: {
               </div>
               <div className="canvas-command-meta">
                 <span>节点导航</span>
-                <small>{commandResults.length} / {nodes.length}</small>
+                <small>{commandResults.length} / {visibleNodes.length}</small>
               </div>
               <div className="canvas-command-results">
                 {commandResults.length > 0 ? commandResults.map((node) => (

@@ -1562,6 +1562,12 @@ export class Store {
     return row ? mapDiagram(row) : undefined;
   }
 
+  /** Raw layer payload is needed to preserve and reject future schema versions without downgrading them. */
+  getRawDiagramLayers(id: string): Record<string, unknown> | null {
+    const row = this.db.prepare("SELECT layers FROM diagrams WHERE id = ?").get(id) as Pick<DiagramRow, "layers"> | undefined;
+    return row ? parseNullableObject(row.layers) : null;
+  }
+
   getPrototypeDraft(diagramId: string): PrototypeStored | undefined {
     const row = this.db.prepare("SELECT * FROM prototype_drafts WHERE diagram_id = ?").get(diagramId) as PrototypeDraftRow | undefined;
     if (!row) return undefined;
@@ -1850,9 +1856,13 @@ export class Store {
     const next: Diagram = { ...current, ...patch, id: current.id, createdAt: current.createdAt, updatedAt: nowIso() };
     next.nodes = (next.nodes ?? []).map(normalizeDiagramNodeLinks);
     assertNoIntroducedDiagramGroupOverlap(current, next);
+    const writesLayers = Object.prototype.hasOwnProperty.call(patch, "layers");
+    const writesComponents = Object.prototype.hasOwnProperty.call(patch, "components");
     this.db.prepare(
       `UPDATE diagrams SET title=@title, type=@type, nodes=@nodesJson, edges=@edgesJson, groups=@groupsJson,
-         layers=@layersJson, components=@componentsJson, updated_at=@updatedAt WHERE id=@id`
+         layers=CASE WHEN @writesLayers = 1 THEN @layersJson ELSE layers END,
+         components=CASE WHEN @writesComponents = 1 THEN @componentsJson ELSE components END,
+         updated_at=@updatedAt WHERE id=@id`
     ).run({
       ...next,
       nodesJson: JSON.stringify(next.nodes ?? []),
@@ -1860,6 +1870,8 @@ export class Store {
       groupsJson: JSON.stringify(next.groups ?? []),
       layersJson: next.layers ? JSON.stringify(next.layers) : null,
       componentsJson: next.components ? JSON.stringify(next.components) : null,
+      writesLayers: writesLayers ? 1 : 0,
+      writesComponents: writesComponents ? 1 : 0,
     });
     const nextNodeIds = new Set(next.nodes.map((node) => node.id));
     for (const node of current.nodes) {

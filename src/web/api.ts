@@ -186,7 +186,7 @@ async function whiteboardRequest<T>(method: string, url: string, body?: unknown)
 }
 
 /** 图层读取响应：图层状态 + 画布 updatedAt（作为下一次保存的 CAS 基准）。 */
-export type DiagramLayerReadResponse = DiagramLayerState & { diagramUpdatedAt: string };
+export type DiagramLayerReadResponse = DiagramLayerState & { diagramUpdatedAt: string; unsupported?: boolean };
 export type DiagramComponentReadResponse = DiagramComponentLibrary & { diagramUpdatedAt: string };
 export interface DiagramComponentWriteResponse {
   component: DiagramComponentDefinition;
@@ -360,7 +360,7 @@ export const api = {
     request<Paginated<Diagram>>("GET", `/api/diagrams${qs({ ...filter, limit: filter.limit ?? 20, offset: filter.offset ?? 0 })}`),
   getDiagram: (id: string) => request<Diagram>("GET", `/api/diagrams/${id}`),
   createDiagram: (body: Record<string, unknown>) => request<Diagram>("POST", "/api/diagrams", body),
-  updateDiagram: (id: string, patch: { title?: string; type?: string; nodes?: unknown[]; edges?: unknown[]; groups?: unknown[] }) =>
+  updateDiagram: (id: string, patch: { title?: string; type?: string; nodes?: unknown[]; edges?: unknown[]; groups?: unknown[]; layers?: DiagramLayerState; components?: DiagramComponentLibrary }) =>
     request<Diagram>("PATCH", `/api/diagrams/${id}`, patch),
   deleteDiagram: (id: string) => request<{ ok: boolean }>("DELETE", `/api/diagrams/${id}`),
   getPrototypeDraft: (id: string) => request<PrototypeStored | null>("GET", `/api/diagrams/${id}/prototype`),

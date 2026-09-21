@@ -21,6 +21,7 @@ import {
 import {
   LAYER_SCHEMA_VERSION,
   defaultLayerState,
+  diagramLayerStateSchema,
   layerSaveSchema,
   layerStateFingerprint,
   normalizeLayerState,
@@ -160,16 +161,82 @@ function readFreeformDocument(store: Store, diagramId: string): FreeformDocument
   }
 }
 
+/** 图层状态真源解析结果：派生后的完整 state + 载荷版本高于本实现的只读标记（设计 3.7 第 6 条）。 */
+interface ResolvedLayerState {
+  state: DiagramLayerState;
+  /** 载荷 schemaVersion > 1：读取返回派生结果并标记，任何写入必须 409。 */
+  unsupported: boolean;
+  sourceVersion: number;
+}
+
 /** 图层状态真源：物理列有值即归一化，否则按当前画布内容派生默认系统层（读取不写库）。 */
-function layerStateFor(diagram: Diagram, freeform: FreeformDocument | null): DiagramLayerState {
-  if (diagram.layers) {
-    return normalizeLayerState(diagram.layers, {
+function layerStateFor(store: Store, diagram: Diagram, freeform: FreeformDocument | null): ResolvedLayerState {
+  const raw = store.getRawDiagramLayers(diagram.id) ?? diagram.layers;
+  if (raw) {
+    const normalized = normalizeLayerState(raw, {
       nodeIds: diagram.nodes.map((node) => node.id),
       edgeIds: diagram.edges.map((edge) => edge.id),
       freeformIds: (freeform?.elements ?? []).map((element) => element.id),
-    }).state;
+    });
+    const sourceVersion = Number((raw as { schemaVersion?: unknown }).schemaVersion);
+    return {
+      state: normalized.state,
+      unsupported: normalized.unsupported,
+      sourceVersion: Number.isFinite(sourceVersion) ? sourceVersion : LAYER_SCHEMA_VERSION,
+    };
   }
-  return defaultLayerState({ nodes: diagram.nodes, edges: diagram.edges, freeform }, "");
+  return {
+    state: defaultLayerState({ nodes: diagram.nodes, edges: diagram.edges, freeform }, ""),
+    unsupported: false,
+    sourceVersion: LAYER_SCHEMA_VERSION,
+  };
+}
+
+/** 载荷 schemaVersion 高于本实现 → 409 LAYER_SCHEMA_UNSUPPORTED（设计 3.7 第 6 条）。 */
+function layerSchemaUnsupported(version: number): ServiceResult {
+  return contractError(409, {
+    code: "LAYER_SCHEMA_UNSUPPORTED",
+    message: `图层载荷版本 ${version} 高于本实现支持的 ${LAYER_SCHEMA_VERSION}`,
+    supportedSchemaVersions: [LAYER_SCHEMA_VERSION],
+  });
+}
+
+/**
+ * 图层写入的统一契约校验（设计 3.6「同一合成函数」/ 3.7）。
+ * 专用端点 PATCH /api/diagrams/:id/layers 与 diagrams PATCH 的可选 layers 字段**共用本函数**：
+ * 同一 strict schema、同一 validateLayerState、同一三类 id 上下文，禁止任何一处绕开校验落库。
+ */
+function assertLayerStateAgainstDiagram(store: Store, diagram: Diagram, state: DiagramLayerState): DiagramLayerState {
+  const freeform = readFreeformDocument(store, diagram.id);
+  validateLayerState(state, {
+    nodeIds: diagram.nodes.map((node) => node.id),
+    edgeIds: diagram.edges.map((edge) => edge.id),
+    freeformIds: (freeform?.elements ?? []).map((element) => element.id),
+  });
+  return state;
+}
+
+/**
+ * diagrams PATCH 的可选 layers 字段解析入口（设计 3.6 加法式契约扩展）。
+ * 返回 `{ state }` 表示通过校验，返回 `{ result }` 表示应原样回给客户端的契约错误结果。
+ */
+export function normalizeDiagramLayerField(
+  context: WhiteboardServiceContext,
+  diagram: Diagram,
+  payload: unknown,
+): { state: DiagramLayerState } | { result: ServiceResult } {
+  const rawVersion = Number((payload as { schemaVersion?: unknown } | null | undefined)?.schemaVersion);
+  if (Number.isFinite(rawVersion) && rawVersion > LAYER_SCHEMA_VERSION) return { result: layerSchemaUnsupported(rawVersion) };
+  const stored = layerStateFor(context.store, diagram, readFreeformDocument(context.store, diagram.id));
+  if (stored.unsupported) return { result: layerSchemaUnsupported(stored.sourceVersion) };
+  try {
+    const state = parseSchema(diagramLayerStateSchema, payload);
+    return { state: assertLayerStateAgainstDiagram(context.store, diagram, state) };
+  } catch (cause) {
+    const mapped = mapContractError(cause);
+    if (mapped) return { result: mapped };
+    throw cause;
+  }
 }
 
 function diagramComponents(diagram: Diagram): DiagramComponentLibrary {
@@ -206,7 +273,9 @@ export function readDiagramLayers(context: WhiteboardServiceContext, input: { di
   const { store } = context;
   const diagram = store.getDiagram(input.diagramId);
   if (!diagram) return contractError(404, { message: "画布不存在" });
-  return service(200, { ...layerStateFor(diagram, readFreeformDocument(store, diagram.id)), diagramUpdatedAt: diagram.updatedAt });
+  const resolved = layerStateFor(store, diagram, readFreeformDocument(store, diagram.id));
+  // 设计 3.7 第 6 条：未知 schemaVersion（>1）读取时返回派生结果并标记 unsupported: true（只读不写）。
+  return service(200, { ...resolved.state, ...(resolved.unsupported ? { unsupported: true } : {}), diagramUpdatedAt: diagram.updatedAt });
 }
 
 export function saveDiagramLayers(
@@ -219,22 +288,18 @@ export function saveDiagramLayers(
     if (!diagram) return contractError(404, { message: "画布不存在" });
     const raw = (input.payload ?? {}) as { schemaVersion?: unknown };
     const rawVersion = Number(raw.schemaVersion);
-    if (Number.isFinite(rawVersion) && rawVersion > LAYER_SCHEMA_VERSION) {
-      return contractError(409, {
-        code: "LAYER_SCHEMA_UNSUPPORTED",
-        message: `图层载荷版本 ${rawVersion} 高于本实现支持的 ${LAYER_SCHEMA_VERSION}`,
-        supportedSchemaVersions: [LAYER_SCHEMA_VERSION],
-      });
+    if (Number.isFinite(rawVersion) && rawVersion > LAYER_SCHEMA_VERSION) return layerSchemaUnsupported(rawVersion);
+    const freeform = readFreeformDocument(store, diagram.id);
+    const stored = layerStateFor(store, diagram, freeform);
+    // 设计 3.7 第 6 条：已存载荷版本高于本实现时只读不写，任何写入一律 409，防止新版本数据被旧实现覆盖破坏。
+    if (stored.unsupported) {
+      return layerSchemaUnsupported(stored.sourceVersion);
     }
     const body = parseSchema(layerSaveSchema, input.payload);
-    const freeform = readFreeformDocument(store, diagram.id);
-    validateLayerState({ schemaVersion: body.schemaVersion, layers: body.layers, itemOverrides: body.itemOverrides }, {
-      nodeIds: diagram.nodes.map((node) => node.id),
-      edgeIds: diagram.edges.map((edge) => edge.id),
-      freeformIds: (freeform?.elements ?? []).map((element) => element.id),
+    const incoming: DiagramLayerState = assertLayerStateAgainstDiagram(store, diagram, {
+      schemaVersion: body.schemaVersion, layers: body.layers, itemOverrides: body.itemOverrides,
     });
-    const incoming: DiagramLayerState = { schemaVersion: body.schemaVersion, layers: body.layers, itemOverrides: body.itemOverrides };
-    const current = layerStateFor(diagram, freeform);
+    const current = stored.state;
     // 内容指纹相同即无变化：直接返回当前状态，不写库、不产生 revision 与 audit 噪音（设计 8.1）。
     if (layerStateFingerprint(incoming) === layerStateFingerprint(current)) {
       return service(200, { ...current, diagramUpdatedAt: diagram.updatedAt });
@@ -377,12 +442,28 @@ export function createComponentInstances(
       definition, offsetX: body.offsetX, offsetY: body.offsetY, now: nowIso(),
       availableAssetIds: assetIds(store, diagram.projectId),
     });
-    const layers = instance.layers ? mergeLayerStates(layerStateFor(diagram, before), instance.layers, nowIso()) : undefined;
+    const stored = layerStateFor(store, diagram, before);
+    // 设计 10.3：实例化引入的新组（来自 payload.groups，nodeIds 只含新节点）必须在写入事务前做重叠校验；
+    // 与既有组重叠 → 409 COMPONENT_GROUP_OVERLAP，且零写入（不做静默裁剪或改名）。
+    const nextNodes = [...diagram.nodes, ...instance.nodes];
+    const nextGroups = [...diagram.groups, ...instance.groups];
+    if (instance.groups.length) {
+      try {
+        assertNoIntroducedDiagramGroupOverlap(diagram, { nodes: nextNodes, groups: nextGroups });
+      } catch {
+        return contractError(409, {
+          code: "COMPONENT_GROUP_OVERLAP",
+          message: "组件实例引入的组合区域与目标画布既有组合区域重叠，已拒绝（不做静默裁剪或改名）",
+        });
+      }
+    }
+    const layers = instance.layers ? mergeLayerStates(stored.state, instance.layers, nowIso()) : undefined;
     const next = store.updateDiagram(diagram.id, {
-      nodes: [...diagram.nodes, ...instance.nodes],
+      nodes: nextNodes,
       edges: [...diagram.edges, ...instance.edges],
-      groups: [...diagram.groups, ...instance.groups],
-      ...(layers ? { layers } : {}),
+      groups: nextGroups,
+      // 已存图层载荷版本高于本实现时只读不写（设计 3.7 第 6 条）：保留原载荷，不写归一化结果。
+      ...(layers && !stored.unsupported ? { layers } : {}),
     });
     if (!next) return contractError(404, { message: "画布不存在" });
     if (instance.freeformElements.length) {
@@ -584,10 +665,11 @@ export function applyDiagramTemplate(
       });
     }
     const before = readFreeformDocument(store, diagram.id);
+    const storedLayers = layerStateFor(store, diagram, before);
     const applied = applyTemplateToDiagram({
       diagram: {
         type: diagram.type, nodes: diagram.nodes, edges: diagram.edges, groups: diagram.groups,
-        layers: layerStateFor(diagram, before), components: diagramComponents(diagram),
+        layers: storedLayers.state, components: diagramComponents(diagram),
       },
       freeform: before,
       content,
@@ -602,7 +684,9 @@ export function applyDiagramTemplate(
     }
     const next = store.updateDiagram(diagram.id, {
       nodes: applied.nodes, edges: applied.edges, groups: applied.groups,
-      layers: applied.layers, components: applied.components,
+      // 已存图层载荷版本高于本实现时只读不写（设计 3.7 第 6 条）：保留原载荷。
+      ...(storedLayers.unsupported ? {} : { layers: applied.layers }),
+      components: applied.components,
     });
     if (!next) return contractError(404, { message: "画布不存在" });
     writeFreeform(store, diagram, before, applied.freeform.elements, applied.freeform.unsupported);
