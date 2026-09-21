@@ -27,7 +27,7 @@ import {
   type NodeShape,
   type RequirementStatus,
 } from "../../shared/types";
-import { buildLayerIndex, effectiveHidden, effectiveLocked, itemKeyOf } from "../../shared/layers";
+import { buildLayerIndex, diagramPaintOrder, effectiveHidden, effectiveLocked, itemKeyOf } from "../../shared/layers";
 import {
   diagramGroupBounds,
   diagramGroupOverlapMessage,
@@ -602,6 +602,7 @@ export function buildDiagramSvg(
   edges: DiagramEdge[],
   groups: DiagramGroup[],
   diagramType: DiagramType,
+  layerState?: Pick<DiagramLayerState, "layers"> | null,
 ): string {
   if (nodes.length === 0) return "";
   const routeResults = routeDiagramEdges(nodes, edges);
@@ -651,7 +652,8 @@ export function buildDiagramSvg(
     P.push(`<rect x="${a - 16}" y="${b - 16}" width="${(c - a) + 32}" height="${(d - b) + 32}" rx="12" fill="rgba(83,126,148,0.05)" stroke="#52758a" stroke-width="1.2" stroke-dasharray="7 4"/>`);
     P.push(`<text x="${a - 8}" y="${b - 22}" font-size="11" fill="#7897a8">${escXml(g.name)} (${g.nodeIds.length})</text>`);
   }
-  for (const e of edges) {
+  for (const paintLayer of diagramPaintOrder(layerState)) {
+    if (paintLayer === "edge") for (const e of edges) {
     const f = nodes.find((n) => n.id === e.from);
     const t = nodes.find((n) => n.id === e.to);
     if (!f || !t) continue;
@@ -688,8 +690,8 @@ export function buildDiagramSvg(
       P.push(`<rect x="${midpoint.x - labelWidth / 2}" y="${midpoint.y - 17}" width="${labelWidth}" height="20" rx="7" fill="#0b161e" stroke="#2c4353" stroke-width="0.9"/>`);
       P.push(`<text x="${midpoint.x}" y="${midpoint.y - 3.5}" text-anchor="middle" font-size="10.5" font-weight="600" fill="#a9bac7">${escXml(edgeLabel)}</text>`);
     }
-  }
-  for (const n of [...nodes].sort((a, b) => Number(useCaseTypeOf(a) !== "boundary") - Number(useCaseTypeOf(b) !== "boundary"))) {
+    }
+    if (paintLayer === "node") for (const n of nodes) {
     const st = NODE_STYLE[n.kind];
     const w = nodeW(n), h = nodeH(n);
     P.push(`<g transform="translate(${n.x},${n.y})">`);
@@ -712,6 +714,7 @@ export function buildDiagramSvg(
       if (subLinkCount > 0) P.push(`<text x="0" y="${h / 2 + 14}" text-anchor="middle" font-size="11" fill="#8ec4ff">⤷ 子画布${subLinkCount > 1 ? ` ×${subLinkCount}` : ""}</text>`);
     }
     P.push(`</g>`);
+    }
   }
   P.push("</svg>");
   return P.join("");
@@ -810,6 +813,7 @@ export function DiagramCanvas(props: {
   const visibleGroups = useMemo(() => groups
     .map((group) => ({ ...group, nodeIds: group.nodeIds.filter((id) => visibleNodeIds.has(id)) }))
     .filter((group) => group.nodeIds.length > 0), [groups, visibleNodeIds]);
+  const paintOrder = useMemo(() => diagramPaintOrder(props.layerState), [props.layerState]);
   const [selectedIds, setSelectedIds] = useState<string[]>(() =>
     props.initialSelectedNodeId && props.initial.nodes.some((node) => node.id === props.initialSelectedNodeId)
       ? [props.initialSelectedNodeId]
@@ -1107,16 +1111,14 @@ export function DiagramCanvas(props: {
   }, [pan, zoom]);
 
   const hitNode = useCallback((wx: number, wy: number): string | null => {
-    const candidates = props.diagramType === "usecase"
-      ? [...visibleNodes.filter((node) => useCaseTypeOf(node) !== "boundary").reverse(), ...visibleNodes.filter((node) => useCaseTypeOf(node) === "boundary").reverse()]
-      : [...visibleNodes].reverse();
+    const candidates = [...visibleNodes].reverse();
     for (const n of candidates) {
       if (wx >= n.x - nodeW(n) / 2 && wx <= n.x + nodeW(n) / 2 && wy >= n.y - nodeH(n) / 2 && wy <= n.y + nodeH(n) / 2) {
         return n.id;
       }
     }
     return null;
-  }, [props.diagramType, visibleNodes]);
+  }, [visibleNodes]);
 
   const commit = useCallback((nextNodes: DiagramNode[], nextEdges: DiagramEdge[], nextGroups: DiagramGroup[]) => {
     props.onCommit(nextNodes, nextEdges, nextGroups);
@@ -1784,7 +1786,7 @@ export function DiagramCanvas(props: {
 
   const baseName = () => props.titleForExport?.trim() || "diagram";
   const exportPng = () => {
-    const svgStr = buildDiagramSvg(visibleNodes, visibleEdges, visibleGroups, props.diagramType);
+    const svgStr = buildDiagramSvg(visibleNodes, visibleEdges, visibleGroups, props.diagramType, props.layerState);
     if (!svgStr) return;
     const blob = new Blob([svgStr], { type: "image/svg+xml;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -1810,7 +1812,7 @@ export function DiagramCanvas(props: {
     img.src = url;
   };
   const exportSvg = () => {
-    const svgStr = buildDiagramSvg(visibleNodes, visibleEdges, visibleGroups, props.diagramType);
+    const svgStr = buildDiagramSvg(visibleNodes, visibleEdges, visibleGroups, props.diagramType, props.layerState);
     if (!svgStr) return;
     const blob = new Blob([svgStr], { type: "image/svg+xml;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -2106,7 +2108,9 @@ export function DiagramCanvas(props: {
               );
             })}
 
-            {visibleEdges.map((edge) => {
+            {paintOrder.map((paintLayer) => paintLayer === "edge" ? (
+              <g key="edge" data-paint-layer="edge">
+              {visibleEdges.map((edge) => {
               const from = edgeFromNode(edge.from);
               const to = edgeFromNode(edge.to);
               if (!from || !to) return null;
@@ -2178,47 +2182,11 @@ export function DiagramCanvas(props: {
                   ) : null}
                 </g>
               );
-            })}
-
-            {preview ? (() => {
-              const from = edgeFromNode(preview.fromId);
-              if (!from) return null;
-              const src = portPoint(from, preview.sourcePort);
-              const hoveredNode = targetId ? edgeFromNode(targetId) : null;
-              const targetPort = hoveredNode ? nearestPort(hoveredNode, preview) : null;
-              const route = hoveredNode && targetPort
-                ? (hoveredNode.id === from.id
-                    ? selfLoopRoute(from, preview.sourcePort, targetPort)
-                    : routeBetweenPorts(from, hoveredNode, preview.sourcePort, targetPort))
-                : (() => {
-                    const sourceOut = offsetPortPoint(src, preview.sourcePort, 20);
-                    const vertical = preview.sourcePort === "top" || preview.sourcePort === "bottom";
-                    return vertical
-                      ? [src, sourceOut, { x: preview.x, y: sourceOut.y }, { x: preview.x, y: preview.y }]
-                      : [src, sourceOut, { x: sourceOut.x, y: preview.y }, { x: preview.x, y: preview.y }];
-                  })();
-              const d = polylineToPath(route);
-              return (
-                <path
-                  d={d}
-                  fill="none"
-                  stroke={targetId ? "#3fb96f" : "#4da3ff"}
-                  strokeWidth={2.5}
-                  strokeDasharray="6 4"
-                  markerEnd="url(#arrow)"
-                />
-              );
-            })() : null}
-
-            {boxState ? (
-              <rect
-                x={boxState.x} y={boxState.y} width={boxState.w} height={boxState.h}
-                fill="rgba(77,163,255,0.10)" stroke="#4da3ff" strokeWidth={1.5}
-                strokeDasharray="4 3"
-              />
-            ) : null}
-
-            {[...visibleNodes].sort((a, b) => Number(useCaseTypeOf(a) !== "boundary") - Number(useCaseTypeOf(b) !== "boundary")).map((node) => {
+              })}
+              </g>
+            ) : (
+              <g key="node" data-paint-layer="node">
+              {visibleNodes.map((node) => {
               const style = NODE_STYLE[node.kind];
               const w = nodeW(node), h = nodeH(node);
               const isSel = selectedIds.includes(node.id);
@@ -2361,7 +2329,47 @@ export function DiagramCanvas(props: {
                   ) : null}
                 </g>
               );
-            })}
+              })}
+              </g>
+            ))}
+
+            {preview ? (() => {
+              const from = edgeFromNode(preview.fromId);
+              if (!from) return null;
+              const src = portPoint(from, preview.sourcePort);
+              const hoveredNode = targetId ? edgeFromNode(targetId) : null;
+              const targetPort = hoveredNode ? nearestPort(hoveredNode, preview) : null;
+              const route = hoveredNode && targetPort
+                ? (hoveredNode.id === from.id
+                    ? selfLoopRoute(from, preview.sourcePort, targetPort)
+                    : routeBetweenPorts(from, hoveredNode, preview.sourcePort, targetPort))
+                : (() => {
+                    const sourceOut = offsetPortPoint(src, preview.sourcePort, 20);
+                    const vertical = preview.sourcePort === "top" || preview.sourcePort === "bottom";
+                    return vertical
+                      ? [src, sourceOut, { x: preview.x, y: sourceOut.y }, { x: preview.x, y: preview.y }]
+                      : [src, sourceOut, { x: sourceOut.x, y: preview.y }, { x: preview.x, y: preview.y }];
+                  })();
+              const d = polylineToPath(route);
+              return (
+                <path
+                  d={d}
+                  fill="none"
+                  stroke={targetId ? "#3fb96f" : "#4da3ff"}
+                  strokeWidth={2.5}
+                  strokeDasharray="6 4"
+                  markerEnd="url(#arrow)"
+                />
+              );
+            })() : null}
+
+            {boxState ? (
+              <rect
+                x={boxState.x} y={boxState.y} width={boxState.w} height={boxState.h}
+                fill="rgba(77,163,255,0.10)" stroke="#4da3ff" strokeWidth={1.5}
+                strokeDasharray="4 3"
+              />
+            ) : null}
 
             {selectedEdge && !edgeEndpointPreview ? (() => {
               const from = edgeFromNode(selectedEdge.from);
@@ -2546,23 +2554,30 @@ export function DiagramCanvas(props: {
                 setPan({ x: viewportWidth / 2 - worldX * zoom, y: viewportHeight / 2 - worldY * zoom });
               }}
             >
-              {visibleEdges.map((edge) => {
-                const from = visibleNodes.find((node) => node.id === edge.from);
-                const to = visibleNodes.find((node) => node.id === edge.to);
-                if (!from || !to) return null;
-                return <line key={edge.id} x1={miniMapProjection.projectX(from.x)} y1={miniMapProjection.projectY(from.y)} x2={miniMapProjection.projectX(to.x)} y2={miniMapProjection.projectY(to.y)} stroke="#476276" strokeWidth={0.8} />;
-              })}
-              {visibleNodes.map((node) => (
-                <rect
-                  key={node.id}
-                  x={miniMapProjection.projectX(node.x - nodeW(node) / 2)}
-                  y={miniMapProjection.projectY(node.y - nodeH(node) / 2)}
-                  width={Math.max(3, nodeW(node) * miniMapProjection.scale)}
-                  height={Math.max(2, nodeH(node) * miniMapProjection.scale)}
-                  rx={1.5}
-                  fill={NODE_STYLE[node.kind].stroke}
-                  opacity={selectedIds.includes(node.id) ? 1 : 0.62}
-                />
+              {paintOrder.map((paintLayer) => paintLayer === "edge" ? (
+                <g key="edge" data-paint-layer="edge">
+                  {visibleEdges.map((edge) => {
+                    const from = visibleNodes.find((node) => node.id === edge.from);
+                    const to = visibleNodes.find((node) => node.id === edge.to);
+                    if (!from || !to) return null;
+                    return <line key={edge.id} x1={miniMapProjection.projectX(from.x)} y1={miniMapProjection.projectY(from.y)} x2={miniMapProjection.projectX(to.x)} y2={miniMapProjection.projectY(to.y)} stroke="#476276" strokeWidth={0.8} />;
+                  })}
+                </g>
+              ) : (
+                <g key="node" data-paint-layer="node">
+                  {visibleNodes.map((node) => (
+                    <rect
+                      key={node.id}
+                      x={miniMapProjection.projectX(node.x - nodeW(node) / 2)}
+                      y={miniMapProjection.projectY(node.y - nodeH(node) / 2)}
+                      width={Math.max(3, nodeW(node) * miniMapProjection.scale)}
+                      height={Math.max(2, nodeH(node) * miniMapProjection.scale)}
+                      rx={1.5}
+                      fill={NODE_STYLE[node.kind].stroke}
+                      opacity={selectedIds.includes(node.id) ? 1 : 0.62}
+                    />
+                  ))}
+                </g>
               ))}
               <rect
                 className="canvas-minimap-viewport"

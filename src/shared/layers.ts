@@ -24,6 +24,18 @@ export const LAYER_ITEM_KEY_MAX = 240;
 export const LAYER_NODE_DEFAULT_W = 176;
 export const LAYER_NODE_DEFAULT_H = 46;
 
+export type DiagramPaintLayer = "edge" | "node";
+
+/** Groups are always painted first; this returns the persisted node/edge layer order. */
+export function diagramPaintOrder(state?: Pick<DiagramLayerState, "layers"> | null): DiagramPaintLayer[] {
+  if (!state) return ["edge", "node"];
+  const order = state.layers.flatMap((layer): DiagramPaintLayer[] => layer.id === LAYER_SYSTEM_NODE_ID
+    ? ["node"] : layer.id === LAYER_SYSTEM_EDGE_ID ? ["edge"] : []);
+  if (!order.includes("edge")) order.push("edge");
+  if (!order.includes("node")) order.push("node");
+  return order;
+}
+
 export const LAYER_SYSTEM_LAYER_DEFS: ReadonlyArray<{
   id: string;
   name: string;

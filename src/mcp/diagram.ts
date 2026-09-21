@@ -35,6 +35,7 @@ import {
   moveDiagramManualRoute,
   routeDiagramEdges,
 } from "../shared/diagramRouting.js";
+import { diagramPaintOrder } from "../shared/layers.js";
 import { PROJECT_WORKFLOW_POLICY } from "../shared/workflowPolicy.js";
 import { newId, nowIso } from "../server/db.js";
 
@@ -544,7 +545,8 @@ export function buildDiagramSvg(diagram: Diagram): string {
     const bottom = Math.max(...members.map((node) => node.y + nodeH(node) / 2)) + 16;
     parts.push(`<rect x="${left}" y="${top}" width="${right - left}" height="${bottom - top}" rx="12" fill="#12202a" stroke="#52758a" stroke-dasharray="7 4"/><text x="${left + 8}" y="${top - 6}" font-size="11" fill="#7897a8">${xml(group.name)}</text>`);
   }
-  for (const edge of diagram.edges) {
+  for (const paintLayer of diagramPaintOrder(diagram.layers)) {
+    if (paintLayer === "edge") for (const edge of diagram.edges) {
     const from = diagram.nodes.find((node) => node.id === edge.from), to = diagram.nodes.find((node) => node.id === edge.to);
     if (!from || !to) continue;
     const route = routeResults.get(edge.id);
@@ -565,8 +567,8 @@ export function buildDiagramSvg(diagram: Diagram): string {
       parts.push(`<rect x="${point.x - labelWidth / 2}" y="${point.y - 17}" width="${labelWidth}" height="20" rx="7" fill="#0b161e" stroke="#2c4353" stroke-width="0.9"/>`);
       parts.push(`<text x="${point.x}" y="${point.y - 3.5}" text-anchor="middle" font-size="10.5" font-weight="600" fill="#a9bac7">${xml(edgeLabel)}</text>`);
     }
-  }
-  for (const node of [...diagram.nodes].sort((a, b) => Number(useCaseTypeOf(a) !== "boundary") - Number(useCaseTypeOf(b) !== "boundary"))) {
+    }
+    if (paintLayer === "node") for (const node of diagram.nodes) {
     const style = NODE_STYLE[node.kind], w = nodeW(node), h = nodeH(node);
     parts.push(`<g transform="translate(${node.x},${node.y})">${nodeBodySvg(node)}`);
     if (diagram.type !== "flow" && diagram.type !== "usecase") parts.push(`<text x="${-w / 2 + 10}" y="${-h / 2 + 11}" font-size="9" fill="${style.text}" opacity="0.7">${KIND_LABELS[node.kind]}</text>`);
@@ -578,6 +580,7 @@ export function buildDiagramSvg(diagram: Diagram): string {
       parts.push(`<circle cx="${w / 2 - 65}" cy="${h / 2 - 7}" r="3.2" fill="${ACCEPTANCE_COLORS[acceptance]}"/><text x="${w / 2 - 58}" y="${h / 2 - 4}" font-size="8.5" fill="#9fb0bf">验收 · ${acceptance}</text>`);
     }
     parts.push("</g>");
+    }
   }
   parts.push("</svg>");
   return parts.join("");
