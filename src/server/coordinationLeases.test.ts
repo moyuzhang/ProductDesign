@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Store } from "./db.js";
-import { claimAgentTask, heartbeatAgentTask } from "./agentTaskLeases.js";
+import { claimAgentTask, heartbeatAgentTask, listClaimableAgentTasks } from "./agentTaskLeases.js";
 import { buildAgentOrchestration } from "./orchestration.js";
 import {
   advanceCoordinationStage,
@@ -85,13 +85,15 @@ describe("Main Agent coordination lease", () => {
     store.updatePlan(planId, { lifecycleStatus: "rework", managerDecision: "pending", auditStatus: "failed" });
     const task = buildAgentOrchestration(store, projectId, true)!.queues.design.find((item) => item.planItemId === planId && item.actionCode === "submit_plan")!;
     expect(task).toBeDefined();
+    const claimable = listClaimableAgentTasks(store, projectId).find((item) => item.id === task.id)!;
+    expect(claimable.available).toBe(true);
     const parent = claimCoordinationLease(store, {
       projectId, planId, mainAgentId: "Main Agent", workerId: "main-design-rework", idempotencyKey: "coord-failed-design-audit",
     });
     expect(parent.stage).toBe("design");
     const dispatchInput = {
       projectId, coordinationLeaseId: parent.id, leaseToken: parent.leaseToken, mainAgentId: "Main Agent",
-      taskId: task.id, taskKey: task.taskKey,
+      taskId: task.id, taskKey: claimable.taskKey,
     };
     expect(() => dispatchChildTask(store, { ...dispatchInput, role: "builder" }))
       .toThrow(expect.objectContaining({ code: "STAGE_ACTION_FORBIDDEN" }));
@@ -103,7 +105,7 @@ describe("Main Agent coordination lease", () => {
       idempotencyKey: "child-failed-design-audit",
     }));
     expect(child.task).toMatchObject({ id: task.id, projectId, planItemId: planId, role: "designer", actionCode: "submit_plan" });
-    expect(child.lease).toMatchObject({ taskKey: task.taskKey, taskRevision: task.taskRevision, status: "claimed" });
+    expect(child.lease).toMatchObject({ taskKey: claimable.taskKey, taskRevision: claimable.taskRevision, status: "claimed" });
     expect(child.lease.leaseToken).toBeTruthy();
     expect(Date.parse(child.lease.leaseExpiresAt)).toBeGreaterThan(Date.now());
     expect(listChildTaskDispatches(store, projectId, parent.id)).toMatchObject([
