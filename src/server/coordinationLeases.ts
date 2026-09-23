@@ -52,7 +52,7 @@ function coordinationStageForPlan(plan: { lifecycleStatus: string; auditStatus: 
   if (plan.lifecycleStatus === "pending_manager") return "acceptance";
   if (plan.lifecycleStatus === "pending_audit") return "implementation_audit";
   if (plan.lifecycleStatus === "audit_failed") return "implementation";
-  if (plan.lifecycleStatus === "rework" && (plan.auditStatus === "failed" || plan.managerDecision === "rejected")) return "implementation";
+  if (plan.lifecycleStatus === "rework" && plan.managerDecision === "rejected") return "implementation";
   if (plan.lifecycleStatus === "approved" || plan.lifecycleStatus === "in_progress") return "implementation";
   if (plan.lifecycleStatus === "pending_approval") return plan.auditStatus === "passed" ? "approval" : "design_audit";
   // Draft, design rework, and legacy plans without a complete submission start in design.

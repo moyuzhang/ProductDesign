@@ -63,14 +63,52 @@ describe("Main Agent coordination lease", () => {
     const auditRework = claimCoordinationLease(store, {
       projectId, planId, mainAgentId: "Main Agent", workerId: "audit-rework", idempotencyKey: "coord-audit-rework",
     });
-    expect(auditRework.stage).toBe("implementation");
+    expect(auditRework.stage).toBe("design");
     releaseCoordinationLease(store, { projectId, coordinationLeaseId: auditRework.id, leaseToken: auditRework.leaseToken, mainAgentId: "Main Agent" });
+
+    store.updatePlan(planId, { lifecycleStatus: "audit_failed", managerDecision: "pending", auditStatus: "failed" });
+    const implementationAuditRework = claimCoordinationLease(store, {
+      projectId, planId, mainAgentId: "Main Agent", workerId: "implementation-audit-rework", idempotencyKey: "coord-implementation-audit-rework",
+    });
+    expect(implementationAuditRework.stage).toBe("implementation");
+    releaseCoordinationLease(store, { projectId, coordinationLeaseId: implementationAuditRework.id, leaseToken: implementationAuditRework.leaseToken, mainAgentId: "Main Agent" });
 
     store.updatePlan(planId, { lifecycleStatus: "rework", managerDecision: "pending", auditStatus: "not_requested" });
     const design = claimCoordinationLease(store, {
       projectId, planId, mainAgentId: "Main Agent", workerId: "design-rework", idempotencyKey: "coord-design-rework",
     });
     expect(design.stage).toBe("design");
+  });
+
+  it("dispatches and claims the exact Designer task after a failed design audit", () => {
+    const { store, projectId, planId } = fixture();
+    store.updatePlan(planId, { lifecycleStatus: "rework", managerDecision: "pending", auditStatus: "failed" });
+    const task = buildAgentOrchestration(store, projectId, true)!.queues.design.find((item) => item.planItemId === planId && item.actionCode === "submit_plan")!;
+    expect(task).toBeDefined();
+    const parent = claimCoordinationLease(store, {
+      projectId, planId, mainAgentId: "Main Agent", workerId: "main-design-rework", idempotencyKey: "coord-failed-design-audit",
+    });
+    expect(parent.stage).toBe("design");
+    const dispatchInput = {
+      projectId, coordinationLeaseId: parent.id, leaseToken: parent.leaseToken, mainAgentId: "Main Agent",
+      taskId: task.id, taskKey: task.taskKey,
+    };
+    expect(() => dispatchChildTask(store, { ...dispatchInput, role: "builder" }))
+      .toThrow(expect.objectContaining({ code: "STAGE_ACTION_FORBIDDEN" }));
+    const dispatch = dispatchChildTask(store, { ...dispatchInput, role: "designer" });
+    expect(() => dispatchChildTask(store, { ...dispatchInput, role: "designer" }))
+      .toThrow(expect.objectContaining({ code: "CHILD_TASK_ALREADY_DISPATCHED" }));
+    const child = JSON.parse(claimDispatchedChildTask(store, {
+      projectId, dispatchId: dispatch.dispatchId, agentId: dispatch.agentId, workerId: dispatch.workerId,
+      idempotencyKey: "child-failed-design-audit",
+    }));
+    expect(child.task).toMatchObject({ id: task.id, projectId, planItemId: planId, role: "designer", actionCode: "submit_plan" });
+    expect(child.lease).toMatchObject({ taskKey: task.taskKey, taskRevision: task.taskRevision, status: "claimed" });
+    expect(child.lease.leaseToken).toBeTruthy();
+    expect(Date.parse(child.lease.leaseExpiresAt)).toBeGreaterThan(Date.now());
+    expect(listChildTaskDispatches(store, projectId, parent.id)).toMatchObject([
+      { dispatchId: dispatch.dispatchId, status: "claimed", childWorkOrderId: child.lease.workOrderId },
+    ]);
   });
 
   it("binds the parent lease to one plan and rejects an exact task from another plan", () => {
