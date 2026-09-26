@@ -1558,7 +1558,7 @@ function claimSingleAgentTask(
       }
       throw new AgentTaskLeaseError(409, "TASK_ALREADY_CLAIMED", `任务已由 ${existing.agent_id} 领取，租约到期时间 ${existing.lease_expires_at}`);
     }
-    if (row.action_code === "approve_node_requirement") assertIndependentApprover(store, row);
+    if (["approve_node_requirement", "approve_node_document"].includes(row.action_code)) assertIndependentApprover(store, row);
     const lease = mapLease(row);
     for (const scope of workScopes) {
       store.db.prepare(`
@@ -1668,7 +1668,7 @@ function assertIndependentApprover(store: Store, row: LeaseRow): void {
   if (row.role !== "approver") return;
   const planId = row.task_id.slice(row.task_id.indexOf(":") + 1);
   const plan = store.getPlan(planId);
-  const nodeApproval = row.action_code === "approve_node_requirement";
+  const nodeApproval = ["approve_node_requirement", "approve_node_document"].includes(row.action_code);
   const nodeScope = nodeApproval ? mapLease(row).workScopes.find((scope) => scope.endsWith(`:${planId}`)) : undefined;
   const scopeDiagramId = nodeScope?.split(":")[1];
   const plans = nodeApproval && scopeDiagramId
@@ -1742,6 +1742,69 @@ function approveNodeRequirementForLease(store: Store, row: LeaseRow, input: Comp
     correlationId: row.task_id, clientId: context.clientId, sessionId: context.sessionId || row.session_id || undefined,
     model: context.model,
   });
+}
+
+function approveNodeDocumentsForLease(store: Store, row: LeaseRow, input: CompleteInput, context: AgentTaskLeaseContext): void {
+  if (row.queue !== "approval" || row.role !== "approver" || row.action_code !== "approve_node_document"
+    || row.status !== "running" || !row.started_at || !input.resultDigest?.trim()) {
+    throw new AgentTaskLeaseError(409, "NODE_DOCUMENT_APPROVAL_INVALID", "节点文档批准必须由已开工的独立 Approver 工单提交审核结论");
+  }
+  if (input.workOrderId !== row.id || input.taskKey !== row.task_key || input.taskRevision !== row.task_revision
+    || input.workerId !== row.worker_id || input.role !== row.role) {
+    throw new AgentTaskLeaseError(409, "WORK_ORDER_CONTEXT_INVALID", "节点文档批准必须精确绑定当前工单与修订");
+  }
+  const queued = listClaimableAgentTasks(store, row.project_id).find((task) => task.taskKey === row.task_key);
+  const nodeId = row.task_id.slice(row.task_id.indexOf(":") + 1);
+  const diagram = queued?.diagramId ? store.getDiagram(queued.diagramId) : undefined;
+  if (!queued || queued.projectId !== row.project_id || queued.id !== row.task_id
+    || queued.taskRevision !== row.task_revision || queued.actionCode !== "approve_node_document"
+    || queued.queue !== "approval" || queued.nodeId !== nodeId || !diagram
+    || diagram.projectId !== row.project_id || diagram.type !== "main"
+    || !diagram.nodes.some((node) => node.id === nodeId)
+    || !mapLease(row).workScopes.includes(`node:${diagram.id}:${nodeId}`)) {
+    throw new AgentTaskLeaseError(409, "TASK_REVISION_DRIFT", "节点文档审批工单已离开队列、修订已变化或节点不在工单范围");
+  }
+  assertIndependentApprover(store, row);
+
+  const references = store.listDocumentReferences({ projectId: row.project_id, targetType: "diagramNode", targetId: nodeId });
+  const pendingDocumentIds = new Set(references.flatMap((reference) => {
+    const document = store.getDesignDoc(reference.documentId);
+    if (!document || document.projectId !== row.project_id) {
+      throw new AgentTaskLeaseError(409, "DOCUMENT_SCOPE_INVALID", "节点文档引用缺失或跨项目，拒绝审批");
+    }
+    return reference.documentRevisionId !== document.currentRevisionId || document.status !== "已批准"
+      ? [document.id] : [];
+  }));
+  if (!pendingDocumentIds.size) throw new AgentTaskLeaseError(409, "TASK_REVISION_DRIFT", "节点已不存在待批准或待固定的文档修订");
+
+  for (const documentId of pendingDocumentIds) {
+    const document = store.getDesignDoc(documentId)!;
+    if (document.status === "已废弃") {
+      throw new AgentTaskLeaseError(409, "DOCUMENT_REVISION_NOT_APPROVABLE", "已废弃文档不能通过节点审批工单重新批准");
+    }
+    const approved = document.status === "已批准" ? document : store.updateDesignDoc(document.id, { status: "已批准" })!;
+    if (approved.currentRevisionId !== document.currentRevisionId) {
+      store.recordAudit({
+        projectId: row.project_id, entityType: "designDoc", entityId: document.id, action: "approve",
+        before: { status: document.status, currentRevisionId: document.currentRevisionId },
+        after: { status: approved.status, currentRevisionId: approved.currentRevisionId, workOrderId: row.id, resultDigest: input.resultDigest.trim() },
+        actor: context.actor?.trim() || `agent:${row.agent_id}`, source: context.source ?? "system",
+        correlationId: row.task_id, clientId: context.clientId, sessionId: context.sessionId || row.session_id || undefined,
+        model: context.model,
+      });
+    }
+    for (const reference of references.filter((item) => item.documentId === documentId
+      && item.documentRevisionId !== approved.currentRevisionId)) {
+      store.updateDocumentReferenceRevision(reference.id, approved.currentRevisionId);
+      store.recordAudit({
+        projectId: row.project_id, entityType: "documentReference", entityId: reference.id, action: "update",
+        before: { documentRevisionId: reference.documentRevisionId }, after: { documentRevisionId: approved.currentRevisionId },
+        actor: context.actor?.trim() || `agent:${row.agent_id}`, source: context.source ?? "system",
+        correlationId: row.task_id, clientId: context.clientId, sessionId: context.sessionId || row.session_id || undefined,
+        model: context.model,
+      });
+    }
+  }
 }
 
 
@@ -2214,6 +2277,9 @@ function controlSingleLease(
     if (operation === "complete") {
       if (currentRow.action_code === "approve_node_requirement") {
         approveNodeRequirementForLease(store, currentRow, input as CompleteInput, context);
+      }
+      if (currentRow.action_code === "approve_node_document") {
+        approveNodeDocumentsForLease(store, currentRow, input as CompleteInput, context);
       }
       if (currentRow.action_code === "submit_evidence_repair") {
         const completion = input as CompleteInput;

@@ -838,7 +838,7 @@ export function buildAgentTaskPackage(
       `租约到期：${selector.lease.leaseExpiresAt}；工作期间每 ${selector.lease.heartbeatSeconds} 秒调用 heartbeat_agent_task 续租。`,
       "开始任何目标项目修改前调用 start_agent_task；Builder 并发时必须提交独立 workspacePath、workspaceBranch 和 baselineRevision。所有计划流转必须携带 leaseToken 和唯一 idempotencyKey。",
       "若收到 LEASE_LOST、TASK_ALREADY_CLAIMED 或租约过期，立即停止写入，不得继续抢占任务。",
-      task.actionCode === "approve_node_requirement"
+      ["approve_node_requirement", "approve_node_document"].includes(task.actionCode)
         ? "核验当前节点资料后调用 complete_agent_task(resultDigest=审核结论)；服务端会在精确工单修订下原子完成审批。"
         : "transition_plan_delivery 成功后会自动推进或关闭租约；不要在工作流动作完成前单独调用 complete_agent_task。",
     ] : []),
@@ -848,6 +848,8 @@ export function buildAgentTaskPackage(
         ? "完成后创建绑定当前 implementationRevision 且 details.auditScope=implementation 的审计证据，再执行 pass_audit 或 fail_audit；不得直接验收。"
         : task.actionCode === "approve_node_requirement"
           ? "本工单只审核当前节点需求；确认后用 complete_agent_task 提交审核结论，不得自行改写节点资料。"
+        : task.actionCode === "approve_node_document"
+          ? "本工单只审核当前节点文档修订；确认后用 complete_agent_task 提交审核结论，不得自行改写文档正文。"
         : "完成后运行与风险相称的测试，通过 create_evidence 回传命令、结果、当前修订和证据 ID。",
     "普通执行期间只按租约 heartbeat；终态动作或受控写入错误后再刷新 workflow，并以新的 nextAction 作为交接依据。",
   ].filter(Boolean).join("\n");
