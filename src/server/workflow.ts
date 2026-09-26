@@ -345,8 +345,8 @@ export function inspectNodeWorkflow(store: Store, diagram: Diagram, node: Diagra
     const legacyPlan = deliveryPlans.find((plan) => plan.lifecycleStatus === "legacy")!;
     nextAction = action("submit_plan", `补齐节点“${node.label}”的正式交付基线`, "历史计划须补齐设计、独立审计与 Main Agent 批准记录后才能验收。", "plan", nodeHref(diagram.id, node.id, "development"), { ...ids, entityId: legacyPlan.id });
   } else if (!evidenceReady && acceptedPlans.length > 0) {
-    if (gapPlans.length === 1) {
-      const plan = gapPlans[0];
+    if (gapPlans.length > 0) {
+      const plan = gapPlans.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))[0];
       let maxAttempts = 3;
       try {
         maxAttempts = Number((store.db.prepare("SELECT max_attempts FROM agent_task_capacity WHERE project_id=?").get(plan.projectId) as { max_attempts?: number } | undefined)?.max_attempts ?? 3);
@@ -361,8 +361,6 @@ export function inspectNodeWorkflow(store: Store, diagram: Diagram, node: Diagra
       } else {
         nextAction = action("submit_evidence_repair", `修复节点“${node.label}”的验收证据`, "由受派 Builder 在冻结当前实现修订后重跑真实测试并提交精确绑定本计划的证据。", "evidence", nodeHref(diagram.id, node.id, "delivery"), { ...ids, entityId: plan.id });
       }
-    } else if (gapPlans.length > 1) {
-      nextAction = action("evidence_repair_blocked", `节点“${node.label}”存在多个证据缺口`, `已验收节点有 ${gapPlans.length} 张 accepted 计划缺少各自受派 Auditor 的当前实现通过证据，必须先明确逐计划修复顺序。`, "evidence", nodeHref(diagram.id, node.id, "delivery"), ids);
     }
   } else if (!evidenceReady) {
     nextAction = action("add_node_evidence", `补充节点“${node.label}”的验收证据`, "添加测试报告、截图、接口响应或其他可复核证据。", "evidence", nodeHref(diagram.id, node.id, "delivery"), ids);

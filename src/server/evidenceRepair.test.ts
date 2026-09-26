@@ -196,11 +196,28 @@ describe("accepted evidence repair", () => {
       .toContain("通过的验收证据");
   });
 
-  it("blocks zero/multiple accepted-plan ownership instead of guessing", () => {
-    const { store, project } = acceptedFixture(1);
+  it("repairs multiple accepted-plan evidence gaps one plan at a time in stable order", () => {
+    const { store, project, nodeId, plans } = acceptedFixture(1);
+    const [first, second] = [...plans].sort((left, right) =>
+      left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
     const workflow = buildProjectWorkflow(store, project.id)!;
-    expect(workflow).toMatchObject({ status: "blocked", nextAction: { code: "evidence_repair_blocked" } });
-    expect(buildAgentOrchestration(store, project.id)!.queues.development).toHaveLength(0);
+    expect(workflow).toMatchObject({ status: "ready", nextAction: { code: "submit_evidence_repair", entityId: first.id } });
+    expect(buildAgentOrchestration(store, project.id)!.queues.development.filter((task) => task.actionCode === "submit_evidence_repair"))
+      .toEqual([expect.objectContaining({ planItemId: first.id })]);
+    expect(listClaimableAgentTasks(store, project.id).find((task) => task.actionCode === "submit_evidence_repair"))
+      .toMatchObject({ planItemId: first.id, available: true });
+    expect(store.getPlan(first.id)?.implementationRevision).toBe(first.implementationRevision);
+    expect(store.getPlan(second.id)?.implementationRevision).toBe(second.implementationRevision);
+
+    updateEvidenceRepairState(store, first.id, { status: "blocked", disposition: "blocked:REPAIR_BASELINE_MISMATCH" });
+    expect(buildProjectWorkflow(store, project.id)).toMatchObject({
+      nextAction: { code: "assess_evidence_repair_failure", entityId: first.id },
+    });
+
+    insertAuditorEvidence(store, project.id, nodeId, first);
+    expect(buildProjectWorkflow(store, project.id)).toMatchObject({
+      nextAction: { code: "submit_evidence_repair", entityId: second.id },
+    });
   });
 
   it("requires a frozen start and atomically submits exact Builder evidence for re-audit", () => {
