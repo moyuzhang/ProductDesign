@@ -37,7 +37,7 @@ import {
 } from "./agentTaskReassignment.js";
 
 const DESIGN_ACTIONS = new Set([
-  "complete_node_definition", "approve_node_requirement", "approve_node_document",
+  "complete_node_definition", "approve_node_document",
   "approve_node_design", "bind_node_database", "create_node_plan", "submit_plan",
 ]);
 
@@ -401,6 +401,9 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
         ? plans.find((plan) => plan.id === action.entityId) ?? null
         : null;
       queues.design.push(task(store, "design", projectId, node, actionPlan, action.code, action.description));
+    }
+    if (action?.code === "approve_node_requirement" && workflow.layerGate.issues.length === 0) {
+      queues.approval.push(task(store, "approval", projectId, node, null, action.code, action.description));
     }
     if (action && pendingNodeDocumentApproval && workflow.layerGate.issues.length === 0) {
       queues.approval.push(task(store, "approval", projectId, node, null, action.code, `${action.description} 由 Main Agent 使用独立 approval 工单审核。`));
@@ -772,7 +775,9 @@ export function buildAgentTaskPackage(
   const databaseBindings = nodeSnapshot
     ? store.listNodeDatabaseBindings({ projectId, diagramId: nodeSnapshot.diagramId, diagramNodeId: nodeSnapshot.nodeId })
     : [];
-  const evidenceRequirements = role === "designer"
+  const evidenceRequirements = task.actionCode === "approve_node_requirement"
+    ? ["非空审核结论", "精确需求工单修订与节点作用域"]
+    : role === "designer"
     ? ["固定的 documentRevisionIds", "计划提案修订与依赖", "验收标准、风险与阻塞解除条件"]
     : role === "builder"
       ? ["实际执行命令与结果", "implementationRevision", "变更摘要", "验收标准逐项自检", "关联 evidenceId"]
@@ -833,12 +838,16 @@ export function buildAgentTaskPackage(
       `租约到期：${selector.lease.leaseExpiresAt}；工作期间每 ${selector.lease.heartbeatSeconds} 秒调用 heartbeat_agent_task 续租。`,
       "开始任何目标项目修改前调用 start_agent_task；Builder 并发时必须提交独立 workspacePath、workspaceBranch 和 baselineRevision。所有计划流转必须携带 leaseToken 和唯一 idempotencyKey。",
       "若收到 LEASE_LOST、TASK_ALREADY_CLAIMED 或租约过期，立即停止写入，不得继续抢占任务。",
-      "transition_plan_delivery 成功后会自动推进或关闭租约；不要在工作流动作完成前单独调用 complete_agent_task。",
+      task.actionCode === "approve_node_requirement"
+        ? "核验当前节点资料后调用 complete_agent_task(resultDigest=审核结论)；服务端会在精确工单修订下原子完成审批。"
+        : "transition_plan_delivery 成功后会自动推进或关闭租约；不要在工作流动作完成前单独调用 complete_agent_task。",
     ] : []),
     role === "auditor" && task.auditScope === "design"
       ? "完成后为每个固定 documentRevisionId 创建带 details.auditScope=design 的审计证据，再执行 pass_design_audit 或 fail_design_audit；不得直接批准计划。"
       : role === "auditor"
         ? "完成后创建绑定当前 implementationRevision 且 details.auditScope=implementation 的审计证据，再执行 pass_audit 或 fail_audit；不得直接验收。"
+        : task.actionCode === "approve_node_requirement"
+          ? "本工单只审核当前节点需求；确认后用 complete_agent_task 提交审核结论，不得自行改写节点资料。"
         : "完成后运行与风险相称的测试，通过 create_evidence 回传命令、结果、当前修订和证据 ID。",
     "普通执行期间只按租约 heartbeat；终态动作或受控写入错误后再刷新 workflow，并以新的 nextAction 作为交接依据。",
   ].filter(Boolean).join("\n");

@@ -358,6 +358,13 @@ function revisionForTask(store: Store, task: AgentOrchestrationTask): string {
     return String(plan.proposalRevision);
   }
   if (task.queue === "approval" && task.actionCode.startsWith("approve_node_") && task.nodeId) {
+    if (task.actionCode === "approve_node_requirement") {
+      const node = store.getDiagram(task.diagramId || "")?.nodes.find((item) => item.id === task.nodeId);
+      return `${task.actionCode}:${createHash("sha256").update(JSON.stringify([
+        node?.description?.trim() || "", node?.owner?.trim() || "",
+        node?.acceptanceCriteria?.trim() || "", node?.requirementStatus || "",
+      ])).digest("hex")}`;
+    }
     const currentRevisionIds = store.listDocumentReferences({
       projectId: task.projectId,
       targetType: "diagramNode",
@@ -1551,6 +1558,7 @@ function claimSingleAgentTask(
       }
       throw new AgentTaskLeaseError(409, "TASK_ALREADY_CLAIMED", `任务已由 ${existing.agent_id} 领取，租约到期时间 ${existing.lease_expires_at}`);
     }
+    if (row.action_code === "approve_node_requirement") assertIndependentApprover(store, row);
     const lease = mapLease(row);
     for (const scope of workScopes) {
       store.db.prepare(`
@@ -1660,7 +1668,12 @@ function assertIndependentApprover(store: Store, row: LeaseRow): void {
   if (row.role !== "approver") return;
   const planId = row.task_id.slice(row.task_id.indexOf(":") + 1);
   const plan = store.getPlan(planId);
-  const plans = row.action_code === "accept_node" && plan?.diagramId && plan.diagramNodeId
+  const nodeApproval = row.action_code === "approve_node_requirement";
+  const nodeScope = nodeApproval ? mapLease(row).workScopes.find((scope) => scope.endsWith(`:${planId}`)) : undefined;
+  const scopeDiagramId = nodeScope?.split(":")[1];
+  const plans = nodeApproval && scopeDiagramId
+    ? store.listPlans(row.project_id, scopeDiagramId, planId).filter(isExecutableDeliveryPlan)
+    : row.action_code === "accept_node" && plan?.diagramId && plan.diagramNodeId
     ? store.listPlans(plan.projectId, plan.diagramId, plan.diagramNodeId).filter(isExecutableDeliveryPlan)
     : plan ? [plan] : [];
   const approverIds = [row.worker_id, row.agent_id].map(normalizeAgentId).filter(Boolean);
@@ -1669,14 +1682,68 @@ function assertIndependentApprover(store: Store, row: LeaseRow): void {
   }
   const taskIds = (plans.length ? plans.map((item) => item.id) : [planId])
     .flatMap((id) => [`design:${id}`, `development:${id}`, `audit:${id}`]);
+  if (nodeApproval) taskIds.push(`design:${planId}`);
   const producers = store.db.prepare(`
     SELECT worker_id, agent_id FROM agent_task_leases
-    WHERE project_id=? AND task_id IN (${taskIds.map(() => "?").join(",")}) AND status='completed'
+    WHERE project_id=? AND task_id IN (${taskIds.map(() => "?").join(",")}) AND ${nodeApproval ? "role='designer'" : "status='completed'"}
   `).all(row.project_id, ...taskIds) as Array<{ worker_id: string; agent_id: string }>;
   if (producers.some((producer) => [producer.worker_id, producer.agent_id].map(normalizeAgentId).some((id) => approverIds.includes(id)))) {
     throw new AgentTaskLeaseError(409, "SELF_APPROVAL_FORBIDDEN", "Approver 身份必须不同于 Designer、Builder 和 Auditor 的生产身份");
   }
+  if (nodeApproval) {
+    const principalFor = (agentId: string, workerId: string) => store.db.prepare(`
+      SELECT DISTINCT principal_id FROM agent_credentials
+      WHERE lower(agent_id)=lower(?) AND lower(worker_id)=lower(?)
+    `).all(agentId, workerId) as Array<{ principal_id: string }>;
+    const approverPrincipals = new Set(principalFor(row.agent_id, row.worker_id).map((item) => item.principal_id));
+    if (approverPrincipals.size && producers.some((producer) => principalFor(producer.agent_id, producer.worker_id)
+      .some((item) => approverPrincipals.has(item.principal_id)))) {
+      throw new AgentTaskLeaseError(409, "SELF_APPROVAL_FORBIDDEN", "Approver 可信主体必须不同于 Designer 生产者");
+    }
+  }
 }
+
+function approveNodeRequirementForLease(store: Store, row: LeaseRow, input: CompleteInput, context: AgentTaskLeaseContext): void {
+  if (row.queue !== "approval" || row.role !== "approver" || row.action_code !== "approve_node_requirement"
+    || row.status !== "running" || !row.started_at || !input.resultDigest?.trim()) {
+    throw new AgentTaskLeaseError(409, "NODE_REQUIREMENT_APPROVAL_INVALID", "节点需求批准必须由已开工的独立 Approver 工单提交审核结论");
+  }
+  if (input.workOrderId !== row.id || input.taskKey !== row.task_key || input.taskRevision !== row.task_revision
+    || input.workerId !== row.worker_id || input.role !== row.role) {
+    throw new AgentTaskLeaseError(409, "WORK_ORDER_CONTEXT_INVALID", "节点需求批准必须精确绑定当前工单与修订");
+  }
+  const queued = listClaimableAgentTasks(store, row.project_id).find((task) => task.taskKey === row.task_key);
+  const nodeId = row.task_id.slice(row.task_id.indexOf(":") + 1);
+  if (!queued || queued.projectId !== row.project_id || queued.id !== row.task_id
+    || queued.taskRevision !== row.task_revision || queued.actionCode !== "approve_node_requirement"
+    || queued.queue !== "approval" || queued.nodeId !== nodeId || !queued.diagramId) {
+    throw new AgentTaskLeaseError(409, "TASK_REVISION_DRIFT", "节点需求审批工单已离开队列或修订已变化");
+  }
+  const diagram = store.getDiagram(queued.diagramId);
+  const node = diagram?.nodes.find((item) => item.id === nodeId);
+  const scopes = mapLease(row).workScopes;
+  if (!diagram || diagram.projectId !== row.project_id || diagram.type !== "main" || !node
+    || !scopes.includes(`node:${diagram.id}:${nodeId}`)) {
+    throw new AgentTaskLeaseError(409, "LEASE_TASK_MISMATCH", "节点需求批准必须属于当前项目主画布及工单作用域");
+  }
+  assertIndependentApprover(store, row);
+  if (!node.description?.trim() || !node.owner?.trim() || !node.acceptanceCriteria?.trim()
+    || node.requirementStatus === "已批准"
+    || buildAgentOrchestration(store, row.project_id)?.workflow.nodes.find((item) => item.nodeId === nodeId && item.diagramId === diagram.id)?.nextAction?.code !== "approve_node_requirement") {
+    throw new AgentTaskLeaseError(409, "NODE_REQUIREMENT_APPROVAL_INVALID", "节点资料不足、已批准或当前流程动作已变化");
+  }
+  store.updateDiagram(diagram.id, { nodes: diagram.nodes.map((item) => item.id === nodeId
+    ? { ...item, requirementStatus: "已批准" } : item) });
+  store.recordAudit({
+    projectId: row.project_id, entityType: "diagramNode", entityId: nodeId, action: "approve_node_requirement",
+    before: { requirementStatus: node.requirementStatus },
+    after: { requirementStatus: "已批准", workOrderId: row.id, resultDigest: input.resultDigest.trim() },
+    actor: context.actor?.trim() || `agent:${row.agent_id}`, source: context.source ?? "system",
+    correlationId: row.task_id, clientId: context.clientId, sessionId: context.sessionId || row.session_id || undefined,
+    model: context.model,
+  });
+}
+
 
 export function assertAgentTaskLeaseForPlanAction(store: Store, input: {
   leaseToken?: string;
@@ -2145,6 +2212,9 @@ function controlSingleLease(
       }
     }
     if (operation === "complete") {
+      if (currentRow.action_code === "approve_node_requirement") {
+        approveNodeRequirementForLease(store, currentRow, input as CompleteInput, context);
+      }
       if (currentRow.action_code === "submit_evidence_repair") {
         const completion = input as CompleteInput;
         const planId = currentRow.task_id.slice(currentRow.task_id.indexOf(":") + 1);

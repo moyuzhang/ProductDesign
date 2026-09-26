@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Store } from "./db.js";
-import { listClaimableAgentTasks, releaseAgentTask } from "./agentTaskLeases.js";
+import { completeAgentTask, listClaimableAgentTasks, releaseAgentTask, startAgentTask } from "./agentTaskLeases.js";
+import { registerAgentCredential } from "./agentSecurity.js";
 import { claimTaskPackage } from "./claimTaskPackage.js";
 import { AgentTaskPackageError, buildAgentOrchestration, buildAgentTaskPackage } from "./orchestration.js";
 
@@ -22,6 +23,97 @@ afterEach(() => {
 });
 
 describe("agent orchestration", () => {
+  it("routes node requirement approval to an independent Approver and completes it atomically", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pcs-node-requirement-approval-"));
+    const store = new Store(join(dir, "test.db"));
+    resources.push({ store, dir });
+    const project = store.insertProject({
+      code: "NODE-REQUIREMENT", name: "需求审批", summary: "节点需求独立审批", stage: "设计", health: "正常",
+      progress: 0, riskLevel: "P1", riskSummary: "", blockerSummary: "", nextStep: "", repositoryPath: dir,
+      startAt: "", dueAt: "",
+    });
+    const main = store.listDiagrams(project.id).find((diagram) => diagram.type === "main")!;
+    const nodeId = "requirement-node";
+    const original = { id: nodeId, kind: "feature" as const, label: "需求", description: "目标清晰", owner: "team",
+      acceptanceCriteria: "可复现", requirementStatus: "待评审" as const, designStatus: "待评审" as const,
+      developmentStatus: "未开发" as const, acceptanceStatus: "未验收" as const, x: 100, y: 100 };
+    store.updateDiagram(main.id, { nodes: [...main.nodes, original] });
+    const orchestration = buildAgentOrchestration(store, project.id)!;
+    expect(orchestration.queues.design.some((item) => item.actionCode === "approve_node_requirement")).toBe(false);
+    expect(orchestration.queues.approval).toEqual(expect.arrayContaining([expect.objectContaining({
+      id: `approval:${nodeId}`, queue: "approval", actionCode: "approve_node_requirement",
+      assignee: expect.objectContaining({ agentId: "Main Agent" }),
+    })]));
+    const firstRevision = listClaimableAgentTasks(store, project.id).find((item) => item.id === `approval:${nodeId}`)!.taskRevision;
+    for (const field of ["description", "owner", "acceptanceCriteria", "requirementStatus"] as const) {
+      const changed = { ...original, [field]: field === "requirementStatus" ? "未评审" : "changed" };
+      store.updateDiagram(main.id, { nodes: [...main.nodes, changed] });
+      expect(listClaimableAgentTasks(store, project.id).find((item) => item.id === `approval:${nodeId}`)?.taskRevision).not.toBe(firstRevision);
+    }
+    store.updateDiagram(main.id, { nodes: [...main.nodes, original] });
+    // A historical node-level Designer lease has no planItemId; it must still block self-approval.
+    store.db.prepare(`INSERT INTO agent_task_leases
+      (id, task_key, task_id, task_revision, project_id, queue, role, action_code, status,
+       lease_token, agent_id, worker_id, lease_expires_at, claimed_at, heartbeat_at, updated_at)
+      VALUES (?, ?, ?, 'old', ?, 'design', 'designer', 'complete_node_definition', 'released',
+        ?, 'Main Agent', 'former-designer', ?, ?, ?, ?)`).run(
+      "former-designer-order", "former-designer-task", `design:${nodeId}`, project.id,
+      "former-designer-token", new Date(Date.now() + 60_000).toISOString(),
+      new Date().toISOString(), new Date().toISOString(), new Date().toISOString(),
+    );
+    expect(() => claimTaskPackage(store, {
+      projectId: project.id, taskId: `approval:${nodeId}`, role: "approver", agentId: "Main Agent",
+      workerId: "independent-approver", idempotencyKey: "self-approve-requirement",
+    })).toThrow(expect.objectContaining({ code: "SELF_APPROVAL_FORBIDDEN" }));
+    store.db.prepare("UPDATE agent_task_leases SET agent_id=? WHERE id=?")
+      .run("historical-designer", "former-designer-order");
+    for (const [agentId, workerId, role] of [
+      ["historical-designer", "former-designer", "designer"],
+      ["Main Agent", "independent-approver", "approver"],
+    ] as const) registerAgentCredential(store, {
+      principalId: "shared-principal", agentId, workerId, allowedRoles: [role], allowedProjects: [project.id],
+    });
+    expect(() => claimTaskPackage(store, {
+      projectId: project.id, taskId: `approval:${nodeId}`, role: "approver", agentId: "Main Agent",
+      workerId: "independent-approver", idempotencyKey: "same-principal-requirement",
+    })).toThrow(expect.objectContaining({ code: "SELF_APPROVAL_FORBIDDEN" }));
+    store.db.prepare("DELETE FROM agent_task_leases WHERE id=?").run("former-designer-order");
+    store.db.prepare("DELETE FROM agent_credentials WHERE principal_id=?").run("shared-principal");
+    const claimed = JSON.parse(claimTaskPackage(store, {
+      projectId: project.id, taskId: `approval:${nodeId}`, role: "approver", agentId: "Main Agent",
+      workerId: "independent-approver", idempotencyKey: "claim-requirement",
+    }));
+    expect(claimed.requiredSubmissionFields).toContain("非空审核结论");
+    expect(claimed.launch.prompt).toContain("complete_agent_task(resultDigest=审核结论)");
+    const exact = { leaseToken: claimed.lease.leaseToken, workOrderId: claimed.lease.workOrderId,
+      taskKey: claimed.lease.taskKey, taskRevision: claimed.lease.taskRevision,
+      agentId: "Main Agent", workerId: "independent-approver", role: "approver" } as const;
+    expect(() => completeAgentTask(store, { ...exact, idempotencyKey: "unstarted", resultDigest: "批准" }))
+      .toThrow(expect.objectContaining({ code: "NODE_REQUIREMENT_APPROVAL_INVALID" }));
+    startAgentTask(store, { ...exact, idempotencyKey: "start-requirement" });
+    expect(() => completeAgentTask(store, { ...exact, idempotencyKey: "empty", resultDigest: " " }))
+      .toThrow(expect.objectContaining({ code: "NODE_REQUIREMENT_APPROVAL_INVALID" }));
+    expect(() => completeAgentTask(store, { ...exact, taskRevision: "stale", idempotencyKey: "wrong-revision", resultDigest: "批准" }))
+      .toThrow(expect.objectContaining({ code: "WORK_ORDER_CONTEXT_INVALID" }));
+    store.updateDiagram(main.id, { nodes: [...main.nodes, { ...original, description: "并发修改" }] });
+    expect(() => completeAgentTask(store, { ...exact, idempotencyKey: "drift", resultDigest: "批准" }))
+      .toThrow(expect.objectContaining({ code: "TASK_REVISION_DRIFT" }));
+    expect(store.getDiagram(main.id)?.nodes.find((item) => item.id === nodeId)?.requirementStatus).toBe("待评审");
+    store.updateDiagram(main.id, { nodes: [...main.nodes, original] });
+    store.db.prepare("UPDATE agent_task_leases SET work_scopes_json='[]' WHERE id=?").run(exact.workOrderId);
+    expect(() => completeAgentTask(store, { ...exact, idempotencyKey: "wrong-scope", resultDigest: "批准" }))
+      .toThrow(expect.objectContaining({ code: "LEASE_TASK_MISMATCH" }));
+    store.db.prepare("UPDATE agent_task_leases SET work_scopes_json=? WHERE id=?")
+      .run(JSON.stringify([`node:${main.id}:${nodeId}`]), exact.workOrderId);
+    expect(store.listAudit(100, project.id).filter((item) => item.action === "approve_node_requirement")).toHaveLength(0);
+    const completed = completeAgentTask(store, { ...exact, idempotencyKey: "approve-requirement", resultDigest: "需求范围已核对" });
+    expect(completed.status).toBe("completed");
+    expect(completeAgentTask(store, { ...exact, idempotencyKey: "approve-requirement", resultDigest: "需求范围已核对" })).toEqual(completed);
+    expect(store.getDiagram(main.id)?.nodes.find((item) => item.id === nodeId)?.requirementStatus).toBe("已批准");
+    expect(store.listAudit(100, project.id).filter((item) => item.action === "approve_node_requirement")).toHaveLength(1);
+    expect(listClaimableAgentTasks(store, project.id).some((item) => item.id === `approval:${nodeId}`)).toBe(false);
+  });
+
   it("routes document approval to Main Agent even when implementation depends on an unaccepted task", () => {
     const dir = mkdtempSync(join(tmpdir(), "pcs-main-agent-node-approval-"));
     const store = new Store(join(dir, "test.db"));
