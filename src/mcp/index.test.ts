@@ -6,7 +6,7 @@ import { createMcpServer } from "./index.js";
 import { Store } from "../server/db.js";
 import { LocalMcpClient, mcpResultText, type AgentMcpResult } from "../server/localMcpClient.js";
 import { createServiceHealthPayload } from "./fullTools.js";
-import { expectedChallengeResponse, registerAgentCredential } from "../server/agentSecurity.js";
+import { beginAgentAuth, completeAgentAuth, expectedChallengeResponse, registerAgentCredential } from "../server/agentSecurity.js";
 
 const dataDir = mkdtempSync(join(tmpdir(), "pcs-mcp-docs-"));
 const dbPath = join(dataDir, "docs.db");
@@ -83,7 +83,7 @@ describe("list_design_docs content retrieval", () => {
         "projectRef", "mainAgentId", "workerId", "idempotencyKey",
       ]));
       expect(coordinationClaim.inputSchema.properties).toEqual(expect.objectContaining({
-        planId: expect.any(Object), taskKey: expect.any(Object), taskRevision: expect.any(Object),
+        authSessionToken: expect.any(Object), planId: expect.any(Object), taskKey: expect.any(Object), taskRevision: expect.any(Object),
       }));
     } finally { await external.close(); }
   });
@@ -158,8 +158,42 @@ describe("list_design_docs content retrieval", () => {
       const text = mcpResultText(result, 100_000);
       return JSON.parse(text.slice(text.indexOf("{")));
     };
-    const parent = json(await client.callTool("claim_coordination_lease", {
-      projectRef: project.id, planId: plan.id, mainAgentId: "Main Agent", workerId: "coord-main-approval", idempotencyKey: "coord-parent-approval",
+    const external = await LocalMcpClient.connect(() => createMcpServer({ store, dbPath, dataDir }));
+    const authenticate = (workerId: string) => {
+      const registration = registerAgentCredential(store, {
+        principalId: `mcp/${workerId}`, agentId: "Main Agent", workerId,
+        allowedRoles: ["approver"], allowedProjects: [project.id],
+      });
+      const connectionId = `mcp-${workerId}`;
+      const challenge = beginAgentAuth(store, registration.credentialId, connectionId);
+      const timestamp = new Date().toISOString();
+      const protocolVersion = "2025-06-18";
+      return completeAgentAuth(store, {
+        challengeId: challenge.challengeId, challenge: challenge.challenge, connectionId, timestamp, protocolVersion,
+        response: expectedChallengeResponse(registration.credentialSecret, challenge.challenge, connectionId,
+          registration.credentialId, timestamp, protocolVersion),
+      }).authSessionToken;
+    };
+    const approvalToken = authenticate("coord-main-approval");
+    const anonymousClaim = await external.callTool("claim_coordination_lease", {
+      projectRef: project.id, planId: plan.id, mainAgentId: "Main Agent", workerId: "coord-main-approval", idempotencyKey: "coord-parent-anonymous",
+    });
+    expect(mcpResultText(anonymousClaim, 100_000)).toContain("AUTH_REQUIRED");
+    const spoofedClaim = await external.callTool("claim_coordination_lease", {
+      projectRef: project.id, planId: plan.id, mainAgentId: "Other Agent", workerId: "coord-main-approval",
+      authSessionToken: approvalToken, idempotencyKey: "coord-parent-spoofed",
+    });
+    expect(mcpResultText(spoofedClaim, 100_000)).toContain("PRINCIPAL_SPOOF_REJECTED");
+    const crossProjectClaim = await external.callTool("claim_coordination_lease", {
+      projectRef: projectId, planId: plan.id, mainAgentId: "Main Agent", workerId: "coord-main-approval",
+      authSessionToken: approvalToken, idempotencyKey: "coord-parent-cross-project",
+    });
+    expect(mcpResultText(crossProjectClaim, 100_000)).toContain("PERMISSION_DENIED");
+    const beforeClaim = JSON.parse(mcpResultText(await external.callTool("list_coordination_leases", { projectRef: project.id }), 100_000));
+    expect(beforeClaim).toEqual([]);
+    const parent = json(await external.callTool("claim_coordination_lease", {
+      projectRef: project.id, planId: plan.id, mainAgentId: "Main Agent", workerId: "coord-main-approval",
+      authSessionToken: approvalToken, idempotencyKey: "coord-parent-approval",
     }));
     const approved = json(await client.callTool("transition_plan_delivery", {
       planId: plan.id, action: "approve_plan", actor: "Main Agent", agentId: "Main Agent",
@@ -179,8 +213,9 @@ describe("list_design_docs content retrieval", () => {
       commitSha: "coord-implementation", digest: "coord-digest", collectedAt: "2026-09-12T01:00:00.000Z",
       planItemId: plan.id, actorRole: "auditor", agentId: "coord-auditor", status: "active",
     });
-    const acceptanceParent = json(await client.callTool("claim_coordination_lease", {
-      projectRef: project.id, planId: plan.id, mainAgentId: "Main Agent", workerId: "coord-main-acceptance", idempotencyKey: "coord-parent-acceptance",
+    const acceptanceParent = json(await external.callTool("claim_coordination_lease", {
+      projectRef: project.id, planId: plan.id, mainAgentId: "Main Agent", workerId: "coord-main-acceptance",
+      authSessionToken: authenticate("coord-main-acceptance"), idempotencyKey: "coord-parent-acceptance",
     }));
     const accepted = json(await client.callTool("transition_plan_delivery", {
       planId: plan.id, action: "approve_acceptance", actor: "Main Agent", agentId: "Main Agent",
@@ -190,6 +225,7 @@ describe("list_design_docs content retrieval", () => {
     await client.callTool("release_coordination_lease", {
       projectRef: project.id, coordinationLeaseId: acceptanceParent.id, leaseToken: acceptanceParent.leaseToken, mainAgentId: "Main Agent", reason: "测试结束",
     });
+    await external.close();
   });
 
   it("exposes list and exact task-context reads to the internal Agent bridge", async () => {

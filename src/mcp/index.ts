@@ -49,6 +49,7 @@ import {
   AGENT_POLICY_INSTRUCTIONS,
   AGENT_POLICY_VERSION,
   AgentSecurityError,
+  assertCoordinationMainAgent,
   recordScopedAgentWrite,
   acknowledgeAgentPolicy,
   beginAgentAuth,
@@ -548,19 +549,25 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
   };
   server.registerTool("claim_coordination_lease", {
     title: "Main Agent 领取父协调租约",
-    description: "Main Agent 领取绑定到单一目标计划，或精确无计划设计任务 taskKey+taskRevision 的父协调租约；两种目标恰选其一。",
+    description: "需先以 Main Agent 的 approver 凭据完成认证并传入 authSessionToken；领取绑定到单一目标计划，或精确无计划设计任务 taskKey+taskRevision 的父协调租约，两种目标恰选其一。",
     inputSchema: {
       projectRef: z.string().min(1), planId: z.string().trim().min(1).max(300).optional(),
       taskKey: z.string().trim().min(1).max(2000).optional(), taskRevision: z.string().trim().min(1).max(500).optional(),
-      mainAgentId: z.string().trim().min(1).max(200),
+      authSessionToken: z.string().min(32).max(300).optional(), mainAgentId: z.string().trim().min(1).max(200),
       workerId: z.string().trim().min(1).max(300), leaseSeconds: z.number().int().min(15).max(1800).default(1800),
       idempotencyKey: z.string().trim().min(1).max(300),
     },
   }, ({ projectRef, ...input }) => {
     const project = byRef(store, projectRef);
     if (!project) return { ...toolText(`PROJECT_NOT_FOUND: 未找到项目: ${projectRef}`), isError: true };
-    try { return toolText(JSON.stringify(claimCoordinationLease(store, { ...input, projectId: project.id }), null, 2)); }
-    catch (cause) { if (cause instanceof CoordinationLeaseError) return { ...toolText(structuredError(cause)), isError: true }; throw cause; }
+    try {
+      assertCoordinationMainAgent(store, { ...input, projectId: project.id });
+      const { authSessionToken: _authSessionToken, ...claim } = input;
+      return toolText(JSON.stringify(claimCoordinationLease(store, { ...claim, projectId: project.id }), null, 2));
+    } catch (cause) {
+      if (cause instanceof CoordinationLeaseError || cause instanceof AgentSecurityError) return { ...toolText(structuredError(cause)), isError: true };
+      throw cause;
+    }
   });
   server.registerTool("heartbeat_coordination_lease", {
     title: "Main Agent 续租父协调租约",

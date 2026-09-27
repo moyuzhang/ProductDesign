@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactElement } from "react";
-import { ArrowRight, Bot, Check, Clipboard, Download, ExternalLink, FileJson, FolderOpen, Pencil, RefreshCw, ShieldCheck, UserCheck, Wrench, XCircle } from "lucide-react";
-import type { AgentBlueprintKey, AgentBlueprintOverride, AgentExecutableQueueKey, AgentOrchestration, AgentOrchestrationQueueKey, AgentOrchestrationTask, AgentTaskLeaseRecord, AgentTaskPackage } from "../../shared/types";
+import { ArrowRight, Bot, Check, Clipboard, ExternalLink, FolderOpen, Pencil, RefreshCw, ShieldCheck, UserCheck, Wrench, XCircle } from "lucide-react";
+import type { AgentBlueprintKey, AgentBlueprintOverride, AgentExecutableQueueKey, AgentOrchestration, AgentOrchestrationQueueKey, AgentTaskLeaseRecord } from "../../shared/types";
 import { api } from "../api";
 import { navigate } from "../App";
 import { EmptyState, ErrorBanner, Field, Modal, Spinner, formatTime } from "../ui";
@@ -22,13 +22,6 @@ const QUEUES: Array<{ key: AgentOrchestrationQueueKey; label: string; owner: str
 ];
 
 const ROLE_ICONS = { designer: Bot, builder: Wrench, auditor: ShieldCheck, approver: UserCheck } as const;
-const ROLE_BY_QUEUE: Record<AgentExecutableQueueKey, AgentBlueprintKey> = {
-  design: "designer",
-  development: "builder",
-  audit: "auditor",
-  approval: "approver",
-};
-
 function QueueCardHeader({ label, count }: { label: string; count: number }): ReactElement {
   return <div className="orchestration-queue-head"><span>{label}</span><strong>{count}</strong></div>;
 }
@@ -53,7 +46,6 @@ export function AgentOrchestrationView(): ReactElement {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [taskPackage, setTaskPackage] = useState<AgentTaskPackage | null>(null);
   const [leases, setLeases] = useState<LeaseRecord[]>([]);
   const [releaseTarget, setReleaseTarget] = useState<LeaseRecord | null>(null);
   const [releaseReason, setReleaseReason] = useState("");
@@ -61,9 +53,6 @@ export function AgentOrchestrationView(): ReactElement {
   const [showLeaseHistory, setShowLeaseHistory] = useState(false);
   const [leaseHistoryOffset, setLeaseHistoryOffset] = useState(0);
   const [runtimeOffset, setRuntimeOffset] = useState(0);
-  const [packageLoadingId, setPackageLoadingId] = useState("");
-  const [packageCopied, setPackageCopied] = useState<"prompt" | "json" | "">("");
-  const [coordinationWorkerId] = useState(() => `productdesign-main-${crypto.randomUUID()}`);
   // Per-queue pagination so any single queue cannot stretch the whole grid.
   const [offsets, setOffsets] = useState<Record<AgentOrchestrationQueueKey, number>>(createOrchestrationQueueOffsets);
   // Editable recommended-agent blueprints (globally shared).
@@ -76,7 +65,6 @@ export function AgentOrchestrationView(): ReactElement {
     if (!workspace) return;
     setLoading(true);
     setError("");
-    setTaskPackage(null);
     Promise.all([api.getAgentOrchestration(workspace), api.listAgentTaskLeases(workspace)])
       .then(([nextData, nextLeases]) => { setData(nextData); setLeases(nextLeases); })
       .catch((cause: Error) => setError(cause.message))
@@ -139,39 +127,6 @@ export function AgentOrchestrationView(): ReactElement {
     window.setTimeout(() => setCopied(false), 1500);
   };
 
-  const generateTaskPackage = async (queue: AgentExecutableQueueKey, task: AgentOrchestrationTask) => {
-    if (!data) return;
-    setPackageLoadingId(task.id);
-    setError("");
-    try {
-      const role = ROLE_BY_QUEUE[queue] as "designer" | "builder" | "auditor";
-      const current = (await api.listAgentTasks(data.project.id)).find((item) => item.id === task.id && item.queue === queue);
-      if (!current?.available || !current.assignee?.agentId || !current.poolId) {
-        throw new Error(current?.availabilityReason || "目标任务当前不可派发，请刷新队列");
-      }
-      const target = current.planItemId ? { planId: current.planItemId }
-        : { taskKey: current.taskKey, taskRevision: current.taskRevision };
-      const parent = await api.claimCoordinationLease(data.project.id, target, "Main Agent", coordinationWorkerId);
-      const dispatch = await api.dispatchChildTask(data.project.id, parent, {
-        taskId: current.id, taskKey: current.taskKey, role, agentId: current.assignee.agentId,
-        workerId: `productdesign-child-${crypto.randomUUID()}`, poolId: current.poolId,
-      });
-      const next = await api.claimDispatchedChildTask(data.project.id, dispatch);
-      setTaskPackage(next);
-      const [nextData, nextLeases] = await Promise.all([
-        api.getAgentOrchestration(data.project.id),
-        api.listAgentTaskLeases(data.project.id),
-      ]);
-      setData(nextData);
-      setLeases(nextLeases);
-      window.setTimeout(() => document.getElementById("agent-task-package")?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setPackageLoadingId("");
-    }
-  };
-
   const confirmManualRelease = async () => {
     if (!releaseTarget || !data || !releaseReason.trim()) return;
     setReleasingLeaseId(releaseTarget.workOrderId);
@@ -191,24 +146,6 @@ export function AgentOrchestrationView(): ReactElement {
     } finally {
       setReleasingLeaseId("");
     }
-  };
-
-  const copyPackage = async (kind: "prompt" | "json") => {
-    if (!taskPackage) return;
-    await navigator.clipboard.writeText(kind === "prompt" ? taskPackage.launch.prompt : JSON.stringify(taskPackage, null, 2));
-    setPackageCopied(kind);
-    window.setTimeout(() => setPackageCopied(""), 1500);
-  };
-
-  const downloadPackage = () => {
-    if (!taskPackage) return;
-    const blob = new Blob([JSON.stringify(taskPackage, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${taskPackage.project.code}-${taskPackage.task.queue}-${taskPackage.packageId}.json`.replace(/[^a-zA-Z0-9._-]+/g, "-");
-    link.click();
-    URL.revokeObjectURL(url);
   };
 
   const openEdit = async (key: AgentBlueprintKey, name: string) => {
@@ -356,14 +293,9 @@ export function AgentOrchestrationView(): ReactElement {
               <QueueCardHeader label={queue.label} count={items.length} />
               <div className="orchestration-owner">责任主体 · {queue.owner}</div>
               {executableQueue ? (
-                <button
-                  className="orchestration-package-trigger orchestration-dispatch-trigger"
-                  disabled={!data.workingDirectory.ready || !claimCandidate || packageLoadingId === claimCandidate.id}
-                  onClick={() => claimCandidate && void generateTaskPackage(executableQueue, claimCandidate)}
-                >
-                  <FileJson />
-                  <span>{packageLoadingId === claimCandidate?.id ? "Main Agent 派发中" : "Main Agent 派发下一任务"}</span>
-                </button>
+                <p className="orchestration-quiet">{claimCandidate
+                  ? "请由已认证的 Main Agent 在 MCP 中领取父协调租约并派发；本页面不保存凭据或匿名领取。"
+                  : "当前没有可派发任务。"}</p>
               ) : null}
               <div className="orchestration-task-list">
                 {items.length === 0 && <div className="orchestration-quiet">当前无任务</div>}
@@ -441,36 +373,6 @@ export function AgentOrchestrationView(): ReactElement {
           </div>
         ) : null}
       </section>
-
-      {taskPackage ? (
-        <section className="orchestration-section orchestration-package" id="agent-task-package" data-testid="agent-task-package">
-          <div className="orchestration-section-title">
-            <div><span>PACKAGE</span><h2>外部 Agent 任务包</h2></div>
-            <p>ProductDesign 只生成交接材料；外部 Agent 由用户在目标目录手动启动。</p>
-          </div>
-          <div className="orchestration-package-summary">
-            <div><span>角色</span><strong>{taskPackage.roleBlueprint.name}</strong></div>
-            <div><span>受派身份</span><strong>{taskPackage.assignment.displayName} · {taskPackage.assignment.agentId}</strong></div>
-            <div><span>Worker / 池</span><strong>{taskPackage.worker.workerId} · {taskPackage.worker.poolId || "兼容池"}</strong></div>
-            <div><span>队列 / 动作</span><strong>{taskPackage.task.queue} / {taskPackage.task.actionCode}</strong></div>
-            <div><span>父协调目标</span><code>{taskPackage.task.planItemId ? `计划 ${taskPackage.task.planItemId}` : `设计任务 ${taskPackage.lease?.taskKey || taskPackage.task.id} / ${taskPackage.lease?.taskRevision || "-"}`}</code></div>
-            <div><span>目标目录</span><code>{taskPackage.launch.workingDirectory}</code></div>
-            <div><span>关联 ID</span><code>{taskPackage.handoff.correlationId}</code></div>
-            {taskPackage.lease ? <div><span>租约 / 资源锁</span><strong>{taskPackage.lease.status} · {taskPackage.lease.workScopes.join("、")}</strong></div> : null}
-            {taskPackage.lease ? <div><span>独立工作区</span><code>{taskPackage.lease.workspace.recommendedPath || "启动时提供"}</code></div> : null}
-          </div>
-          <div className="orchestration-package-actions">
-            <button className="btn btn-primary" onClick={() => void copyPackage("prompt")}><Clipboard />{packageCopied === "prompt" ? "提示词已复制" : "复制启动提示词"}</button>
-            <button className="btn" onClick={() => void copyPackage("json")}><FileJson />{packageCopied === "json" ? "JSON 已复制" : "复制 JSON"}</button>
-            <button className="btn" onClick={downloadPackage}><Download />下载 JSON</button>
-          </div>
-          <pre>{taskPackage.launch.prompt}</pre>
-          <details>
-            <summary>查看完整机器可读任务包</summary>
-            <pre>{JSON.stringify(taskPackage, null, 2)}</pre>
-          </details>
-        </section>
-      ) : null}
 
       <section className="orchestration-section">
         <div className="orchestration-section-title"><div><span>01</span><h2>建议创建的 Agent</h2></div><p>管理员是人，不由外部编排器自动创建。</p></div>

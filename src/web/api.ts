@@ -4,8 +4,6 @@ import type {
   AgentApprovalStatus,
   AgentBlueprintKey,
   AgentBlueprintOverride,
-  AgentChildTaskDispatch,
-  AgentCoordinationLease,
   AgentControlMode,
   AgentExecutableQueueKey,
   AgentMessage,
@@ -19,7 +17,6 @@ import type {
   AgentRunnerRegistration,
   AgentTaskLeaseRecord,
   AgentTaskCapacity,
-  AgentTaskPackage,
   AuditEvent,
   Backup,
   DatabaseCodeResult,
@@ -267,19 +264,6 @@ export const api = {
     request<AgentOrchestration>("GET", `/api/projects/${id}/agent-orchestration${qs({ includePrompts: String(includePrompts) })}`),
   listAgentTasks: (projectId: string) =>
     request<Array<AgentOrchestrationTask & { taskKey: string; taskRevision: string; requiredRole: AgentBlueprintKey; available: boolean; availabilityReason: string }>>("GET", `/api/projects/${projectId}/agent-tasks`),
-  claimCoordinationLease: (projectId: string, target: { planId: string } | { taskKey: string; taskRevision: string }, mainAgentId: string, workerId: string) =>
-    request<AgentCoordinationLease>("POST", `/api/projects/${projectId}/coordination-leases`, {
-      ...target, mainAgentId, workerId, leaseSeconds: 1800, idempotencyKey: crypto.randomUUID(),
-    }),
-  dispatchChildTask: (projectId: string, parent: Pick<AgentCoordinationLease, "id" | "leaseToken" | "mainAgentId">, body: { taskId: string; taskKey?: string; role: "designer" | "builder" | "auditor"; agentId?: string; workerId?: string; poolId?: string }) =>
-    request<AgentChildTaskDispatch>("POST", `/api/projects/${projectId}/coordination-leases/${encodeURIComponent(parent.id)}/dispatch`, {
-      leaseToken: parent.leaseToken, mainAgentId: parent.mainAgentId, ...body,
-    }),
-  claimDispatchedChildTask: (projectId: string, dispatch: Pick<AgentChildTaskDispatch, "dispatchId" | "agentId" | "workerId" | "poolId">) =>
-    request<AgentTaskPackage>("POST", `/api/projects/${projectId}/child-task-dispatches/${encodeURIComponent(dispatch.dispatchId)}/claim`, {
-      agentId: dispatch.agentId, workerId: dispatch.workerId, poolId: dispatch.poolId, capabilities: ["manual-external-runner"],
-      leaseSeconds: 1800, idempotencyKey: crypto.randomUUID(),
-    }),
   listAgentBlueprints: () => request<AgentBlueprintOverride[]>("GET", "/api/agent-blueprints"),
   getAgentTaskCapacity: (id: string) => request<AgentTaskCapacity>("GET", `/api/projects/${id}/agent-task-capacity`),
   updateAgentTaskCapacity: (id: string, patch: Partial<Omit<AgentTaskCapacity, "projectId" | "updatedAt">>) =>

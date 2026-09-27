@@ -280,6 +280,20 @@ export function resolveAuthPrincipal(store: Store, authSessionToken: string): Au
   };
 }
 
+export function assertCoordinationMainAgent(store: Store, input: {
+  authSessionToken?: string; mainAgentId: string; workerId: string; projectId: string;
+}): AuthPrincipal {
+  if (!input.authSessionToken) throw new AgentSecurityError(401, "AUTH_REQUIRED", "Authenticated Main Agent session is required");
+  const principal = resolveAuthPrincipal(store, input.authSessionToken);
+  if (principal.agentId !== input.mainAgentId || principal.workerId !== input.workerId) {
+    throw new AgentSecurityError(403, "PRINCIPAL_SPOOF_REJECTED", "Main Agent identity conflicts with authenticated principal");
+  }
+  if (!principal.allowedRoles.includes("approver") || !principal.allowedProjects.includes(input.projectId)) {
+    throw new AgentSecurityError(403, "PERMISSION_DENIED", "Credential does not allow coordination in this project");
+  }
+  return principal;
+}
+
 export function acknowledgeAgentPolicy(store: Store, principal: AuthPrincipal, input: {
   role: AgentRole; projectId: string; policyVersion: string;
 }): { policyAckToken: string; tokenId: string; expiresAt: string; policyVersion: string } {

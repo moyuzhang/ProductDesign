@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { buildApp } from "./index.js";
 import * as orchestration from "./orchestration.js";
+import { Store } from "./db.js";
+import { beginAgentAuth, completeAgentAuth, expectedChallengeResponse, registerAgentCredential } from "./agentSecurity.js";
 
 const dataDir = mkdtempSync(join(tmpdir(), "pcs-api-"));
 const dbPath = join(dataDir, "api-test.db");
@@ -127,16 +129,70 @@ describe("REST API", () => {
     });
     expect(released.statusCode, released.body).toBe(200);
 
-    const parentClaim = await app.inject({ method: "POST", url: `/api/projects/${restProjectId}/coordination-leases`, payload: {
+    const securityStore = new Store(dbPath, dataDir);
+    const registration = registerAgentCredential(securityStore, {
+      principalId: "rest/main", agentId: "Main Agent", workerId: "rest-preplan-parent",
+      allowedRoles: ["approver"], allowedProjects: [restProjectId],
+    });
+    const connectionId = "rest-parent-test";
+    const challenge = beginAgentAuth(securityStore, registration.credentialId, connectionId);
+    const timestamp = new Date().toISOString();
+    const protocolVersion = "2025-06-18";
+    const authSessionToken = completeAgentAuth(securityStore, {
+      challengeId: challenge.challengeId, challenge: challenge.challenge, connectionId, timestamp, protocolVersion,
+      response: expectedChallengeResponse(registration.credentialSecret, challenge.challenge, connectionId,
+        registration.credentialId, timestamp, protocolVersion),
+    }).authSessionToken;
+    const parentInput = {
       taskKey: task.taskKey, taskRevision: task.taskRevision, mainAgentId: "Main Agent",
       workerId: "rest-preplan-parent", idempotencyKey: "rest-preplan-parent-claim",
+    };
+    const anonymous = await app.inject({ method: "POST", url: `/api/projects/${restProjectId}/coordination-leases`, payload: parentInput });
+    expect(anonymous.statusCode).toBe(401);
+    expect(anonymous.json().code).toBe("AUTH_REQUIRED");
+    const spoofed = await app.inject({ method: "POST", url: `/api/projects/${restProjectId}/coordination-leases`, payload: {
+      ...parentInput, authSessionToken, mainAgentId: "Other Agent",
+    } });
+    expect(spoofed.statusCode).toBe(403);
+    expect(spoofed.json().code).toBe("PRINCIPAL_SPOOF_REJECTED");
+    const wrongWorker = await app.inject({ method: "POST", url: `/api/projects/${restProjectId}/coordination-leases`, payload: {
+      ...parentInput, authSessionToken, workerId: "another-worker",
+    } });
+    expect(wrongWorker.statusCode).toBe(403);
+    expect(wrongWorker.json().code).toBe("PRINCIPAL_SPOOF_REJECTED");
+    const builderCredential = registerAgentCredential(securityStore, {
+      principalId: "rest/builder", agentId: "Main Agent", workerId: "rest-preplan-parent",
+      allowedRoles: ["builder"], allowedProjects: [restProjectId],
+    });
+    const builderChallenge = beginAgentAuth(securityStore, builderCredential.credentialId, "rest-builder-test");
+    const builderToken = completeAgentAuth(securityStore, {
+      challengeId: builderChallenge.challengeId, challenge: builderChallenge.challenge,
+      connectionId: "rest-builder-test", timestamp, protocolVersion,
+      response: expectedChallengeResponse(builderCredential.credentialSecret, builderChallenge.challenge,
+        "rest-builder-test", builderCredential.credentialId, timestamp, protocolVersion),
+    }).authSessionToken;
+    const wrongRole = await app.inject({ method: "POST", url: `/api/projects/${restProjectId}/coordination-leases`, payload: {
+      ...parentInput, authSessionToken: builderToken,
+    } });
+    expect(wrongRole.statusCode).toBe(403);
+    expect(wrongRole.json().code).toBe("PERMISSION_DENIED");
+    const noLease = await app.inject({ method: "GET", url: `/api/projects/${restProjectId}/coordination-leases` });
+    expect(noLease.json()).toEqual([]);
+    const otherProject = await app.inject({ method: "POST", url: "/api/projects", payload: { code: "PREPLANOTHER", name: "其他项目" } });
+    const crossProject = await app.inject({ method: "POST", url: `/api/projects/${otherProject.json().id}/coordination-leases`, payload: {
+      ...parentInput, authSessionToken,
+    } });
+    expect(crossProject.statusCode).toBe(403);
+    expect(crossProject.json().code).toBe("PERMISSION_DENIED");
+    const parentClaim = await app.inject({ method: "POST", url: `/api/projects/${restProjectId}/coordination-leases`, payload: {
+      ...parentInput, authSessionToken,
     } });
     expect(parentClaim.statusCode, parentClaim.body).toBe(200);
     expect(parentClaim.json()).toMatchObject({ planId: "", taskKey: task.taskKey, taskRevision: task.taskRevision, stage: "design" });
     const parent = parentClaim.json();
     const wrongTarget = await app.inject({ method: "POST", url: `/api/projects/${restProjectId}/coordination-leases`, payload: {
       planId: "fake-plan", taskKey: task.taskKey, taskRevision: task.taskRevision, mainAgentId: "Main Agent",
-      workerId: "rest-preplan-parent", idempotencyKey: "rest-preplan-both-targets",
+      workerId: "rest-preplan-parent", idempotencyKey: "rest-preplan-both-targets", authSessionToken,
     } });
     expect(wrongTarget.json().code).toBe("COORDINATION_TARGET_INVALID");
     const dispatched = await app.inject({ method: "POST",
@@ -151,6 +207,7 @@ describe("REST API", () => {
         leaseToken: parent.leaseToken, mainAgentId: "Main Agent", reason: "REST task-bound parent regression",
       } });
     expect(parentReleased.statusCode, parentReleased.body).toBe(200);
+    securityStore.close();
   });
 
   it("exposes the governed design-change contract", async () => {

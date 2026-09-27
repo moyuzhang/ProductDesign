@@ -142,6 +142,7 @@ import type { AgentUiEventBus, SequencedAgentUiEvent } from "./agentUiEvents.js"
 import {
   AGENT_POLICY_VERSION,
   AgentSecurityError,
+  assertCoordinationMainAgent,
   acknowledgeAgentPolicy,
   beginAgentAuth,
   completeAgentAuth,
@@ -266,6 +267,7 @@ function httpError(statusCode: number, message: string): Error {
 }
 
 function agentTaskPackageError(reply: FastifyReply, cause: unknown) {
+  if (cause instanceof AgentSecurityError) return reply.code(cause.statusCode).send({ message: cause.message, code: cause.code });
   if (cause instanceof AgentTaskPackageError || cause instanceof AgentTaskLeaseError || cause instanceof CoordinationLeaseError) {
     return reply.code(cause.statusCode).send({ message: cause.message, code: cause.code, ...(cause.details ? { details: cause.details } : {}) });
   }
@@ -503,8 +505,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       catch (cause) { return sendSecurityError(reply, cause); }
       return;
     }
-    // Coordination endpoints authenticate the Main Agent with the parent lease;
-    // they intentionally do not carry a child work-order token.
+    // Coordination operations use the parent lease; claim authenticates separately in its handler.
     if (/^\/api\/projects\/[^/]+\/(?:coordination-leases|child-task-dispatches)(?:\/|$)/.test(requestPath)) return;
     const declaredActor = request.headers["x-productdesign-actor-type"];
     const body = (request.body ?? {}) as Record<string, unknown>;
@@ -1095,8 +1096,10 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id } = request.params as { id: string };
     if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在", code: "PROJECT_NOT_FOUND" });
     try {
-      const body = parse(coordinationIdentity.extend({ planId: z.string().trim().min(1).max(300).optional(), taskKey: z.string().trim().min(1).max(2000).optional(), taskRevision: z.string().trim().min(1).max(500).optional(), leaseSeconds: z.number().int().min(15).max(1800).default(1800), idempotencyKey: z.string().trim().min(1).max(300) }), request.body);
-      return claimCoordinationLease(store, { ...body, projectId: id });
+      const body = parse(coordinationIdentity.extend({ authSessionToken: z.string().min(32).max(300).optional(), planId: z.string().trim().min(1).max(300).optional(), taskKey: z.string().trim().min(1).max(2000).optional(), taskRevision: z.string().trim().min(1).max(500).optional(), leaseSeconds: z.number().int().min(15).max(1800).default(1800), idempotencyKey: z.string().trim().min(1).max(300) }), request.body);
+      assertCoordinationMainAgent(store, { ...body, projectId: id });
+      const { authSessionToken: _authSessionToken, ...claim } = body;
+      return claimCoordinationLease(store, { ...claim, projectId: id });
     } catch (cause) { return agentTaskPackageError(reply, cause); }
   });
   app.post("/api/projects/:id/coordination-leases/:coordinationLeaseId/:operation", async (request, reply) => {
