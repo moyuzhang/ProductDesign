@@ -561,9 +561,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     const project = byRef(store, projectRef);
     if (!project) return { ...toolText(`PROJECT_NOT_FOUND: 未找到项目: ${projectRef}`), isError: true };
     try {
-      assertCoordinationMainAgent(store, { ...input, projectId: project.id });
-      const { authSessionToken: _authSessionToken, ...claim } = input;
-      return toolText(JSON.stringify(claimCoordinationLease(store, { ...claim, projectId: project.id }), null, 2));
+      return toolText(JSON.stringify(claimCoordinationLease(store, { ...input, authSessionToken: input.authSessionToken || "", projectId: project.id }), null, 2));
     } catch (cause) {
       if (cause instanceof CoordinationLeaseError || cause instanceof AgentSecurityError) return { ...toolText(structuredError(cause)), isError: true };
       throw cause;

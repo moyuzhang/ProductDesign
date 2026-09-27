@@ -262,6 +262,9 @@ export const api = {
     request<DesignChangeResult>("POST", `/api/projects/${id}/design-changes`, body),
   getAgentOrchestration: (id: string, includePrompts = true) =>
     request<AgentOrchestration>("GET", `/api/projects/${id}/agent-orchestration${qs({ includePrompts: String(includePrompts) })}`),
+  getCoordinationHandoff: (projectId: string, target: {
+    planId?: string; taskId?: string; expectedProposalRevision?: number; expectedTaskKey?: string; expectedTaskRevision?: string;
+  }) => request<{ serialized: string }>("GET", `/api/projects/${projectId}/coordination-handoff${qs(target)}`),
   listAgentTasks: (projectId: string) =>
     request<Array<AgentOrchestrationTask & { taskKey: string; taskRevision: string; requiredRole: AgentBlueprintKey; available: boolean; availabilityReason: string }>>("GET", `/api/projects/${projectId}/agent-tasks`),
   listAgentBlueprints: () => request<AgentBlueprintOverride[]>("GET", "/api/agent-blueprints"),

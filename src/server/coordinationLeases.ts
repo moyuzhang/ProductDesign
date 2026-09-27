@@ -23,6 +23,7 @@ import {
   type ClaimAgentTaskInput,
 } from "./agentTaskLeases.js";
 import { buildAgentOrchestration, buildAgentTaskPackage } from "./orchestration.js";
+import { assertCoordinationMainAgent, ensureAgentSecuritySchema } from "./agentSecurity.js";
 
 const ACTIVE_CHILD_STATUSES: AgentChildDispatchStatus[] = ["dispatched", "claimed", "running"];
 const CHILD_ROLE_BY_STAGE: Partial<Record<AgentCoordinationStage, Exclude<AgentBlueprintKey, "approver">>> = {
@@ -73,6 +74,9 @@ interface CoordinationLeaseRow {
   lease_expires_at: string;
   heartbeat_at: string;
   dispatch_revision: number;
+  claim_credential_id: string;
+  claim_auth_session_hash: string;
+  claim_revocation_version: number;
   created_at: string;
   updated_at: string;
 }
@@ -191,6 +195,7 @@ function setCoordinationRunnerStatus(store: Store, projectId: string, mainAgentI
 
 export function ensureCoordinationLeaseSchema(store: Store): void {
   ensureAgentTaskLeaseSchema(store);
+  ensureAgentSecuritySchema(store);
   const columns = store.db.prepare("PRAGMA table_info(agent_task_leases)").all() as Array<{ name: string }>;
   if (!columns.some((column) => column.name === "coordination_dispatch_id")) {
     store.db.exec("ALTER TABLE agent_task_leases ADD COLUMN coordination_dispatch_id TEXT NOT NULL DEFAULT ''");
@@ -210,6 +215,9 @@ export function ensureCoordinationLeaseSchema(store: Store): void {
       lease_expires_at TEXT NOT NULL,
       heartbeat_at TEXT NOT NULL,
       dispatch_revision INTEGER NOT NULL DEFAULT 0,
+      claim_credential_id TEXT NOT NULL DEFAULT '',
+      claim_auth_session_hash TEXT NOT NULL DEFAULT '',
+      claim_revocation_version INTEGER NOT NULL DEFAULT -1,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -247,20 +255,85 @@ export function ensureCoordinationLeaseSchema(store: Store): void {
       ON agent_child_task_dispatches(project_id, task_key)
       WHERE status IN ('dispatched', 'claimed', 'running');
   `);
-  const parentColumns = store.db.prepare("PRAGMA table_info(agent_coordination_leases)").all() as Array<{ name: string }>;
-  if (!parentColumns.some((column) => column.name === "target_plan_id")) {
-    store.db.exec("ALTER TABLE agent_coordination_leases ADD COLUMN target_plan_id TEXT NOT NULL DEFAULT ''");
-  }
-  if (!parentColumns.some((column) => column.name === "target_task_key")) {
-    store.db.exec("ALTER TABLE agent_coordination_leases ADD COLUMN target_task_key TEXT NOT NULL DEFAULT ''");
-  }
-  if (!parentColumns.some((column) => column.name === "target_task_revision")) {
-    store.db.exec("ALTER TABLE agent_coordination_leases ADD COLUMN target_task_revision TEXT NOT NULL DEFAULT ''");
-  }
+  // Complete the security migration atomically. A crash must not leave an old
+  // parent live while its child lease and resource locks remain usable.
+  store.db.transaction(() => {
+    const columns = store.db.prepare("PRAGMA table_info(agent_coordination_leases)").all() as Array<{ name: string }>;
+    for (const [name, definition] of [
+      ["target_plan_id", "TEXT NOT NULL DEFAULT ''"],
+      ["target_task_key", "TEXT NOT NULL DEFAULT ''"],
+      ["target_task_revision", "TEXT NOT NULL DEFAULT ''"],
+      ["claim_credential_id", "TEXT NOT NULL DEFAULT ''"],
+      ["claim_auth_session_hash", "TEXT NOT NULL DEFAULT ''"],
+      ["claim_revocation_version", "INTEGER NOT NULL DEFAULT -1"],
+    ]) {
+      if (!columns.some((column) => column.name === name)) store.db.exec(`ALTER TABLE agent_coordination_leases ADD COLUMN ${name} ${definition}`);
+    }
+    const legacy = store.db.prepare(`SELECT * FROM agent_coordination_leases WHERE status IN ('active','paused')
+      AND (claim_credential_id='' OR claim_auth_session_hash='' OR claim_revocation_version<0)`).all() as CoordinationLeaseRow[];
+    for (const row of legacy) {
+      const timestamp = now();
+      reclaimChildren(store, row.id, "legacy_unbound_security_migration");
+      store.db.prepare("UPDATE agent_coordination_leases SET status='released', updated_at=? WHERE id=?").run(timestamp, row.id);
+      setCoordinationRunnerStatus(store, row.project_id, row.main_agent_id, row.worker_id, "offline");
+      store.db.prepare(`INSERT INTO security_audit_events
+        (id,occurred_at,actor_type,action,risk_class,result,details_json)
+        VALUES (?,?,'system','legacy_unbound_security_migration','controlled','success',?)`)
+        .run(randomUUID(), timestamp, JSON.stringify({ coordinationLeaseId: row.id, projectId: row.project_id }));
+    }
+  }).immediate();
+}
+
+function credentialBinding(store: Store, authSessionToken: string, input: { projectId: string; mainAgentId: string; workerId: string }) {
+  const principal = assertCoordinationMainAgent(store, { ...input, authSessionToken });
+  const credential = store.db.prepare("SELECT status, expires_at, revocation_version FROM agent_credentials WHERE credential_id=?")
+    .get(principal.credentialId) as { status: string; expires_at: string; revocation_version: number } | undefined;
+  if (!credential || credential.status !== "active" || credential.expires_at <= now())
+    throw new CoordinationLeaseError(401, "COORDINATION_CREDENTIAL_REVOKED", "Main Agent 凭据已失效");
+  return { credentialId: principal.credentialId, sessionHash: createHash("sha256").update(authSessionToken).digest("hex"),
+    revocationVersion: credential.revocation_version, expiresAt: [principal.expiresAt, credential.expires_at].sort()[0] };
+}
+
+function bindingValid(store: Store, row: CoordinationLeaseRow): boolean {
+  if (!row.claim_credential_id || !row.claim_auth_session_hash || row.claim_revocation_version < 0) return false;
+  const session = store.db.prepare("SELECT * FROM agent_auth_sessions WHERE session_token_hash=? AND credential_id=?")
+    .get(row.claim_auth_session_hash, row.claim_credential_id) as Record<string, string> | undefined;
+  const credential = store.db.prepare("SELECT * FROM agent_credentials WHERE credential_id=?")
+    .get(row.claim_credential_id) as Record<string, string | number> | undefined;
+  const timestamp = now();
+  if (!session || !credential || session.revoked_at || session.expires_at <= timestamp || credential.status !== "active"
+    || String(credential.expires_at) <= timestamp || credential.revocation_version !== row.claim_revocation_version
+    || session.agent_id !== row.main_agent_id || session.worker_id !== row.worker_id
+    || credential.agent_id !== row.main_agent_id || credential.worker_id !== row.worker_id) return false;
+  try {
+    return (JSON.parse(session.allowed_roles_json) as string[]).includes("approver")
+      && (JSON.parse(session.allowed_projects_json) as string[]).includes(row.project_id)
+      && (JSON.parse(String(credential.allowed_roles_json)) as string[]).includes("approver")
+      && (JSON.parse(String(credential.allowed_projects_json)) as string[]).includes(row.project_id);
+  } catch { return false; }
+}
+
+function invalidateParent(store: Store, row: CoordinationLeaseRow, reason: string): void {
+  reclaimChildren(store, row.id, reason);
+  store.db.prepare("UPDATE agent_coordination_leases SET status='released', updated_at=? WHERE id=? AND status IN ('active','paused')")
+    .run(now(), row.id);
+  setCoordinationRunnerStatus(store, row.project_id, row.main_agent_id, row.worker_id, "offline");
+}
+
+/** Called inside the credential revocation transaction; no parent can outlive it. */
+export function invalidateCoordinationByCredential(store: Store, credentialId: string): void {
+  if (!store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_coordination_leases'").get()) return;
+  const rows = store.db.prepare("SELECT * FROM agent_coordination_leases WHERE claim_credential_id=? AND status IN ('active','paused')")
+    .all(credentialId) as CoordinationLeaseRow[];
+  for (const row of rows) invalidateParent(store, row, "coordination_credential_revoked");
 }
 
 function expireCoordinationLeases(store: Store, projectId?: string): number {
   ensureCoordinationLeaseSchema(store);
+  return store.db.transaction(() => expireCoordinationLeasesInTransaction(store, projectId)).immediate();
+}
+
+function expireCoordinationLeasesInTransaction(store: Store, projectId?: string): number {
   const timestamp = now();
   const staleAt = new Date(Date.now() - AGENT_TASK_HEARTBEAT_SECONDS * 2_000).toISOString();
   const rows = store.db.prepare(`SELECT * FROM agent_coordination_leases
@@ -280,7 +353,13 @@ function expireCoordinationLeases(store: Store, projectId?: string): number {
     setCoordinationRunnerStatus(store, row.project_id, row.main_agent_id, row.worker_id, "offline");
     reclaimChildren(store, row.id, "coordination_lease_expired");
   }
-  return rows.length;
+  const revoked = store.db.prepare(`SELECT * FROM agent_coordination_leases WHERE status IN ('active','paused')
+    ${projectId ? "AND project_id=?" : ""}`).all(...(projectId ? [projectId] : [])) as CoordinationLeaseRow[];
+  for (const row of revoked) {
+    if (bindingValid(store, row)) continue;
+    invalidateParent(store, row, "coordination_credential_lost");
+  }
+  return rows.length + revoked.filter((row) => !bindingValid(store, row)).length;
 }
 
 function activeParent(store: Store, projectId: string, id: string, token: string, mainAgentId: string): CoordinationLeaseRow {
@@ -292,6 +371,10 @@ function activeParent(store: Store, projectId: string, id: string, token: string
   }
   if (row.main_agent_id !== mainAgentId) {
     throw new CoordinationLeaseError(409, "MAIN_AGENT_MISMATCH", "父协调租约不属于当前 Main Agent");
+  }
+  if (!bindingValid(store, row)) {
+    store.db.transaction(() => invalidateParent(store, row, "coordination_credential_lost")).immediate();
+    throw new CoordinationLeaseError(409, "COORDINATION_LEASE_LOST", "父协调租约认证绑定已失效");
   }
   return row;
 }
@@ -320,17 +403,22 @@ export interface ClaimCoordinationLeaseInput {
   taskRevision?: string;
   mainAgentId: string;
   workerId: string;
+  authSessionToken: string;
   leaseSeconds?: number;
   idempotencyKey: string;
 }
 
 export function claimCoordinationLease(store: Store, input: ClaimCoordinationLeaseInput): AgentCoordinationLease {
   ensureCoordinationLeaseSchema(store);
+  if (!input.authSessionToken) throw new CoordinationLeaseError(401, "AUTH_REQUIRED", "Main Agent 认证会话必填");
   const project = store.getProject(input.projectId);
   if (!project) throw new CoordinationLeaseError(404, "PROJECT_NOT_FOUND", "项目不存在");
   if (!input.mainAgentId.trim() || !input.workerId.trim() || !input.idempotencyKey.trim()) {
     throw new CoordinationLeaseError(400, "COORDINATION_IDENTITY_REQUIRED", "Main Agent、workerId 和幂等键不能为空");
   }
+  // Permission is checked before target lookup so a cross-project caller
+  // cannot probe plan or task existence through the error contract.
+  credentialBinding(store, input.authSessionToken, input);
   const targetPlanId = input.planId?.trim() || "";
   const targetTaskKey = input.taskKey?.trim() || "";
   const targetTaskRevision = input.taskRevision?.trim() || "";
@@ -348,6 +436,7 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
   }
   expireCoordinationLeases(store, input.projectId);
   return store.db.transaction(() => {
+    const binding = credentialBinding(store, input.authSessionToken, input);
     const hash = requestHash(input);
     const cached = store.db.prepare("SELECT request_hash, response_json FROM agent_coordination_idempotency WHERE operation='claim' AND idempotency_key=?")
       .get(input.idempotencyKey) as { request_hash: string; response_json: string } | undefined;
@@ -359,6 +448,10 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
       if (!current || !["active", "paused"].includes(current.status) || current.lease_expires_at <= now()) {
         throw new CoordinationLeaseError(409, "COORDINATION_LEASE_LOST", "原父协调租约已结束或失效；不能重放为可执行授权");
       }
+      if (!bindingValid(store, current) || current.claim_credential_id !== binding.credentialId
+        || current.claim_auth_session_hash !== binding.sessionHash || current.claim_revocation_version !== binding.revocationVersion) {
+        throw new CoordinationLeaseError(409, "COORDINATION_LEASE_LOST", "原父协调租约认证绑定已失效或会话已变化");
+      }
       if (current.target_plan_id !== targetPlanId || current.target_task_key !== targetTaskKey || current.target_task_revision !== targetTaskRevision) {
         throw new CoordinationLeaseError(409, "COORDINATION_TARGET_MISMATCH", "父协调租约目标已改变");
       }
@@ -368,6 +461,9 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
     const existing = store.db.prepare("SELECT * FROM agent_coordination_leases WHERE project_id=? AND status IN ('active','paused')")
       .get(input.projectId) as CoordinationLeaseRow | undefined;
     if (existing) {
+      if (!bindingValid(store, existing) || existing.claim_credential_id !== binding.credentialId
+        || existing.claim_auth_session_hash !== binding.sessionHash || existing.claim_revocation_version !== binding.revocationVersion)
+        throw new CoordinationLeaseError(409, "COORDINATION_LEASE_BUSY", "项目已有其他认证会话的父协调租约");
       if (existing.main_agent_id === input.mainAgentId && existing.worker_id === input.workerId) {
         if (existing.target_plan_id || existing.target_task_key) {
           if (existing.target_plan_id !== targetPlanId || existing.target_task_key !== targetTaskKey || existing.target_task_revision !== targetTaskRevision) {
@@ -408,11 +504,12 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
     const timestamp = now();
     const row = {
       id: randomUUID(), projectId: input.projectId, targetPlanId, targetTaskKey, targetTaskRevision, mainAgentId: input.mainAgentId.trim(), workerId: input.workerId.trim(),
-      leaseToken: randomUUID(), leaseExpiresAt: expires(input.leaseSeconds), stage: planInitialStage, timestamp,
+      leaseToken: randomUUID(), leaseExpiresAt: [expires(input.leaseSeconds), binding.expiresAt].sort()[0], stage: planInitialStage, timestamp,
+      claimCredentialId: binding.credentialId, claimAuthSessionHash: binding.sessionHash, claimRevocationVersion: binding.revocationVersion,
     };
     store.db.prepare(`INSERT INTO agent_coordination_leases
-      (id, project_id, target_plan_id, target_task_key, target_task_revision, main_agent_id, worker_id, status, stage, lease_token, lease_expires_at, heartbeat_at, dispatch_revision, created_at, updated_at)
-      VALUES (@id,@projectId,@targetPlanId,@targetTaskKey,@targetTaskRevision,@mainAgentId,@workerId,'active',@stage,@leaseToken,@leaseExpiresAt,@timestamp,0,@timestamp,@timestamp)`).run(row);
+      (id, project_id, target_plan_id, target_task_key, target_task_revision, main_agent_id, worker_id, status, stage, lease_token, lease_expires_at, heartbeat_at, dispatch_revision, claim_credential_id, claim_auth_session_hash, claim_revocation_version, created_at, updated_at)
+      VALUES (@id,@projectId,@targetPlanId,@targetTaskKey,@targetTaskRevision,@mainAgentId,@workerId,'active',@stage,@leaseToken,@leaseExpiresAt,@timestamp,0,@claimCredentialId,@claimAuthSessionHash,@claimRevocationVersion,@timestamp,@timestamp)`).run(row);
     const created = store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=?").get(row.id) as CoordinationLeaseRow;
     upsertCoordinationRunner(store, input.projectId, row.mainAgentId, row.workerId, row.id, "online");
     store.recordAudit({ projectId: input.projectId, entityType: "agentCoordinationLease", entityId: row.id, action: "claim", before: null,
@@ -428,8 +525,10 @@ export function heartbeatCoordinationLease(store: Store, input: { projectId: str
   ensureCoordinationLeaseSchema(store);
   const row = activeParent(store, input.projectId, input.coordinationLeaseId, input.leaseToken, input.mainAgentId);
   const timestamp = now();
+  const session = store.db.prepare("SELECT expires_at FROM agent_auth_sessions WHERE session_token_hash=?").get(row.claim_auth_session_hash) as { expires_at: string };
+  const credential = store.db.prepare("SELECT expires_at FROM agent_credentials WHERE credential_id=?").get(row.claim_credential_id) as { expires_at: string };
   store.db.prepare("UPDATE agent_coordination_leases SET lease_expires_at=?, heartbeat_at=?, updated_at=? WHERE id=?")
-    .run(expires(input.leaseSeconds), timestamp, timestamp, row.id);
+    .run([expires(input.leaseSeconds), session.expires_at, credential.expires_at].sort()[0], timestamp, timestamp, row.id);
   upsertCoordinationRunner(store, row.project_id, row.main_agent_id, row.worker_id, row.id, "online");
   return mapLease(store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=?").get(row.id) as CoordinationLeaseRow);
 }
@@ -494,6 +593,10 @@ export interface DispatchChildTaskInput {
 
 export function dispatchChildTask(store: Store, input: DispatchChildTaskInput): AgentChildTaskDispatch {
   ensureCoordinationLeaseSchema(store);
+  return store.db.transaction(() => dispatchChildTaskInTransaction(store, input)).immediate();
+}
+
+function dispatchChildTaskInTransaction(store: Store, input: DispatchChildTaskInput): AgentChildTaskDispatch {
   const parent = activeParent(store, input.projectId, input.coordinationLeaseId, input.leaseToken, input.mainAgentId);
   if (!parent.target_plan_id && !parent.target_task_key) throw new CoordinationLeaseError(409, "COORDINATION_TARGET_INVALID", "父协调租约未绑定有效目标，请重新领取");
   if (parent.status !== "active") throw new CoordinationLeaseError(409, "COORDINATION_PAUSED", "父协调租约已暂停");
@@ -569,6 +672,10 @@ export function reclaimChildTask(store: Store, input: { projectId: string; coord
 
 export function reassignChildTask(store: Store, input: DispatchChildTaskInput & { dispatchId: string; reason?: string }): AgentChildTaskDispatch {
   ensureCoordinationLeaseSchema(store);
+  return store.db.transaction(() => reassignChildTaskInTransaction(store, input)).immediate();
+}
+
+function reassignChildTaskInTransaction(store: Store, input: DispatchChildTaskInput & { dispatchId: string; reason?: string }): AgentChildTaskDispatch {
   const parent = activeParent(store, input.projectId, input.coordinationLeaseId, input.leaseToken, input.mainAgentId);
   const existing = store.db.prepare("SELECT * FROM agent_child_task_dispatches WHERE dispatch_id=? AND coordination_lease_id=?")
     .get(input.dispatchId, parent.id) as DispatchRow | undefined;
@@ -582,10 +689,12 @@ export function reassignChildTask(store: Store, input: DispatchChildTaskInput & 
 
 export function pauseCoordinationLease(store: Store, input: { projectId: string; coordinationLeaseId: string; leaseToken: string; mainAgentId: string }): AgentCoordinationLease {
   ensureCoordinationLeaseSchema(store);
+  return store.db.transaction(() => {
   const parent = activeParent(store, input.projectId, input.coordinationLeaseId, input.leaseToken, input.mainAgentId);
   reclaimChildren(store, parent.id, "coordination_lease_paused");
   store.db.prepare("UPDATE agent_coordination_leases SET status='paused', updated_at=? WHERE id=?").run(now(), parent.id);
   return mapLease(store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=?").get(parent.id) as CoordinationLeaseRow);
+  }).immediate();
 }
 
 export function resumeCoordinationLease(store: Store, input: { projectId: string; coordinationLeaseId: string; leaseToken: string; mainAgentId: string }): AgentCoordinationLease {
@@ -598,6 +707,7 @@ export function resumeCoordinationLease(store: Store, input: { projectId: string
 
 export function releaseCoordinationLease(store: Store, input: { projectId: string; coordinationLeaseId: string; leaseToken: string; mainAgentId: string; reason?: string }): AgentCoordinationLease {
   ensureCoordinationLeaseSchema(store);
+  return store.db.transaction(() => {
   const alreadyReleased = store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=? AND project_id=? AND lease_token=? AND main_agent_id=? AND target_task_key<>'' AND status='released'")
     .get(input.coordinationLeaseId, input.projectId, input.leaseToken, input.mainAgentId) as CoordinationLeaseRow | undefined;
   if (alreadyReleased) return mapLease(alreadyReleased);
@@ -606,6 +716,7 @@ export function releaseCoordinationLease(store: Store, input: { projectId: strin
   store.db.prepare("UPDATE agent_coordination_leases SET status='released', updated_at=? WHERE id=?").run(now(), parent.id);
   setCoordinationRunnerStatus(store, parent.project_id, parent.main_agent_id, parent.worker_id, "offline");
   return mapLease(store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=?").get(parent.id) as CoordinationLeaseRow);
+  }).immediate();
 }
 
 export function advanceCoordinationStage(store: Store, input: { projectId: string; coordinationLeaseId: string; leaseToken: string; mainAgentId: string; stage?: AgentCoordinationStage }): AgentCoordinationLease {
@@ -698,10 +809,16 @@ export function markChildDispatchFromLease(store: Store, lease: AgentTaskLease, 
 
 export function invalidateChildLeaseIfParentLost(store: Store, workOrderId: string): boolean {
   if (!store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_child_task_dispatches'").get()) return false;
-  const row = store.db.prepare(`SELECT c.status, c.lease_expires_at, d.dispatch_id FROM agent_task_leases l
+  ensureCoordinationLeaseSchema(store);
+  const row = store.db.prepare(`SELECT c.*, d.dispatch_id FROM agent_task_leases l
     LEFT JOIN agent_child_task_dispatches d ON d.child_work_order_id=l.id
-    LEFT JOIN agent_coordination_leases c ON c.id=d.coordination_lease_id WHERE l.id=?`).get(workOrderId) as { status?: string; lease_expires_at?: string; dispatch_id?: string } | undefined;
-  if (!row?.dispatch_id || row.status === "active" && (row.lease_expires_at || "") > now()) return false;
+    LEFT JOIN agent_coordination_leases c ON c.id=d.coordination_lease_id WHERE l.id=?`).get(workOrderId) as (CoordinationLeaseRow & { dispatch_id?: string }) | undefined;
+  if (!row?.dispatch_id) return false;
+  if (row.status === "active" && row.lease_expires_at > now() && bindingValid(store, row)) return false;
+  if (["active", "paused"].includes(row.status)) {
+    store.db.transaction(() => invalidateParent(store, row, "coordination_lease_lost")).immediate();
+    return true;
+  }
   store.db.prepare("UPDATE agent_task_leases SET status='released', last_error='coordination_lease_lost', completed_at=?, updated_at=? WHERE id=? AND status IN ('claimed','running')")
     .run(now(), now(), workOrderId);
   store.db.prepare("UPDATE agent_child_task_dispatches SET status='reclaimed', updated_at=? WHERE dispatch_id=? AND status IN ('dispatched','claimed','running')")

@@ -5,10 +5,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Store } from "./db.js";
 import { claimAgentTask, completeAgentTask, heartbeatAgentTask, listClaimableAgentTasks } from "./agentTaskLeases.js";
 import { buildAgentOrchestration } from "./orchestration.js";
+import { beginAgentAuth, completeAgentAuth, expectedChallengeResponse, registerAgentCredential, revokeAgentCredential } from "./agentSecurity.js";
 import {
   advanceCoordinationStage,
   assertCoordinationLeaseForPlan,
-  claimCoordinationLease,
+  claimCoordinationLease as claimCoordinationLeaseWithAuth,
   claimDispatchedChildTask,
   dispatchChildTask,
   listCoordinationLeases,
@@ -17,7 +18,34 @@ import {
   reassignChildTask,
   releaseCoordinationLease,
   resumeCoordinationLease,
+  ensureCoordinationLeaseSchema,
 } from "./coordinationLeases.js";
+import type { ClaimCoordinationLeaseInput } from "./coordinationLeases.js";
+
+const sessions = new WeakMap<Store, Map<string, string>>();
+function claimCoordinationLease(store: Store, input: Omit<ClaimCoordinationLeaseInput, "authSessionToken">) {
+  let byIdentity = sessions.get(store);
+  if (!byIdentity) { byIdentity = new Map(); sessions.set(store, byIdentity); }
+  const identity = `${input.projectId}:${input.mainAgentId}:${input.workerId}`;
+  let token = byIdentity.get(identity);
+  if (!token) {
+    const credential = registerAgentCredential(store, {
+      principalId: `test/${identity}`, agentId: input.mainAgentId, workerId: input.workerId,
+      allowedRoles: ["approver"], allowedProjects: [input.projectId],
+    });
+    const connectionId = `test/${identity}`;
+    const challenge = beginAgentAuth(store, credential.credentialId, connectionId);
+    const timestamp = new Date().toISOString();
+    const protocolVersion = "2025-06-18";
+    token = completeAgentAuth(store, {
+      challengeId: challenge.challengeId, challenge: challenge.challenge, connectionId, timestamp, protocolVersion,
+      response: expectedChallengeResponse(credential.credentialSecret, challenge.challenge, connectionId,
+        credential.credentialId, timestamp, protocolVersion),
+    }).authSessionToken;
+    byIdentity.set(identity, token);
+  }
+  return claimCoordinationLeaseWithAuth(store, { ...input, authSessionToken: token });
+}
 
 const fixtures: Array<{ store: Store; dir: string }> = [];
 afterEach(() => {
@@ -60,6 +88,90 @@ function noPlanFixture() {
 }
 
 describe("Main Agent coordination lease", () => {
+  it("requires an authenticated claim and atomically revokes active children with the credential", () => {
+    const { store, projectId, task } = noPlanFixture();
+    expect(() => claimCoordinationLeaseWithAuth(store, { projectId, taskKey: task.taskKey,
+      taskRevision: task.taskRevision, mainAgentId: "Main Agent", workerId: "revoked-parent",
+      idempotencyKey: "no-auth", authSessionToken: "" })).toThrow(expect.objectContaining({ code: "AUTH_REQUIRED" }));
+    const parent = claimCoordinationLease(store, { projectId, taskKey: task.taskKey,
+      taskRevision: task.taskRevision, mainAgentId: "Main Agent", workerId: "revoked-parent",
+      idempotencyKey: "revoked-parent-claim" });
+    const dispatch = dispatchChildTask(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent", taskId: task.id,
+      taskKey: task.taskKey, role: "designer", workerId: "revoked-child" });
+    const child = JSON.parse(claimDispatchedChildTask(store, { projectId, dispatchId: dispatch.dispatchId,
+      agentId: dispatch.agentId, workerId: dispatch.workerId, idempotencyKey: "revoked-child-claim" }));
+    const credential = store.db.prepare("SELECT claim_credential_id AS id FROM agent_coordination_leases WHERE id=?")
+      .get(parent.id) as { id: string };
+    revokeAgentCredential(store, credential.id);
+    expect(listCoordinationLeases(store, projectId).find((item) => item.id === parent.id)?.status).toBe("released");
+    expect(listChildTaskDispatches(store, projectId).find((item) => item.dispatchId === dispatch.dispatchId)?.status).toBe("reclaimed");
+    expect(store.db.prepare("SELECT status FROM agent_task_leases WHERE id=?").get(child.lease.workOrderId))
+      .toEqual({ status: "released" });
+    expect(store.db.prepare("SELECT count(*) AS count FROM agent_task_resource_locks WHERE lease_token=?")
+      .get(child.lease.leaseToken)).toEqual({ count: 0 });
+    expect(() => dispatchChildTask(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent", taskId: task.id,
+      taskKey: task.taskKey, role: "designer" })).toThrow(expect.objectContaining({ code: "COORDINATION_LEASE_LOST" }));
+  });
+
+  it("fail-closes an unbound historical parent exactly once", () => {
+    const { store, projectId, task } = noPlanFixture();
+    const parent = claimCoordinationLease(store, { projectId, taskKey: task.taskKey,
+      taskRevision: task.taskRevision, mainAgentId: "Main Agent", workerId: "legacy-parent",
+      idempotencyKey: "legacy-parent-claim" });
+    store.db.prepare("UPDATE agent_coordination_leases SET claim_credential_id='', claim_auth_session_hash='', claim_revocation_version=-1 WHERE id=?")
+      .run(parent.id);
+    ensureCoordinationLeaseSchema(store);
+    ensureCoordinationLeaseSchema(store);
+    expect(listCoordinationLeases(store, projectId).find((item) => item.id === parent.id)?.status).toBe("released");
+    const events = store.db.prepare("SELECT count(*) AS count FROM security_audit_events WHERE action='legacy_unbound_security_migration'")
+      .get() as { count: number };
+    expect(events.count).toBe(1);
+    expect(() => claimCoordinationLease(store, { projectId, taskKey: task.taskKey,
+      taskRevision: task.taskRevision, mainAgentId: "Main Agent", workerId: "legacy-parent",
+      idempotencyKey: "legacy-parent-claim" })).toThrow(expect.objectContaining({ code: "COORDINATION_LEASE_LOST" }));
+  });
+
+  it("rolls back the legacy cleanup if its audit write fails", () => {
+    const { store, projectId, task } = noPlanFixture();
+    const parent = claimCoordinationLease(store, { projectId, taskKey: task.taskKey,
+      taskRevision: task.taskRevision, mainAgentId: "Main Agent", workerId: "migration-rollback-parent",
+      idempotencyKey: "migration-rollback-claim" });
+    const dispatch = dispatchChildTask(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent", taskId: task.id,
+      taskKey: task.taskKey, role: "designer" });
+    store.db.prepare("UPDATE agent_coordination_leases SET claim_credential_id='' WHERE id=?").run(parent.id);
+    store.db.exec(`CREATE TRIGGER fail_coordination_migration BEFORE INSERT ON security_audit_events
+      WHEN NEW.action='legacy_unbound_security_migration' BEGIN SELECT RAISE(ABORT,'migration audit failure'); END`);
+    expect(() => ensureCoordinationLeaseSchema(store)).toThrow(/migration audit failure/);
+    expect(store.db.prepare("SELECT status FROM agent_coordination_leases WHERE id=?").get(parent.id)).toEqual({ status: "active" });
+    expect(store.db.prepare("SELECT status FROM agent_child_task_dispatches WHERE dispatch_id=?").get(dispatch.dispatchId))
+      .toEqual({ status: "dispatched" });
+    store.db.exec("DROP TRIGGER fail_coordination_migration");
+    ensureCoordinationLeaseSchema(store);
+    expect(store.db.prepare("SELECT status FROM agent_coordination_leases WHERE id=?").get(parent.id)).toEqual({ status: "released" });
+    expect(store.db.prepare("SELECT status FROM agent_child_task_dispatches WHERE dispatch_id=?").get(dispatch.dispatchId))
+      .toEqual({ status: "reclaimed" });
+  });
+
+  it("bounds the parent TTL by its auth session and refuses a later dispatch after session expiry", () => {
+    const { store, projectId, task } = noPlanFixture();
+    const parent = claimCoordinationLease(store, { projectId, taskKey: task.taskKey,
+      taskRevision: task.taskRevision, mainAgentId: "Main Agent", workerId: "expiring-parent",
+      idempotencyKey: "expiring-parent-claim", leaseSeconds: 1800 });
+    const row = store.db.prepare("SELECT claim_auth_session_hash AS hash FROM agent_coordination_leases WHERE id=?")
+      .get(parent.id) as { hash: string };
+    const session = store.db.prepare("SELECT expires_at AS expiresAt FROM agent_auth_sessions WHERE session_token_hash=?")
+      .get(row.hash) as { expiresAt: string };
+    expect(Date.parse(parent.leaseExpiresAt)).toBeLessThanOrEqual(Date.parse(session.expiresAt));
+    store.db.prepare("UPDATE agent_auth_sessions SET expires_at='2000-01-01T00:00:00.000Z' WHERE session_token_hash=?")
+      .run(row.hash);
+    expect(() => dispatchChildTask(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent", taskId: task.id,
+      taskKey: task.taskKey, role: "designer" })).toThrow(expect.objectContaining({ code: "COORDINATION_LEASE_LOST" }));
+    expect(listChildTaskDispatches(store, projectId)).toEqual([]);
+  });
   it("binds only one exact claimable no-plan Designer task and exposes its target", () => {
     const { store, projectId, task } = noPlanFixture();
     const input = { projectId, taskKey: task.taskKey, taskRevision: task.taskRevision,

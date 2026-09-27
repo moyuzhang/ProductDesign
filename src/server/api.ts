@@ -152,6 +152,7 @@ import {
   revokeAgentCredential,
 } from "./agentSecurity.js";
 import { classifyRestRequest } from "./controlledWriteRegistry.js";
+import { safeCoordinationHandoff } from "./coordinationHandoff.js";
 import {
   checkDatabaseConnection,
   databaseConnectionLabel,
@@ -991,6 +992,24 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     return wantsPage(query) ? paginate(tasks, query) : tasks;
   });
 
+  app.get("/api/projects/:id/coordination-handoff", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+      const query = parse(z.object({
+        planId: z.string().trim().min(1).optional(), taskId: z.string().trim().min(1).optional(),
+        expectedProposalRevision: z.coerce.number().int().nonnegative().optional(),
+        expectedTaskKey: z.string().trim().min(1).optional(), expectedTaskRevision: z.string().trim().min(1).optional(),
+      }).strict(), request.query);
+      if (Boolean(query.planId) === Boolean(query.taskId))
+        throw new CoordinationLeaseError(400, "HANDOFF_TARGET_INVALID", "只能选择一个计划或设计任务");
+      const serialized = query.planId
+        ? safeCoordinationHandoff(store, id, { planId: query.planId, expectedProposalRevision: query.expectedProposalRevision })
+        : safeCoordinationHandoff(store, id, { taskId: query.taskId!, expectedTaskKey: query.expectedTaskKey,
+          expectedTaskRevision: query.expectedTaskRevision });
+      return { serialized };
+    } catch (cause) { return agentTaskPackageError(reply, cause); }
+  });
+
   app.get("/api/projects/:id/agent-task-leases", async (request, reply) => {
     const { id } = request.params as { id: string };
     if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在" });
@@ -1097,9 +1116,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在", code: "PROJECT_NOT_FOUND" });
     try {
       const body = parse(coordinationIdentity.extend({ authSessionToken: z.string().min(32).max(300).optional(), planId: z.string().trim().min(1).max(300).optional(), taskKey: z.string().trim().min(1).max(2000).optional(), taskRevision: z.string().trim().min(1).max(500).optional(), leaseSeconds: z.number().int().min(15).max(1800).default(1800), idempotencyKey: z.string().trim().min(1).max(300) }), request.body);
-      assertCoordinationMainAgent(store, { ...body, projectId: id });
-      const { authSessionToken: _authSessionToken, ...claim } = body;
-      return claimCoordinationLease(store, { ...claim, projectId: id });
+      return claimCoordinationLease(store, { ...body, authSessionToken: body.authSessionToken || "", projectId: id });
     } catch (cause) { return agentTaskPackageError(reply, cause); }
   });
   app.post("/api/projects/:id/coordination-leases/:coordinationLeaseId/:operation", async (request, reply) => {

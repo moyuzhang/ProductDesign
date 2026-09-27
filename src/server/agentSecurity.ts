@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Store } from "./db.js";
+import { invalidateCoordinationByCredential } from "./coordinationLeases.js";
 
 export const AGENT_POLICY_VERSION = "2.3.0";
 export const AGENT_POLICY_INSTRUCTIONS = `ProductDesign Agent policy ${AGENT_POLICY_VERSION}
@@ -188,6 +189,8 @@ export function revokeAgentCredential(store: Store, credentialId: string): void 
       revocation_version=revocation_version+1 WHERE credential_id=? AND status='active'`).run(now, credentialId);
     if (changed.changes !== 1) throw new AgentSecurityError(404, "CREDENTIAL_REJECTED", "Credential is absent or already revoked");
     store.db.prepare("UPDATE agent_tokens SET revoked_at=? WHERE credential_id=? AND revoked_at=''").run(now, credentialId);
+    store.db.prepare("UPDATE agent_auth_sessions SET revoked_at=? WHERE credential_id=? AND revoked_at=''").run(now, credentialId);
+    invalidateCoordinationByCredential(store, credentialId);
   }).immediate();
   audit(store, "credential.revoke", "success", { credentialId, actorType: "human" });
 }

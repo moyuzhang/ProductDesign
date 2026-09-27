@@ -46,6 +46,8 @@ export function AgentOrchestrationView(): ReactElement {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [handoff, setHandoff] = useState<{ serialized: string; target: { planId?: string; taskId?: string;
+    expectedProposalRevision?: number; expectedTaskKey?: string; expectedTaskRevision?: string } } | null>(null);
   const [leases, setLeases] = useState<LeaseRecord[]>([]);
   const [releaseTarget, setReleaseTarget] = useState<LeaseRecord | null>(null);
   const [releaseReason, setReleaseReason] = useState("");
@@ -73,6 +75,7 @@ export function AgentOrchestrationView(): ReactElement {
 
   useEffect(() => {
     setData(null);
+    setHandoff(null);
     setOffsets(createOrchestrationQueueOffsets());
     setLeaseHistoryOffset(0);
     setRuntimeOffset(0);
@@ -125,6 +128,35 @@ export function AgentOrchestrationView(): ReactElement {
     await navigator.clipboard.writeText(data.bootstrapPrompt);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1500);
+  };
+
+  const previewHandoff = async (item: { id: string; planItemId: string | null }) => {
+    if (!data) return;
+    setError("");
+    try {
+      const target = item.planItemId ? { planId: item.planItemId } : { taskId: item.id };
+      const { serialized } = await api.getCoordinationHandoff(data.project.id, target);
+      const parsed = JSON.parse(serialized) as { binding: { type: "plan" | "task"; proposalRevision?: number;
+        taskKey?: string; taskRevision?: string } };
+      setHandoff({ serialized, target: parsed.binding.type === "plan"
+        ? { ...target, expectedProposalRevision: parsed.binding.proposalRevision }
+        : { ...target, expectedTaskKey: parsed.binding.taskKey, expectedTaskRevision: parsed.binding.taskRevision } });
+    } catch (cause) { setHandoff(null); setError(cause instanceof Error ? cause.message : String(cause)); }
+  };
+
+  const exportHandoff = async (mode: "copy" | "download") => {
+    if (!handoff || !data) return;
+    try {
+      const fresh = await api.getCoordinationHandoff(data.project.id, handoff.target);
+      if (fresh.serialized !== handoff.serialized) throw new Error("交接目标已变化，请重新预览");
+      if (mode === "copy") await navigator.clipboard.writeText(handoff.serialized);
+      else {
+        const href = URL.createObjectURL(new Blob([handoff.serialized], { type: "application/json;charset=utf-8" }));
+        const link = document.createElement("a");
+        link.href = href; link.download = "coordination-handoff.json"; link.click();
+        URL.revokeObjectURL(href);
+      }
+    } catch (cause) { setHandoff(null); setError(cause instanceof Error ? cause.message : String(cause)); }
   };
 
   const confirmManualRelease = async () => {
@@ -210,6 +242,14 @@ export function AgentOrchestrationView(): ReactElement {
       </header>
 
       {error && <ErrorBanner message={error} />}
+
+      {handoff && <section className="orchestration-section" aria-label="只读协调交接预览">
+        <div className="orchestration-section-title"><div><span>HANDOFF</span><h2>只读协调交接</h2></div>
+          <p>此内容不含租约或凭据；实际领取和派发仅由已认证 Main Agent 完成。</p></div>
+        <pre data-testid="coordination-handoff-preview">{handoff.serialized}</pre>
+        <button className="btn" onClick={() => void exportHandoff("copy")}>复制交接</button>
+        <button className="btn" onClick={() => void exportHandoff("download")}>下载交接</button>
+      </section>}
 
       <section className={`orchestration-workdir ${data.workingDirectory.ready ? "is-ready" : "is-blocked"}`} data-testid="agent-working-directory">
         <FolderOpen />
@@ -311,6 +351,8 @@ export function AgentOrchestrationView(): ReactElement {
                       {executableQueue && item.attempt ? <small>已尝试 {item.attempt} 次</small> : null}
                       <ExternalLink />
                     </button>
+                    {executableQueue === "design" && item.available !== false || item.planItemId && executableQueue
+                      ? <button className="btn btn-ghost btn-sm" onClick={() => void previewHandoff(item)}>预览只读交接</button> : null}
                   </div>
                 ))}
               </div>
