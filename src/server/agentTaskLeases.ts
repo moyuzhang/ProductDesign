@@ -375,6 +375,20 @@ function revisionForTask(store: Store, task: AgentOrchestrationTask): string {
     });
     return `${task.actionCode}:${[...new Set(currentRevisionIds)].sort().join(",") || "initial"}`;
   }
+  if (task.queue === "design" && !task.planItemId && task.nodeId) {
+    const node = store.getDiagram(task.diagramId || "")?.nodes.find((item) => item.id === task.nodeId);
+    const documentState = store.listDocumentReferences({ projectId: task.projectId,
+      targetType: "diagramNode", targetId: task.nodeId }).map((reference) => {
+      const document = store.getDesignDoc(reference.documentId);
+      return [reference.documentId, document?.currentRevisionId || "", document?.status || ""];
+    }).sort((left, right) => String(left[0]).localeCompare(String(right[0])));
+    const digest = createHash("sha256").update(JSON.stringify([
+      task.actionCode, task.diagramId, task.nodeId, node?.description?.trim() || "",
+      node?.owner?.trim() || "", node?.acceptanceCriteria?.trim() || "",
+      node?.requirementStatus || "", node?.designStatus || "", documentState,
+    ])).digest("hex");
+    return `${task.actionCode}:${digest}`;
+  }
   return "0";
 }
 
@@ -2410,6 +2424,25 @@ function controlSingleLease(
       const dispatchStatus = operation === "start" ? "running" : operation === "complete" ? "completed" : operation === "release" || operation === "fail" ? "reclaimed" : "claimed";
       store.db.prepare("UPDATE agent_child_task_dispatches SET status=?, updated_at=? WHERE dispatch_id=? AND status IN ('dispatched','claimed','running')")
         .run(dispatchStatus, now, row.coordination_dispatch_id);
+      if (operation === "complete") {
+        // A no-plan parent coordinates exactly this one design task. Completing
+        // its child is the terminal event; it must not occupy the project's
+        // unique parent slot while Main Agent is waiting to dispatch next work.
+        const parent = store.db.prepare(`UPDATE agent_coordination_leases SET status='released', updated_at=?
+          WHERE id=(SELECT coordination_lease_id FROM agent_child_task_dispatches WHERE dispatch_id=?)
+            AND project_id=? AND target_plan_id='' AND target_task_key=? AND target_task_revision=?
+            AND stage='design' AND status='active' RETURNING id, main_agent_id, worker_id`)
+          .get(now, row.coordination_dispatch_id, row.project_id, row.task_key, row.task_revision) as
+          { id: string; main_agent_id: string; worker_id: string } | undefined;
+        if (parent) {
+          store.db.prepare(`UPDATE agent_runner_registrations SET status='offline', last_seen_at=?, updated_at=?
+            WHERE project_id=? AND lower(agent_id)=lower(?) AND lower(worker_id)=lower(?)`)
+            .run(now, now, row.project_id, parent.main_agent_id, parent.worker_id);
+          store.recordAudit({ projectId: row.project_id, entityType: "agentCoordinationLease", entityId: parent.id,
+            action: "release", before: { status: "active" }, after: { status: "released", reason: "task_child_completed", taskKey: row.task_key },
+            actor: "system", source: "system" });
+        }
+      }
     }
     cacheResponse(store, operation, input.idempotencyKey, hash, lease, now);
     audit(store, lease, operation, context, { status: currentRow.status, leaseExpiresAt: currentRow.lease_expires_at });

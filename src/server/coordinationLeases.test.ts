@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Store } from "./db.js";
-import { claimAgentTask, heartbeatAgentTask, listClaimableAgentTasks } from "./agentTaskLeases.js";
+import { claimAgentTask, completeAgentTask, heartbeatAgentTask, listClaimableAgentTasks } from "./agentTaskLeases.js";
 import { buildAgentOrchestration } from "./orchestration.js";
 import {
   advanceCoordinationStage,
@@ -46,10 +46,141 @@ function fixture() {
     title: "协调计划", description: "", status: "未开始", priority: "P1", progress: 0, owner: "designer",
     versionTag: "", startAt: "", dueAt: "", dependencyIds: [], lifecycleStatus: "draft", roleAssignments,
   });
-  return { store, projectId: project.id, planId: plan.id };
+  return { store, projectId: project.id, planId: plan.id, diagramId: diagram.id };
+}
+
+function noPlanFixture() {
+  const context = fixture();
+  context.store.deletePlan(context.planId);
+  const task = listClaimableAgentTasks(context.store, context.projectId)
+    .find((item) => item.queue === "design" && item.nodeId === "coord-node" && !item.planItemId)!;
+  expect(task).toBeDefined();
+  expect(task.available).toBe(true);
+  return { ...context, task };
 }
 
 describe("Main Agent coordination lease", () => {
+  it("binds only one exact claimable no-plan Designer task and exposes its target", () => {
+    const { store, projectId, task } = noPlanFixture();
+    const input = { projectId, taskKey: task.taskKey, taskRevision: task.taskRevision,
+      mainAgentId: "Main Agent", workerId: "task-parent", idempotencyKey: "task-parent-claim" };
+    expect(() => claimCoordinationLease(store, { ...input, planId: "also-a-plan" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TARGET_INVALID" }));
+    expect(() => claimCoordinationLease(store, { ...input, taskRevision: undefined }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TARGET_INVALID" }));
+    expect(() => claimCoordinationLease(store, { ...input, taskKey: `${task.taskKey}-wrong` }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TASK_REVISION_MISMATCH" }));
+    expect(() => claimCoordinationLease(store, { ...input, taskRevision: "stale" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TASK_REVISION_MISMATCH" }));
+    const otherProject = store.insertProject({ code: "COORD-OTHER", name: "另一个项目", summary: "", stage: "设计", health: "正常",
+      progress: 0, riskLevel: "P1", riskSummary: "", blockerSummary: "", nextStep: "", repositoryPath: "", startAt: "", dueAt: "" });
+    expect(() => claimCoordinationLease(store, { ...input, projectId: otherProject.id }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TASK_REVISION_MISMATCH" }));
+    const parent = claimCoordinationLease(store, input);
+    expect(parent).toMatchObject({ planId: "", taskKey: task.taskKey, taskRevision: task.taskRevision, stage: "design" });
+    expect(claimCoordinationLease(store, input).id).toBe(parent.id);
+    expect(() => claimCoordinationLease(store, { ...input, taskKey: "changed-target" }))
+      .toThrow(expect.objectContaining({ code: "IDEMPOTENCY_CONFLICT" }));
+    expect(() => claimCoordinationLease(store, { ...input, workerId: "competing-parent", idempotencyKey: "competing-claim" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_LEASE_BUSY" }));
+    expect(() => claimCoordinationLease(store, { ...input, idempotencyKey: "second-key", taskRevision: "stale" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TARGET_MISMATCH" }));
+    expect(() => advanceCoordinationStage(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent", stage: "design_audit" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TASK_STAGE_FORBIDDEN" }));
+    expect(() => assertCoordinationLeaseForPlan(store, { projectId, planId: "any-plan", coordinationLeaseId: parent.id,
+      coordinationLeaseToken: parent.leaseToken, mainAgentId: "Main Agent" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_PLAN_MISMATCH" }));
+  });
+
+  it("cannot bind a plan-backed Designer task through the task target contract", () => {
+    const { store, projectId, planId } = fixture();
+    const task = listClaimableAgentTasks(store, projectId).find((item) => item.planItemId === planId && item.queue === "design")!;
+    expect(task).toBeDefined();
+    expect(() => claimCoordinationLease(store, { projectId, taskKey: task.taskKey, taskRevision: task.taskRevision,
+      mainAgentId: "Main Agent", workerId: "spoofed-task-parent", idempotencyKey: "spoofed-task-parent" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TASK_INVALID" }));
+    expect(listCoordinationLeases(store, projectId)).toHaveLength(0);
+  });
+
+  it("dispatches the exact no-plan task once and revokes its child on parent release", () => {
+    const { store, projectId, task } = noPlanFixture();
+    const parent = claimCoordinationLease(store, { projectId, taskKey: task.taskKey, taskRevision: task.taskRevision,
+      mainAgentId: "Main Agent", workerId: "task-parent", idempotencyKey: "no-plan-dispatch" });
+    const input = { projectId, coordinationLeaseId: parent.id, leaseToken: parent.leaseToken,
+      mainAgentId: "Main Agent", taskId: task.id, taskKey: task.taskKey, role: "designer" as const };
+    expect(() => dispatchChildTask(store, { ...input, taskKey: undefined }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TASK_MISMATCH" }));
+    expect(() => dispatchChildTask(store, { ...input, taskKey: "wrong" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TASK_MISMATCH" }));
+    expect(() => dispatchChildTask(store, { ...input, role: "builder" }))
+      .toThrow(expect.objectContaining({ code: "STAGE_ACTION_FORBIDDEN" }));
+    expect(() => dispatchChildTask(store, { ...input, agentId: "wrong-designer" }))
+      .toThrow(expect.objectContaining({ code: "ASSIGNEE_MISMATCH" }));
+    expect(() => dispatchChildTask(store, { ...input, poolId: "wrong-pool" }))
+      .toThrow(expect.objectContaining({ code: "WORKER_POOL_MISMATCH" }));
+    const dispatch = dispatchChildTask(store, input);
+    expect(() => dispatchChildTask(store, input))
+      .toThrow(expect.objectContaining({ code: "CHILD_TASK_ALREADY_DISPATCHED" }));
+    const child = JSON.parse(claimDispatchedChildTask(store, { projectId, dispatchId: dispatch.dispatchId,
+      agentId: dispatch.agentId, workerId: dispatch.workerId, idempotencyKey: "child-no-plan" }));
+    expect(child.task).toMatchObject({ planItemId: null, deliveryTrack: "design" });
+    releaseCoordinationLease(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent" });
+    expect(listChildTaskDispatches(store, projectId)[0].status).toBe("reclaimed");
+    expect(() => heartbeatAgentTask(store, { leaseToken: child.lease.leaseToken,
+      agentId: child.worker.agentId, idempotencyKey: "child-after-parent-release" })).toThrow();
+    expect(() => claimCoordinationLease(store, { projectId, taskKey: task.taskKey, taskRevision: task.taskRevision,
+      mainAgentId: "Main Agent", workerId: "task-parent", idempotencyKey: "no-plan-dispatch" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_LEASE_LOST" }));
+    const nextParent = claimCoordinationLease(store, { projectId, taskKey: task.taskKey, taskRevision: task.taskRevision,
+      mainAgentId: "Main Agent", workerId: "new-task-parent", idempotencyKey: "no-plan-dispatch-retry" });
+    expect(nextParent.id).not.toBe(parent.id);
+  });
+
+  it("rejects dispatch after a no-plan task revision changes without leaving a child", () => {
+    const { store, projectId, diagramId, task } = noPlanFixture();
+    const parent = claimCoordinationLease(store, { projectId, taskKey: task.taskKey, taskRevision: task.taskRevision,
+      mainAgentId: "Main Agent", workerId: "revision-parent", idempotencyKey: "revision-parent-claim" });
+    const diagram = store.getDiagram(diagramId)!;
+    store.updateDiagram(diagramId, { nodes: diagram.nodes.map((node) => node.id === "coord-node"
+      ? { ...node, description: "changed but still lacks owner" } : node) });
+    const changed = listClaimableAgentTasks(store, projectId).find((item) => item.id === task.id)!;
+    expect(changed.taskRevision).not.toBe(task.taskRevision);
+    expect(() => dispatchChildTask(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent", taskId: task.id,
+      taskKey: task.taskKey, role: "designer" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TASK_MISMATCH" }));
+    expect(listChildTaskDispatches(store, projectId)).toHaveLength(0);
+    releaseCoordinationLease(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent" });
+    expect(() => claimCoordinationLease(store, { projectId, taskKey: task.taskKey, taskRevision: task.taskRevision,
+      mainAgentId: "Main Agent", workerId: "revision-parent-new", idempotencyKey: "revision-parent-new" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_TASK_REVISION_MISMATCH" }));
+  });
+
+  it("releases a task-bound parent atomically when its exact design child completes", () => {
+    const { store, projectId, diagramId, task } = noPlanFixture();
+    expect(task.actionCode).toBe("complete_node_definition");
+    const parent = claimCoordinationLease(store, { projectId, taskKey: task.taskKey, taskRevision: task.taskRevision,
+      mainAgentId: "Main Agent", workerId: "completion-parent", idempotencyKey: "completion-parent-claim" });
+    const dispatch = dispatchChildTask(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent", taskId: task.id, taskKey: task.taskKey, role: "designer" });
+    const child = JSON.parse(claimDispatchedChildTask(store, { projectId, dispatchId: dispatch.dispatchId,
+      agentId: dispatch.agentId, workerId: dispatch.workerId, idempotencyKey: "completion-child-claim" }));
+    const diagram = store.getDiagram(diagramId)!;
+    store.updateDiagram(diagramId, { nodes: diagram.nodes.map((node) => node.id === "coord-node"
+      ? { ...node, description: "完成节点边界", owner: "designer" } : node) });
+    expect(completeAgentTask(store, { leaseToken: child.lease.leaseToken, agentId: child.worker.agentId,
+      idempotencyKey: "completion-child-complete", resultDigest: "defined" }).status).toBe("completed");
+    expect(listChildTaskDispatches(store, projectId)[0].status).toBe("completed");
+    expect(listCoordinationLeases(store, projectId).find((lease) => lease.id === parent.id)?.status).toBe("released");
+    expect(releaseCoordinationLease(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent" }).status).toBe("released");
+    expect(() => advanceCoordinationStage(store, { projectId, coordinationLeaseId: parent.id,
+      leaseToken: parent.leaseToken, mainAgentId: "Main Agent", stage: "design_audit" }))
+      .toThrow(expect.objectContaining({ code: "COORDINATION_LEASE_LOST" }));
+  });
   it("resumes implementation rework at the builder stage without skipping design rework", () => {
     const { store, projectId, planId } = fixture();
     store.updatePlan(planId, { lifecycleStatus: "rework", managerDecision: "rejected", rejectionReason: "真实验收未闭环" });

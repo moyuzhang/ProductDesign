@@ -326,7 +326,7 @@ function agentBlueprints(store: Store, includePrompts: boolean): AgentBlueprint[
       consumes: ["已通过的独立审计", "当前固定修订", "证据"],
       produces: ["可追溯的计划批准、最终验收或返工决定"],
       completionConditions: ["独立 approval workOrderId", "独立审计已通过且证据完整", "无生产者身份冲突", "高风险事项未被自动批准"],
-      prompt: includePrompts ? "你是 Main Agent。先读取当前目标计划的 planId，再调用 claim_coordination_lease(planId=目标计划) 领取父任务；只有你可以选择、派发、暂停、回收、重派和推进阶段。用 dispatch_child_task 派 Designer → Design Auditor，审核通过后由你批准，再派 Builder → Implementation Auditor，最后由你验收。子 Agent 禁止自行领取；只能通过一次性 dispatchId 获取精确任务包。父租约或 Runner 失联时回收并重派，旧子 leaseToken 永不复用；严格按设计→审核→批准→编码→审计→验收，不得并行验收。" : "",
+      prompt: includePrompts ? "你是 Main Agent。先确定唯一目标：已有计划传 planId；无计划 design/Designer 任务从当前可领取列表取精确 taskKey+taskRevision，二者恰选其一领取父租约。只有你可以选择、派发、暂停、回收和重派；任务型父租约只派绑定的设计任务，完成后自动释放，不进入计划阶段。计划型按 Designer → Design Auditor → 你批准 → Builder → Implementation Auditor → 你验收推进。子 Agent 禁止自行领取；只能凭一次性 dispatchId 获取精确任务包。父租约或 Runner 失联时回收并重派，旧子 leaseToken 永不复用。" : "",
     },
   ];
   // Merge any globally-shared, user-edited overrides onto the editable fields only.
@@ -597,7 +597,7 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
         `编排器或会话初始化时读取一次 get_agent_orchestration；队列长度仅代表待办数（designer=${counts.design}，builder=${counts.development}，auditor=${counts.audit}），绝不能按任务数创建 Agent。Worker 领取任务后以任务包为上下文真源，不再重复读取全局编排。`,
         "只按 leaseSummary.activeSlots 与 leaseSummary.roleSlots 创建有限 Worker；每个外部进程使用唯一且稳定的 workerId，同一 workerId/sessionId 一次只领取一个任务。",
         `managerApproval=${counts.managerApproval} 仅保留 human-only 高风险执行授权，禁止自动创建管理员 Agent；施工计划批准和证据充分的最终验收由 Main Agent 领取独立 approval 工单。`,
-        "Main Agent 必须先确定唯一目标 planId，再调用 claim_coordination_lease(planId=目标计划) 领取父任务/协调租约；只有 Main Agent 可以选择任务、派发、暂停、回收、重派和推进阶段。",
+        "Main Agent 必须先确定唯一目标：已有计划传 planId；无计划 design/Designer 任务从当前可领取列表取精确 taskKey+taskRevision。二者恰选其一领取父协调租约；任务型只派绑定的设计任务，完成后自动释放，不进入计划阶段。只有 Main Agent 可以选择、派发、暂停、回收、重派和推进计划型阶段。",
         "Main Agent 通过 dispatch_child_task 按当前阶段派发精确任务包；Designer、Builder、Auditor 禁止调用 claim_next_agent_task 自行领取任务，必须使用 claim_dispatched_child_task 并校验一次性 dispatchId。",
         "子 Agent 只接收自己的任务包和子租约；Main Agent 响应永不返回子 Agent 的 leaseToken。父租约暂停、回收、过期或 Runner 失联时，服务端级联释放子租约、资源锁和工作区预留，旧心跳必须返回 LEASE_LOST。",
         "阶段严格按 设计 → 审核 → 批准 → 编码 → 审计 → 验收推进；禁止跨阶段派发和并行验收。",

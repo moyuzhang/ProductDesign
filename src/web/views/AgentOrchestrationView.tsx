@@ -141,18 +141,20 @@ export function AgentOrchestrationView(): ReactElement {
 
   const generateTaskPackage = async (queue: AgentExecutableQueueKey, task: AgentOrchestrationTask) => {
     if (!data) return;
-    if (!task.planItemId || !task.assignee?.agentId) {
-      setError("Main Agent 父协调租约必须绑定具体 planId；当前任务没有可绑定的施工计划。");
-      return;
-    }
     setPackageLoadingId(task.id);
     setError("");
     try {
       const role = ROLE_BY_QUEUE[queue] as "designer" | "builder" | "auditor";
-      const parent = await api.claimCoordinationLease(data.project.id, task.planItemId, "Main Agent", coordinationWorkerId);
+      const current = (await api.listAgentTasks(data.project.id)).find((item) => item.id === task.id && item.queue === queue);
+      if (!current?.available || !current.assignee?.agentId || !current.poolId) {
+        throw new Error(current?.availabilityReason || "目标任务当前不可派发，请刷新队列");
+      }
+      const target = current.planItemId ? { planId: current.planItemId }
+        : { taskKey: current.taskKey, taskRevision: current.taskRevision };
+      const parent = await api.claimCoordinationLease(data.project.id, target, "Main Agent", coordinationWorkerId);
       const dispatch = await api.dispatchChildTask(data.project.id, parent, {
-        taskId: task.id, role, agentId: task.assignee.agentId,
-        workerId: `productdesign-child-${crypto.randomUUID()}`, poolId: task.poolId,
+        taskId: current.id, taskKey: current.taskKey, role, agentId: current.assignee.agentId,
+        workerId: `productdesign-child-${crypto.randomUUID()}`, poolId: current.poolId,
       });
       const next = await api.claimDispatchedChildTask(data.project.id, dispatch);
       setTaskPackage(next);
@@ -345,7 +347,7 @@ export function AgentOrchestrationView(): ReactElement {
           const items = data.queues[queue.key];
           const executableQueue: AgentExecutableQueueKey | null = queue.key === "managerApproval" ? null : queue.key;
           const claimCandidate = executableQueue
-            ? items.find((item) => item.available !== false && item.planItemId && item.assignee?.agentId)
+            ? items.find((item) => item.available !== false && (item.planItemId || executableQueue === "design"))
             : undefined;
           // Refreshes preserve the current page when possible and clamp to a real page boundary when the queue shrinks.
           const pagination = paginateOrchestrationQueue(items, offsets[queue.key]);
@@ -356,7 +358,7 @@ export function AgentOrchestrationView(): ReactElement {
               {executableQueue ? (
                 <button
                   className="orchestration-package-trigger orchestration-dispatch-trigger"
-                  disabled={!data.workingDirectory.ready || !claimCandidate?.planItemId || !claimCandidate?.assignee?.agentId || packageLoadingId === claimCandidate?.id}
+                  disabled={!data.workingDirectory.ready || !claimCandidate || packageLoadingId === claimCandidate.id}
                   onClick={() => claimCandidate && void generateTaskPackage(executableQueue, claimCandidate)}
                 >
                   <FileJson />
@@ -451,6 +453,7 @@ export function AgentOrchestrationView(): ReactElement {
             <div><span>受派身份</span><strong>{taskPackage.assignment.displayName} · {taskPackage.assignment.agentId}</strong></div>
             <div><span>Worker / 池</span><strong>{taskPackage.worker.workerId} · {taskPackage.worker.poolId || "兼容池"}</strong></div>
             <div><span>队列 / 动作</span><strong>{taskPackage.task.queue} / {taskPackage.task.actionCode}</strong></div>
+            <div><span>父协调目标</span><code>{taskPackage.task.planItemId ? `计划 ${taskPackage.task.planItemId}` : `设计任务 ${taskPackage.lease?.taskKey || taskPackage.task.id} / ${taskPackage.lease?.taskRevision || "-"}`}</code></div>
             <div><span>目标目录</span><code>{taskPackage.launch.workingDirectory}</code></div>
             <div><span>关联 ID</span><code>{taskPackage.handoff.correlationId}</code></div>
             {taskPackage.lease ? <div><span>租约 / 资源锁</span><strong>{taskPackage.lease.status} · {taskPackage.lease.workScopes.join("、")}</strong></div> : null}

@@ -63,6 +63,8 @@ interface CoordinationLeaseRow {
   id: string;
   project_id: string;
   target_plan_id: string;
+  target_task_key: string;
+  target_task_revision: string;
   main_agent_id: string;
   worker_id: string;
   status: AgentCoordinationLeaseStatus;
@@ -120,6 +122,8 @@ function mapLease(row: CoordinationLeaseRow, includeToken = true): AgentCoordina
     id: row.id,
     projectId: row.project_id,
     planId: row.target_plan_id || "",
+    taskKey: row.target_task_key || "",
+    taskRevision: row.target_task_revision || "",
     mainAgentId: row.main_agent_id,
     workerId: row.worker_id,
     status: row.status,
@@ -196,6 +200,8 @@ export function ensureCoordinationLeaseSchema(store: Store): void {
       id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
       target_plan_id TEXT NOT NULL DEFAULT '',
+      target_task_key TEXT NOT NULL DEFAULT '',
+      target_task_revision TEXT NOT NULL DEFAULT '',
       main_agent_id TEXT NOT NULL,
       worker_id TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -244,6 +250,12 @@ export function ensureCoordinationLeaseSchema(store: Store): void {
   const parentColumns = store.db.prepare("PRAGMA table_info(agent_coordination_leases)").all() as Array<{ name: string }>;
   if (!parentColumns.some((column) => column.name === "target_plan_id")) {
     store.db.exec("ALTER TABLE agent_coordination_leases ADD COLUMN target_plan_id TEXT NOT NULL DEFAULT ''");
+  }
+  if (!parentColumns.some((column) => column.name === "target_task_key")) {
+    store.db.exec("ALTER TABLE agent_coordination_leases ADD COLUMN target_task_key TEXT NOT NULL DEFAULT ''");
+  }
+  if (!parentColumns.some((column) => column.name === "target_task_revision")) {
+    store.db.exec("ALTER TABLE agent_coordination_leases ADD COLUMN target_task_revision TEXT NOT NULL DEFAULT ''");
   }
 }
 
@@ -302,8 +314,10 @@ export function assertCoordinationLeaseForPlan(store: Store, input: {
 
 export interface ClaimCoordinationLeaseInput {
   projectId: string;
-  /** The single delivery plan coordinated by this parent lease. */
-  planId: string;
+  /** Supply either planId or the exact no-plan design task key and revision. */
+  planId?: string;
+  taskKey?: string;
+  taskRevision?: string;
   mainAgentId: string;
   workerId: string;
   leaseSeconds?: number;
@@ -317,17 +331,20 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
   if (!input.mainAgentId.trim() || !input.workerId.trim() || !input.idempotencyKey.trim()) {
     throw new CoordinationLeaseError(400, "COORDINATION_IDENTITY_REQUIRED", "Main Agent、workerId 和幂等键不能为空");
   }
-  if (typeof input.planId !== "string" || !input.planId.trim()) {
-    throw new CoordinationLeaseError(400, "COORDINATION_PLAN_REQUIRED", "必须指定目标计划才能领取父协调租约");
+  const targetPlanId = input.planId?.trim() || "";
+  const targetTaskKey = input.taskKey?.trim() || "";
+  const targetTaskRevision = input.taskRevision?.trim() || "";
+  if (Boolean(targetPlanId) === Boolean(targetTaskKey) || Boolean(targetTaskKey) !== Boolean(targetTaskRevision)) {
+    throw new CoordinationLeaseError(400, "COORDINATION_TARGET_INVALID", "planId 与 taskKey+taskRevision 必须且只能指定一种目标");
   }
-  const targetPlanId = input.planId.trim();
-  const targetPlan = store.getPlan(targetPlanId);
-  if (!targetPlan || targetPlan.projectId !== input.projectId || !isExecutableDeliveryPlan(targetPlan)) {
-    throw new CoordinationLeaseError(404, "COORDINATION_PLAN_NOT_FOUND", "目标计划不存在、不属于项目或不是可交付 task");
-  }
-  const initialStage = coordinationStageForPlan(targetPlan);
-  if (initialStage === "completed") {
-    throw new CoordinationLeaseError(409, "COORDINATION_PLAN_COMPLETED", "目标计划已经完成，无需领取父协调租约");
+  let planInitialStage: AgentCoordinationStage = "design";
+  if (targetPlanId) {
+    const targetPlan = store.getPlan(targetPlanId);
+    if (!targetPlan || targetPlan.projectId !== input.projectId || !isExecutableDeliveryPlan(targetPlan)) {
+      throw new CoordinationLeaseError(404, "COORDINATION_PLAN_NOT_FOUND", "目标计划不存在、不属于项目或不是可交付 task");
+    }
+    planInitialStage = coordinationStageForPlan(targetPlan);
+    if (planInitialStage === "completed") throw new CoordinationLeaseError(409, "COORDINATION_PLAN_COMPLETED", "目标计划已经完成，无需领取父协调租约");
   }
   expireCoordinationLeases(store, input.projectId);
   return store.db.transaction(() => {
@@ -342,6 +359,9 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
       if (!current || !["active", "paused"].includes(current.status) || current.lease_expires_at <= now()) {
         throw new CoordinationLeaseError(409, "COORDINATION_LEASE_LOST", "原父协调租约已结束或失效；不能重放为可执行授权");
       }
+      if (current.target_plan_id !== targetPlanId || current.target_task_key !== targetTaskKey || current.target_task_revision !== targetTaskRevision) {
+        throw new CoordinationLeaseError(409, "COORDINATION_TARGET_MISMATCH", "父协调租约目标已改变");
+      }
       upsertCoordinationRunner(store, current.project_id, current.main_agent_id, current.worker_id, current.id, "online");
       return mapLease(current);
     }
@@ -349,18 +369,31 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
       .get(input.projectId) as CoordinationLeaseRow | undefined;
     if (existing) {
       if (existing.main_agent_id === input.mainAgentId && existing.worker_id === input.workerId) {
-        if (existing.target_plan_id && existing.target_plan_id !== targetPlanId) {
-          throw new CoordinationLeaseError(409, "COORDINATION_PLAN_MISMATCH", "当前父协调租约已绑定其他目标计划");
-        }
-        if (!existing.target_plan_id) {
+        if (existing.target_plan_id || existing.target_task_key) {
+          if (existing.target_plan_id !== targetPlanId || existing.target_task_key !== targetTaskKey || existing.target_task_revision !== targetTaskRevision) {
+            throw new CoordinationLeaseError(409, "COORDINATION_TARGET_MISMATCH", "当前父协调租约已绑定其他目标");
+          }
+        } else if (targetPlanId) {
           const activeChild = store.db.prepare("SELECT 1 FROM agent_child_task_dispatches WHERE coordination_lease_id=? AND status IN ('dispatched','claimed','running') LIMIT 1").get(existing.id);
           if (activeChild) throw new CoordinationLeaseError(409, "COORDINATION_PLAN_MISMATCH", "已有未完成子任务，不能切换父协调租约目标计划");
-          store.db.prepare("UPDATE agent_coordination_leases SET target_plan_id=?, stage=?, updated_at=? WHERE id=?").run(targetPlanId, initialStage, now(), existing.id);
+          store.db.prepare("UPDATE agent_coordination_leases SET target_plan_id=?, stage=?, updated_at=? WHERE id=?").run(targetPlanId, planInitialStage, now(), existing.id);
+        } else {
+          throw new CoordinationLeaseError(409, "COORDINATION_TARGET_MISMATCH", "旧父租约未绑定精确任务，必须释放后重新领取");
         }
         upsertCoordinationRunner(store, existing.project_id, existing.main_agent_id, existing.worker_id, existing.id, "online");
         return mapLease(store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=?").get(existing.id) as CoordinationLeaseRow);
       }
       throw new CoordinationLeaseError(409, "COORDINATION_LEASE_BUSY", "项目已有有效父协调租约");
+    }
+    if (!targetPlanId) {
+      const task = listClaimableAgentTasks(store, input.projectId).find((candidate) => candidate.taskKey === targetTaskKey);
+      if (!task || task.taskRevision !== targetTaskRevision) throw new CoordinationLeaseError(409, "COORDINATION_TASK_REVISION_MISMATCH", "目标任务不存在或修订已变化");
+      if (task.planItemId || task.queue !== "design" || task.deliveryTrack !== "design" || task.requiredRole !== "designer") {
+        throw new CoordinationLeaseError(409, "COORDINATION_TASK_INVALID", "只允许绑定无计划的 Designer 设计任务");
+      }
+      if (!task.assignee?.agentId || !task.poolId || !task.available) {
+        throw new CoordinationLeaseError(409, "COORDINATION_TASK_NOT_AVAILABLE", task.availabilityReason || "任务当前不可派发");
+      }
     }
     const activeTask = store.db.prepare(`SELECT 1 FROM agent_task_leases
       WHERE project_id=? AND lower(worker_id)=lower(?) AND status IN ('claimed','running') AND lease_expires_at > ? LIMIT 1`)
@@ -374,16 +407,16 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
     }
     const timestamp = now();
     const row = {
-      id: randomUUID(), projectId: input.projectId, targetPlanId, mainAgentId: input.mainAgentId.trim(), workerId: input.workerId.trim(),
-      leaseToken: randomUUID(), leaseExpiresAt: expires(input.leaseSeconds), stage: initialStage, timestamp,
+      id: randomUUID(), projectId: input.projectId, targetPlanId, targetTaskKey, targetTaskRevision, mainAgentId: input.mainAgentId.trim(), workerId: input.workerId.trim(),
+      leaseToken: randomUUID(), leaseExpiresAt: expires(input.leaseSeconds), stage: planInitialStage, timestamp,
     };
     store.db.prepare(`INSERT INTO agent_coordination_leases
-      (id, project_id, target_plan_id, main_agent_id, worker_id, status, stage, lease_token, lease_expires_at, heartbeat_at, dispatch_revision, created_at, updated_at)
-      VALUES (@id,@projectId,@targetPlanId,@mainAgentId,@workerId,'active',@stage,@leaseToken,@leaseExpiresAt,@timestamp,0,@timestamp,@timestamp)`).run(row);
+      (id, project_id, target_plan_id, target_task_key, target_task_revision, main_agent_id, worker_id, status, stage, lease_token, lease_expires_at, heartbeat_at, dispatch_revision, created_at, updated_at)
+      VALUES (@id,@projectId,@targetPlanId,@targetTaskKey,@targetTaskRevision,@mainAgentId,@workerId,'active',@stage,@leaseToken,@leaseExpiresAt,@timestamp,0,@timestamp,@timestamp)`).run(row);
     const created = store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=?").get(row.id) as CoordinationLeaseRow;
     upsertCoordinationRunner(store, input.projectId, row.mainAgentId, row.workerId, row.id, "online");
     store.recordAudit({ projectId: input.projectId, entityType: "agentCoordinationLease", entityId: row.id, action: "claim", before: null,
-      after: { mainAgentId: row.mainAgentId, workerId: row.workerId, planId: row.targetPlanId, stage: row.stage }, actor: row.mainAgentId, source: "system" });
+      after: { mainAgentId: row.mainAgentId, workerId: row.workerId, planId: row.targetPlanId, taskKey: row.targetTaskKey, taskRevision: row.targetTaskRevision, stage: row.stage }, actor: row.mainAgentId, source: "system" });
     const result = mapLease(created);
     store.db.prepare("INSERT INTO agent_coordination_idempotency (operation,idempotency_key,request_hash,response_json,created_at) VALUES ('claim',?,?,?,?)")
       .run(input.idempotencyKey, hash, JSON.stringify(result), timestamp);
@@ -422,6 +455,11 @@ function expectedChild(store: Store, parent: CoordinationLeaseRow, taskId: strin
   if (parent.target_plan_id && task.planItemId !== parent.target_plan_id) {
     throw new CoordinationLeaseError(409, "COORDINATION_PLAN_MISMATCH", "子任务不属于父协调租约的目标计划");
   }
+  if (parent.target_task_key && (parent.stage !== "design" || !taskId || !taskKey
+    || task.taskKey !== taskKey || task.taskKey !== parent.target_task_key || task.taskRevision !== parent.target_task_revision
+    || task.planItemId || task.queue !== "design" || task.deliveryTrack !== "design")) {
+    throw new CoordinationLeaseError(409, "COORDINATION_TASK_MISMATCH", "子任务与父协调租约绑定的精确设计任务不一致");
+  }
   if (task.requiredRole !== role) throw new CoordinationLeaseError(409, "ROLE_MISMATCH", `任务必须由 ${task.requiredRole} 处理`);
   if ((parent.stage === "design_audit" && task.auditScope !== "design")
     || (parent.stage === "implementation_audit" && task.auditScope !== "implementation")
@@ -457,7 +495,7 @@ export interface DispatchChildTaskInput {
 export function dispatchChildTask(store: Store, input: DispatchChildTaskInput): AgentChildTaskDispatch {
   ensureCoordinationLeaseSchema(store);
   const parent = activeParent(store, input.projectId, input.coordinationLeaseId, input.leaseToken, input.mainAgentId);
-  if (!parent.target_plan_id) throw new CoordinationLeaseError(409, "COORDINATION_PLAN_REQUIRED", "父协调租约未绑定目标计划，请重新领取");
+  if (!parent.target_plan_id && !parent.target_task_key) throw new CoordinationLeaseError(409, "COORDINATION_TARGET_INVALID", "父协调租约未绑定有效目标，请重新领取");
   if (parent.status !== "active") throw new CoordinationLeaseError(409, "COORDINATION_PAUSED", "父协调租约已暂停");
   const expected = expectedChild(store, parent, input.taskId, input.taskKey, input.role);
   const agentId = input.agentId?.trim() || expected.agentId;
@@ -560,6 +598,9 @@ export function resumeCoordinationLease(store: Store, input: { projectId: string
 
 export function releaseCoordinationLease(store: Store, input: { projectId: string; coordinationLeaseId: string; leaseToken: string; mainAgentId: string; reason?: string }): AgentCoordinationLease {
   ensureCoordinationLeaseSchema(store);
+  const alreadyReleased = store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=? AND project_id=? AND lease_token=? AND main_agent_id=? AND target_task_key<>'' AND status='released'")
+    .get(input.coordinationLeaseId, input.projectId, input.leaseToken, input.mainAgentId) as CoordinationLeaseRow | undefined;
+  if (alreadyReleased) return mapLease(alreadyReleased);
   const parent = activeParent(store, input.projectId, input.coordinationLeaseId, input.leaseToken, input.mainAgentId);
   reclaimChildren(store, parent.id, input.reason?.trim() || "released_by_main_agent");
   store.db.prepare("UPDATE agent_coordination_leases SET status='released', updated_at=? WHERE id=?").run(now(), parent.id);
@@ -570,6 +611,7 @@ export function releaseCoordinationLease(store: Store, input: { projectId: strin
 export function advanceCoordinationStage(store: Store, input: { projectId: string; coordinationLeaseId: string; leaseToken: string; mainAgentId: string; stage?: AgentCoordinationStage }): AgentCoordinationLease {
   ensureCoordinationLeaseSchema(store);
   const parent = activeParent(store, input.projectId, input.coordinationLeaseId, input.leaseToken, input.mainAgentId);
+  if (parent.target_task_key) throw new CoordinationLeaseError(409, "COORDINATION_TASK_STAGE_FORBIDDEN", "任务型父租约仅能协调设计任务，不进入计划阶段");
   const next = NEXT_STAGE[parent.stage];
   if (!next || (input.stage && input.stage !== next)) throw new CoordinationLeaseError(409, "STAGE_ORDER_VIOLATION", `不能从 ${parent.stage} 跳转到 ${input.stage || "下一阶段"}`);
   const active = store.db.prepare("SELECT 1 FROM agent_child_task_dispatches WHERE coordination_lease_id=? AND status IN ('dispatched','claimed','running') LIMIT 1").get(parent.id);

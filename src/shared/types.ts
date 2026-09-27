@@ -1305,8 +1305,10 @@ export type AgentChildDispatchStatus = "dispatched" | "claimed" | "running" | "c
 export interface AgentCoordinationLease {
   id: string;
   projectId: string;
-  /** The single delivery plan this parent lease coordinates. */
+  /** Exactly one of planId or taskKey/taskRevision identifies the target. */
   planId: string;
+  taskKey: string;
+  taskRevision: string;
   mainAgentId: string;
   workerId: string;
   status: AgentCoordinationLeaseStatus;

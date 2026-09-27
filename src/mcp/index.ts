@@ -548,9 +548,11 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
   };
   server.registerTool("claim_coordination_lease", {
     title: "Main Agent 领取父协调租约",
-    description: "Main Agent 领取绑定到单一目标计划的父任务/协调租约；子 Agent 不得使用该租约代替自己的子租约。",
+    description: "Main Agent 领取绑定到单一目标计划，或精确无计划设计任务 taskKey+taskRevision 的父协调租约；两种目标恰选其一。",
     inputSchema: {
-      projectRef: z.string().min(1), planId: z.string().trim().min(1).max(300), mainAgentId: z.string().trim().min(1).max(200),
+      projectRef: z.string().min(1), planId: z.string().trim().min(1).max(300).optional(),
+      taskKey: z.string().trim().min(1).max(2000).optional(), taskRevision: z.string().trim().min(1).max(500).optional(),
+      mainAgentId: z.string().trim().min(1).max(200),
       workerId: z.string().trim().min(1).max(300), leaseSeconds: z.number().int().min(15).max(1800).default(1800),
       idempotencyKey: z.string().trim().min(1).max(300),
     },

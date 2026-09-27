@@ -187,7 +187,7 @@ export function SystemGuideView(): ReactElement {
           <ol>
             <li><code>get_project_workflow</code> 读取当前门禁</li>
             <li><code>get_agent_orchestration</code> 读取队列、容量和交付层</li>
-            <li>Main Agent：先按目标 <code>planId</code> 调用 <code>claim_coordination_lease</code> → <code>dispatch_child_task</code> → 回收/重派/阶段推进</li>
+            <li>Main Agent：已有计划用 <code>planId</code>，无计划设计任务用精确 <code>taskKey + taskRevision</code> 领取父租约 → 派发子任务；任务型完成后自动释放，不推进计划阶段</li>
             <li>子 Agent：<code>claim_dispatched_child_task</code>（一次性 <code>dispatchId</code>）</li>
             <li>校验 deliveryTrack、auditScope、taskKey、taskRevision、workScopes、leaseToken 和当前修订</li>
             <li>每个 Designer、Builder 和 Auditor 提交与本人任务绑定的工单；未提交不得交接或完成</li>

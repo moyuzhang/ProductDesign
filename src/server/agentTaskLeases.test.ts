@@ -126,13 +126,13 @@ describe("agent task leases", () => {
       nodeId,
       planItemId: null,
       requiredRole: "designer",
-      taskRevision: "0",
+      taskRevision: expect.stringMatching(new RegExp(`^${task.actionCode}:[0-9a-f]{64}$`)),
       available: true,
       availabilityReason: "可领取",
       assignee: { agentId: expectedAgentId, displayName: "白板设计 1 Designer", poolId: expectedPoolId },
       poolId: expectedPoolId,
     });
-    expect(task.taskKey).toContain(`:${encodeURIComponent(`design:${nodeId}`)}:0`);
+    expect(task.taskKey).toContain(`:${encodeURIComponent(`design:${nodeId}`)}:${task.taskRevision}`);
 
     const packageBeforeClaim = buildAgentTaskPackage(store, projectId, { queue: "design", taskId: task.id });
     expect(packageBeforeClaim).toMatchObject({
@@ -170,7 +170,7 @@ describe("agent task leases", () => {
     const lease = claimAgentTask(store, claimInput);
     expect(claimAgentTask(store, claimInput).leaseToken).toBe(lease.leaseToken);
     expect(lease).toMatchObject({
-      taskId: task.id, taskKey: task.taskKey, taskRevision: "0", agentId: expectedAgentId,
+      taskId: task.id, taskKey: task.taskKey, taskRevision: task.taskRevision, agentId: expectedAgentId,
       poolId: expectedPoolId, attempt: 1, status: "claimed",
     });
     expect(() => claimAgentTask(store, { ...claimInput, workerId: "changed-worker" }))

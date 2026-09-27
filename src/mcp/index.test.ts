@@ -80,8 +80,11 @@ describe("list_design_docs content retrieval", () => {
       }));
       const coordinationClaim = tools.find((item) => item.name === "claim_coordination_lease")!;
       expect((coordinationClaim.inputSchema.required ?? []) as string[]).toEqual(expect.arrayContaining([
-        "projectRef", "planId", "mainAgentId", "workerId", "idempotencyKey",
+        "projectRef", "mainAgentId", "workerId", "idempotencyKey",
       ]));
+      expect(coordinationClaim.inputSchema.properties).toEqual(expect.objectContaining({
+        planId: expect.any(Object), taskKey: expect.any(Object), taskRevision: expect.any(Object),
+      }));
     } finally { await external.close(); }
   });
 

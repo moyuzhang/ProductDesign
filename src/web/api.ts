@@ -15,6 +15,7 @@ import type {
   AgentWorkspace,
   AgentWorkspaceSnapshot,
   AgentOrchestration,
+  AgentOrchestrationTask,
   AgentRunnerRegistration,
   AgentTaskLeaseRecord,
   AgentTaskCapacity,
@@ -264,11 +265,13 @@ export const api = {
     request<DesignChangeResult>("POST", `/api/projects/${id}/design-changes`, body),
   getAgentOrchestration: (id: string, includePrompts = true) =>
     request<AgentOrchestration>("GET", `/api/projects/${id}/agent-orchestration${qs({ includePrompts: String(includePrompts) })}`),
-  claimCoordinationLease: (projectId: string, planId: string, mainAgentId: string, workerId: string) =>
+  listAgentTasks: (projectId: string) =>
+    request<Array<AgentOrchestrationTask & { taskKey: string; taskRevision: string; requiredRole: AgentBlueprintKey; available: boolean; availabilityReason: string }>>("GET", `/api/projects/${projectId}/agent-tasks`),
+  claimCoordinationLease: (projectId: string, target: { planId: string } | { taskKey: string; taskRevision: string }, mainAgentId: string, workerId: string) =>
     request<AgentCoordinationLease>("POST", `/api/projects/${projectId}/coordination-leases`, {
-      planId, mainAgentId, workerId, leaseSeconds: 1800, idempotencyKey: crypto.randomUUID(),
+      ...target, mainAgentId, workerId, leaseSeconds: 1800, idempotencyKey: crypto.randomUUID(),
     }),
-  dispatchChildTask: (projectId: string, parent: Pick<AgentCoordinationLease, "id" | "leaseToken" | "mainAgentId">, body: { taskId: string; role: "designer" | "builder" | "auditor"; agentId?: string; workerId?: string; poolId?: string }) =>
+  dispatchChildTask: (projectId: string, parent: Pick<AgentCoordinationLease, "id" | "leaseToken" | "mainAgentId">, body: { taskId: string; taskKey?: string; role: "designer" | "builder" | "auditor"; agentId?: string; workerId?: string; poolId?: string }) =>
     request<AgentChildTaskDispatch>("POST", `/api/projects/${projectId}/coordination-leases/${encodeURIComponent(parent.id)}/dispatch`, {
       leaseToken: parent.leaseToken, mainAgentId: parent.mainAgentId, ...body,
     }),

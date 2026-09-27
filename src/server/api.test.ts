@@ -126,6 +126,31 @@ describe("REST API", () => {
       },
     });
     expect(released.statusCode, released.body).toBe(200);
+
+    const parentClaim = await app.inject({ method: "POST", url: `/api/projects/${restProjectId}/coordination-leases`, payload: {
+      taskKey: task.taskKey, taskRevision: task.taskRevision, mainAgentId: "Main Agent",
+      workerId: "rest-preplan-parent", idempotencyKey: "rest-preplan-parent-claim",
+    } });
+    expect(parentClaim.statusCode, parentClaim.body).toBe(200);
+    expect(parentClaim.json()).toMatchObject({ planId: "", taskKey: task.taskKey, taskRevision: task.taskRevision, stage: "design" });
+    const parent = parentClaim.json();
+    const wrongTarget = await app.inject({ method: "POST", url: `/api/projects/${restProjectId}/coordination-leases`, payload: {
+      planId: "fake-plan", taskKey: task.taskKey, taskRevision: task.taskRevision, mainAgentId: "Main Agent",
+      workerId: "rest-preplan-parent", idempotencyKey: "rest-preplan-both-targets",
+    } });
+    expect(wrongTarget.json().code).toBe("COORDINATION_TARGET_INVALID");
+    const dispatched = await app.inject({ method: "POST",
+      url: `/api/projects/${restProjectId}/coordination-leases/${parent.id}/dispatch`, payload: {
+        leaseToken: parent.leaseToken, mainAgentId: "Main Agent", taskId: task.id,
+        taskKey: task.taskKey, role: "designer", agentId: task.assignee.agentId, workerId: "rest-child-worker", poolId: task.poolId,
+      } });
+    expect(dispatched.statusCode, dispatched.body).toBe(200);
+    expect(dispatched.json()).toMatchObject({ taskKey: task.taskKey, taskRevision: task.taskRevision });
+    const parentReleased = await app.inject({ method: "POST",
+      url: `/api/projects/${restProjectId}/coordination-leases/${parent.id}/release`, payload: {
+        leaseToken: parent.leaseToken, mainAgentId: "Main Agent", reason: "REST task-bound parent regression",
+      } });
+    expect(parentReleased.statusCode, parentReleased.body).toBe(200);
   });
 
   it("exposes the governed design-change contract", async () => {

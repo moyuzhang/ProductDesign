@@ -1095,7 +1095,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id } = request.params as { id: string };
     if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在", code: "PROJECT_NOT_FOUND" });
     try {
-      const body = parse(coordinationIdentity.extend({ planId: z.string().trim().min(1).max(300), leaseSeconds: z.number().int().min(15).max(1800).default(1800), idempotencyKey: z.string().trim().min(1).max(300) }), request.body);
+      const body = parse(coordinationIdentity.extend({ planId: z.string().trim().min(1).max(300).optional(), taskKey: z.string().trim().min(1).max(2000).optional(), taskRevision: z.string().trim().min(1).max(500).optional(), leaseSeconds: z.number().int().min(15).max(1800).default(1800), idempotencyKey: z.string().trim().min(1).max(300) }), request.body);
       return claimCoordinationLease(store, { ...body, projectId: id });
     } catch (cause) { return agentTaskPackageError(reply, cause); }
   });
