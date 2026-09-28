@@ -379,6 +379,21 @@ function activeParent(store: Store, projectId: string, id: string, token: string
   return row;
 }
 
+/** Commit security cleanup after a rejected outer transaction rolls it back. */
+export function recoverCoordinationLeaseAfterRejectedTransaction(store: Store, projectId: string, cause: unknown): void {
+  if (cause instanceof CoordinationLeaseError && cause.code === "COORDINATION_LEASE_LOST") {
+    expireCoordinationLeases(store, projectId);
+  }
+}
+
+function coordinationTransaction<T>(store: Store, projectId: string, action: () => T): T {
+  try { return store.db.transaction(action).immediate(); }
+  catch (cause) {
+    recoverCoordinationLeaseAfterRejectedTransaction(store, projectId, cause);
+    throw cause;
+  }
+}
+
 /** Validate the plan-scoped parent lease used by Main Agent plan transitions. */
 export function assertCoordinationLeaseForPlan(store: Store, input: {
   projectId: string;
@@ -593,7 +608,7 @@ export interface DispatchChildTaskInput {
 
 export function dispatchChildTask(store: Store, input: DispatchChildTaskInput): AgentChildTaskDispatch {
   ensureCoordinationLeaseSchema(store);
-  return store.db.transaction(() => dispatchChildTaskInTransaction(store, input)).immediate();
+  return coordinationTransaction(store, input.projectId, () => dispatchChildTaskInTransaction(store, input));
 }
 
 function dispatchChildTaskInTransaction(store: Store, input: DispatchChildTaskInput): AgentChildTaskDispatch {
@@ -672,7 +687,7 @@ export function reclaimChildTask(store: Store, input: { projectId: string; coord
 
 export function reassignChildTask(store: Store, input: DispatchChildTaskInput & { dispatchId: string; reason?: string }): AgentChildTaskDispatch {
   ensureCoordinationLeaseSchema(store);
-  return store.db.transaction(() => reassignChildTaskInTransaction(store, input)).immediate();
+  return coordinationTransaction(store, input.projectId, () => reassignChildTaskInTransaction(store, input));
 }
 
 function reassignChildTaskInTransaction(store: Store, input: DispatchChildTaskInput & { dispatchId: string; reason?: string }): AgentChildTaskDispatch {
@@ -689,12 +704,12 @@ function reassignChildTaskInTransaction(store: Store, input: DispatchChildTaskIn
 
 export function pauseCoordinationLease(store: Store, input: { projectId: string; coordinationLeaseId: string; leaseToken: string; mainAgentId: string }): AgentCoordinationLease {
   ensureCoordinationLeaseSchema(store);
-  return store.db.transaction(() => {
+  return coordinationTransaction(store, input.projectId, () => {
   const parent = activeParent(store, input.projectId, input.coordinationLeaseId, input.leaseToken, input.mainAgentId);
   reclaimChildren(store, parent.id, "coordination_lease_paused");
   store.db.prepare("UPDATE agent_coordination_leases SET status='paused', updated_at=? WHERE id=?").run(now(), parent.id);
   return mapLease(store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=?").get(parent.id) as CoordinationLeaseRow);
-  }).immediate();
+  });
 }
 
 export function resumeCoordinationLease(store: Store, input: { projectId: string; coordinationLeaseId: string; leaseToken: string; mainAgentId: string }): AgentCoordinationLease {
@@ -707,7 +722,7 @@ export function resumeCoordinationLease(store: Store, input: { projectId: string
 
 export function releaseCoordinationLease(store: Store, input: { projectId: string; coordinationLeaseId: string; leaseToken: string; mainAgentId: string; reason?: string }): AgentCoordinationLease {
   ensureCoordinationLeaseSchema(store);
-  return store.db.transaction(() => {
+  return coordinationTransaction(store, input.projectId, () => {
   const alreadyReleased = store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=? AND project_id=? AND lease_token=? AND main_agent_id=? AND target_task_key<>'' AND status='released'")
     .get(input.coordinationLeaseId, input.projectId, input.leaseToken, input.mainAgentId) as CoordinationLeaseRow | undefined;
   if (alreadyReleased) return mapLease(alreadyReleased);
@@ -716,7 +731,7 @@ export function releaseCoordinationLease(store: Store, input: { projectId: strin
   store.db.prepare("UPDATE agent_coordination_leases SET status='released', updated_at=? WHERE id=?").run(now(), parent.id);
   setCoordinationRunnerStatus(store, parent.project_id, parent.main_agent_id, parent.worker_id, "offline");
   return mapLease(store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=?").get(parent.id) as CoordinationLeaseRow);
-  }).immediate();
+  });
 }
 
 export function advanceCoordinationStage(store: Store, input: { projectId: string; coordinationLeaseId: string; leaseToken: string; mainAgentId: string; stage?: AgentCoordinationStage }): AgentCoordinationLease {

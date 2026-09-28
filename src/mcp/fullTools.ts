@@ -51,7 +51,7 @@ import { DesignChangeError, dismissDesignChangeIntent, requestDesignChange } fro
 import { DesignChangeIntentError, submitDesignChangeIntent } from "../server/designChangeIntent.js";
 import { EvidenceRepairAssessmentError, requestEvidenceRepairAssessment } from "../server/evidenceRepair.js";
 import { AgentSecurityError } from "../server/agentSecurity.js";
-import { assertCoordinationLeaseForPlan, CoordinationLeaseError } from "../server/coordinationLeases.js";
+import { assertCoordinationLeaseForPlan, CoordinationLeaseError, recoverCoordinationLeaseAfterRejectedTransaction } from "../server/coordinationLeases.js";
 import { leaseWriteContextSchema } from "./agentWriteSchema.js";
 import {
   alignDiagramNodes,
@@ -762,6 +762,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
       }).immediate();
       return result(updated, "计划交付状态已流转");
     } catch (cause) {
+      recoverCoordinationLeaseAfterRejectedTransaction(store, before.projectId, cause);
       if (cause instanceof AgentTaskLeaseError || cause instanceof AgentSecurityError || cause instanceof CoordinationLeaseError) return error(structuredError(cause));
       return error(cause instanceof Error ? cause.message : String(cause));
     }

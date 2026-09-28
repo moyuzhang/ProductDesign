@@ -178,6 +178,7 @@ import {
   advanceCoordinationStage,
   listChildTaskDispatches,
   assertCoordinationLeaseForPlan,
+  recoverCoordinationLeaseAfterRejectedTransaction,
 } from "./coordinationLeases.js";
 
 const stageSchema = z.enum(PROJECT_STAGES);
@@ -1641,6 +1642,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         return next;
       }).immediate();
     } catch (cause) {
+      recoverCoordinationLeaseAfterRejectedTransaction(store, before.projectId, cause);
       if (cause instanceof AgentTaskLeaseError || cause instanceof CoordinationLeaseError) return agentTaskPackageError(reply, cause);
       throw cause;
     }
