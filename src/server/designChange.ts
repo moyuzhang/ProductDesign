@@ -1,3 +1,4 @@
+import { recordDesignChangeLineage } from "./designChangeLineage.js";
 import { createHash } from "node:crypto";
 import type {
   DesignChangeRequest,
@@ -756,6 +757,7 @@ function requestDesignChangeInTransaction(
     store.db.prepare(
       "INSERT INTO design_change_requests (idempotency_key, request_hash, change_id, response_json, created_at) VALUES (?, ?, ?, ?, ?)",
     ).run(input.idempotencyKey, hash, changeId, JSON.stringify(result), createdAt);
+    recordDesignChangeLineage(store, result);
     const workflow = buildProjectWorkflow(store, project.id);
     result.nextAction = workflow?.nodes.find((item) => item.diagramId === diagram.id && item.nodeId === node.id)?.nextAction ?? null;
     if (input.intentId) finishDesignChangeIntent(store, input.intentId, "applied", changeId);

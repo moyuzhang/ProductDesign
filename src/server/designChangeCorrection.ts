@@ -1,3 +1,4 @@
+import { activeDesignChangeId } from "./designChangeLineage.js";
 import { createHash } from "node:crypto";
 import type { DesignChangeRecovery, DesignChangeResult, Diagram, PlanItem } from "../shared/types.js";
 import type { Store } from "./db.js";
@@ -15,7 +16,7 @@ export function assertDesignChangeCorrection(store: Store, projectId: string, ro
     || !["draft", "pending_approval", "rework"].includes(root.lifecycleStatus)) return fail();
   const diagram = store.getDiagram(root.diagramId);
   const node = diagram?.nodes.find((item) => item.id === root.diagramNodeId);
-  if (!diagram || diagram.projectId !== projectId || node?.blockedReason !== `设计变更处理中 · ${changeId}`) return fail();
+  if (!diagram || diagram.projectId !== projectId || !node || activeDesignChangeId(store, projectId, diagram.id, node.id) !== changeId) return fail();
   const governance = store.getGovernance(changeId);
   if (!governance || governance.projectId !== projectId || governance.type !== "decision" || governance.status !== "有效") return fail();
   if (!store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='design_change_requests'").get()) return fail();
@@ -23,9 +24,9 @@ export function assertDesignChangeCorrection(store: Store, projectId: string, ro
   if (!row) return fail();
   let decision: Record<string, unknown>; let result: DesignChangeResult;
   try { decision = JSON.parse(governance.content); result = JSON.parse(row.response_json); } catch { return fail(); }
-  if (decision.requirementImpact !== false || decision.diagramId !== diagram.id || decision.nodeId !== node.id
+  if (!decision || !result || decision.requirementImpact !== false || decision.diagramId !== diagram.id || decision.nodeId !== node.id
     || result.changeId !== changeId || result.projectId !== projectId || result.diagramId !== diagram.id || result.nodeId !== node.id
-    || !result.reworkPlanIds?.includes(root.id)) return fail();
+    || (!Array.isArray(result.reworkPlanIds) || !result.reworkPlanIds.includes(root.id))) return fail();
   return {
     changeId,
     sourceHash: createHash("sha256").update(JSON.stringify({ governance, result })).digest("hex"),
@@ -39,7 +40,7 @@ export function listDesignChangeRecoveries(store: Store, projectId: string, plan
     if (!root.diagramId || !root.diagramNodeId) continue;
     const diagram = diagrams ? diagrams.find((item) => item.id === root.diagramId) : store.getDiagram(root.diagramId);
     const node = diagram?.nodes.find((item) => item.id === root.diagramNodeId);
-    const changeId = /^设计变更处理中 · ([0-9a-f-]{36})$/i.exec(node?.blockedReason ?? "")?.[1];
+    const changeId = node && diagram ? activeDesignChangeId(store, projectId, diagram.id, node.id) : null;
     if (!changeId || seen.has(changeId)) continue;
     try { assertDesignChangeCorrection(store, projectId, root, changeId); } catch { continue; }
     seen.add(changeId);

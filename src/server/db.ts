@@ -1,3 +1,4 @@
+import { migrateDesignChangeLineage } from "./designChangeLineage.js";
 import Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
@@ -895,6 +896,7 @@ export class Store {
     this.migrateDocumentReferences();
     this.repairDuplicateProjectDocumentReferences();
     this.ensureAllProjectsHaveMainDiagrams();
+    migrateDesignChangeLineage(this);
   }
 
   private migratePlanRoleAssignments(): void {
@@ -2812,6 +2814,14 @@ CREATE TABLE IF NOT EXISTS projects (
   due_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS design_change_active_nodes (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  diagram_id TEXT NOT NULL REFERENCES diagrams(id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL,
+  change_id TEXT NOT NULL,
+  PRIMARY KEY(project_id, diagram_id, node_id)
 );
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
