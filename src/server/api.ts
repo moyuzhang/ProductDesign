@@ -1,3 +1,4 @@
+import { externalWorkspaceSchema } from "./externalWorkspace.js";
 import { agentRunFailureLogFields } from "./agentRunDiagnostics.js";
 import type { CodexDesignRuntime } from "./codexDesignRuntime.js";
 import { designContractSchema, requirementsBaselineSchema } from "../shared/designContract.js";
@@ -71,7 +72,7 @@ import {
 } from "../shared/databaseSchemas.js";
 import { collectGitEvidence } from "./collectors.js";
 import { createBackupFile, loadBackupFile, storageRetentionSummary } from "./backups.js";
-import { PrototypeDraftConflictError, PrototypeDraftCorruptError, FreeformDraftConflictError, FreeformDocumentCorruptError, FreeformAssetRejectedError, Store, nowIso } from "./db.js";
+import { ProjectRepositoryError, PrototypeDraftConflictError, PrototypeDraftCorruptError, FreeformDraftConflictError, FreeformDocumentCorruptError, FreeformAssetRejectedError, Store, nowIso } from "./db.js";
 import {
   type ServiceResult,
   type WhiteboardAuditContext,
@@ -396,7 +397,7 @@ function audit(
 }
 
 function projectCreatedPayload(p: Project): Record<string, unknown> {
-  return { id: p.id, code: p.code, name: p.name, stage: p.stage, health: p.health };
+  return { id: p.id, code: p.code, name: p.name, stage: p.stage, health: p.health, repositoryPath: p.repositoryPath, externalRepositoryId: p.externalRepositoryId ?? "" };
 }
 
 function databaseModelSummary(model: DatabaseModel): Record<string, unknown> {
@@ -1031,6 +1032,8 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
   });
 
   const agentTaskPackageClaim = z.object({
+    externalWorkspace: externalWorkspaceSchema.optional(),
+    authSessionToken: z.string().min(32).max(300).optional(),
     role: z.enum(["designer", "builder", "auditor", "approver"]),
     agentId: z.string().trim().min(1).max(200),
     workerId: z.string().trim().min(1).max(300).optional(),
@@ -1240,7 +1243,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id, dispatchId } = request.params as { id: string; dispatchId: string };
     if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在", code: "PROJECT_NOT_FOUND" });
     try {
-      const body = parse(z.object({ agentId: z.string().trim().min(1).max(200), workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), sessionId: z.string().trim().max(300).optional(), runId: z.string().trim().max(300).optional(), capabilities: z.array(z.string().trim().min(1).max(100)).max(50).default([]), leaseSeconds: z.number().int().min(15).max(1800).default(1800), idempotencyKey: z.string().trim().min(1).max(300) }), request.body);
+      const body = parse(z.object({ externalWorkspace: externalWorkspaceSchema.optional(), authSessionToken: z.string().min(32).max(300).optional(), agentId: z.string().trim().min(1).max(200), workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), sessionId: z.string().trim().max(300).optional(), runId: z.string().trim().max(300).optional(), capabilities: z.array(z.string().trim().min(1).max(100)).max(50).default([]), leaseSeconds: z.number().int().min(15).max(1800).default(1800), idempotencyKey: z.string().trim().min(1).max(300) }), request.body);
       return reply.type("application/json").send(JSON.parse(claimDispatchedChildTask(store, { ...body, dispatchId, projectId: id })));
     } catch (cause) { return agentTaskPackageError(reply, cause); }
   });
@@ -1286,6 +1289,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         projectId: id, taskId: body.taskId, taskKey: body.taskKey,
         role: body.role, agentId: body.agentId, workerId: body.workerId,
         poolId: body.poolId, sessionId: body.sessionId, runId: body.runId,
+        externalWorkspace: body.externalWorkspace, authSessionToken: body.authSessionToken,
         capabilities: body.capabilities, leaseSeconds: body.leaseSeconds,
         idempotencyKey: body.idempotencyKey,
       }, { actor: body.agentId, source: "web", clientId: "productdesign-web" });
@@ -1410,6 +1414,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const patch = parsePatch(z.object({
       ...projectCore,
       repositoryPath: z.string().trim().max(2000),
+      externalRepositoryId: z.string().trim().max(500).regex(/^(?:[A-Za-z0-9][A-Za-z0-9._:/@-]*)?$/),
     }).partial(), request.body);
     if (patch.repositoryPath) {
       if (!isAbsolute(patch.repositoryPath)) throw httpError(400, "repositoryPath 必须是绝对目录");
@@ -1420,7 +1425,12 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         throw httpError(400, "repositoryPath 不存在或当前服务无权访问");
       }
     }
-    const project = store.updateProject(id, patch);
+    let project: Project | undefined;
+    try { project = store.updateProject(id, patch); }
+    catch (cause) {
+      if (cause instanceof ProjectRepositoryError) return reply.code(cause.statusCode).send({ code: cause.code, message: cause.message });
+      throw cause;
+    }
     if (project) ensureManagedProjectDirectory(dataDir, project);
     audit(store, request.body as ActorHint, {
       projectId: id, entityType: "project", entityId: id,

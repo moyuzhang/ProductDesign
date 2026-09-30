@@ -1,3 +1,6 @@
+import { externalWorkspaceSchema, sameExternalWorkspace } from "./externalWorkspace.js";
+import { assertExternalWorkspaceClaim } from "./agentTaskLeases.js";
+import type { ExternalWorkspaceBinding } from "../shared/types.js";
 import { createHash, randomUUID } from "node:crypto";
 import type {
   AgentBlueprintKey,
@@ -773,6 +776,8 @@ export function listChildTaskDispatches(store: Store, projectId: string, coordin
 }
 
 export interface ClaimDispatchedChildTaskInput {
+  externalWorkspace?: ExternalWorkspaceBinding;
+  authSessionToken?: string;
   projectId: string;
   dispatchId: string;
   agentId: string;
@@ -786,6 +791,10 @@ export interface ClaimDispatchedChildTaskInput {
 }
 
 export function claimDispatchedChildTask(store: Store, input: ClaimDispatchedChildTaskInput): string {
+  return store.db.transaction(() => claimDispatchedChildTaskAtomic(store, input)).immediate();
+}
+
+function claimDispatchedChildTaskAtomic(store: Store, input: ClaimDispatchedChildTaskInput): string {
   ensureCoordinationLeaseSchema(store);
   expireCoordinationLeases(store, input.projectId);
   const dispatch = store.db.prepare("SELECT d.*, c.status AS parent_status, c.lease_expires_at AS parent_expires FROM agent_child_task_dispatches d JOIN agent_coordination_leases c ON c.id=d.coordination_lease_id WHERE d.dispatch_id=? AND d.project_id=?")
@@ -797,9 +806,12 @@ export function claimDispatchedChildTask(store: Store, input: ClaimDispatchedChi
   if (dispatch.agent_id !== input.agentId || dispatch.worker_id !== input.workerId) {
     throw new CoordinationLeaseError(409, "CHILD_IDENTITY_MISMATCH", "只能由 Main Agent 派发的精确子 Agent/workerId 领取");
   }
+  assertExternalWorkspaceClaim(store, { ...input, role: dispatch.role });
   if (dispatch.status !== "dispatched" && dispatch.child_work_order_id) {
     const current = getAgentTaskLeaseByWorkOrder(store, dispatch.child_work_order_id);
     if (current && ["claimed", "running"].includes(current.status)) {
+      if (input.externalWorkspace && !sameExternalWorkspace(externalWorkspaceSchema.parse(input.externalWorkspace), current.externalWorkspace))
+        throw new CoordinationLeaseError(409, "EXTERNAL_WORKSPACE_IMMUTABLE", "原派发领取已固定外部工作区，不允许重试时更换");
       const snapshot = buildAgentOrchestration(store, input.projectId, true);
       if (!snapshot) throw new CoordinationLeaseError(404, "PROJECT_NOT_FOUND", "项目不存在");
       return JSON.stringify(buildAgentTaskPackage(store, input.projectId, {
@@ -811,6 +823,7 @@ export function claimDispatchedChildTask(store: Store, input: ClaimDispatchedChi
     }
   }
   const leaseInput: ClaimAgentTaskInput = {
+    externalWorkspace: input.externalWorkspace, authSessionToken: input.authSessionToken,
     projectId: input.projectId, taskId: dispatch.task_id, taskKey: dispatch.task_key, role: dispatch.role,
     agentId: input.agentId, workerId: input.workerId, poolId: input.poolId || dispatch.pool_id,
     sessionId: input.sessionId, runId: input.runId, capabilities: input.capabilities, leaseSeconds: input.leaseSeconds,

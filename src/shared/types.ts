@@ -64,6 +64,8 @@ export interface Project {
   blockerSummary: string;
   nextStep: string;
   repositoryPath: string;
+  /** Opaque external source identity; empty/absent retains service-local mode. */
+  externalRepositoryId?: string;
   startAt: string;
   dueAt: string;
   createdAt: string;
@@ -1370,7 +1372,18 @@ export interface AgentChildTaskDispatch {
   updatedAt: string;
 }
 
+/** Runner attestation, never a service-verified Git observation. Frozen on claim. */
+export interface ExternalWorkspaceBinding {
+  repositoryId: string;
+  workspaceId: string;
+  workspacePath: string;
+  workspaceBranch: string;
+  baselineRevision: string;
+}
+
 export interface AgentWorkingDirectory {
+  location?: "service" | "external";
+  verification?: "service-filesystem" | "runner-attestation";
   repositoryPath: string;
   configured: boolean;
   absolute: boolean;
@@ -1442,7 +1455,7 @@ export interface AgentTaskPackage {
   agentSecurityPolicyVersion: string;
   workOrderStatus: "unclaimed" | "claimed" | "running";
   requiredSubmissionFields: string[];
-  project: Pick<Project, "id" | "code" | "name" | "repositoryPath">;
+  project: Pick<Project, "id" | "code" | "name" | "repositoryPath" | "externalRepositoryId">;
   workingDirectory: AgentWorkingDirectory;
   workflow: Pick<ProjectWorkflow, "phase" | "phaseLabel" | "status" | "summary" | "nextAction">;
   task: AgentOrchestrationTask & { role: AgentBlueprintKey };
@@ -1479,6 +1492,7 @@ export interface AgentTaskPackage {
     leaseExpiresAt: string;
     heartbeatSeconds: number;
     requiredForAgentWrites: true;
+    externalWorkspace?: ExternalWorkspaceBinding;
     workScopes: string[];
     workspace: {
       key: string;
@@ -1491,6 +1505,8 @@ export interface AgentTaskPackage {
   };
   launch: {
     manualStartRequired: true;
+    executionOwner?: "external-harness";
+    sourceVerification?: "runner-attestation";
     workingDirectory: string;
     instructions: string[];
     prompt: string;

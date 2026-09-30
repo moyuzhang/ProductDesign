@@ -81,6 +81,28 @@ export class DiagramTemplateRevisionConflictError extends Error {
   constructor(message: string, readonly serverUpdatedAt: string | null) { super(message); }
 }
 export class DiagramTemplateRevokedError extends Error {}
+export class ProjectRepositoryError extends Error {
+  constructor(readonly statusCode: number, readonly code: string, message: string) { super(message); }
+}
+
+/** Repository identities are labels only: never resolve them as URLs or filesystem paths. */
+export function normalizeExternalRepositoryId(value: unknown): string {
+  if (value === undefined) return "";
+  if (typeof value !== "string") {
+    throw new ProjectRepositoryError(400, "EXTERNAL_REPOSITORY_ID_INVALID", "externalRepositoryId 必须是字符串");
+  }
+  const normalized = value.trim();
+  if (normalized.length > 500 || !/^(?:[A-Za-z0-9][A-Za-z0-9._:/@-]*)?$/.test(normalized)) {
+    throw new ProjectRepositoryError(400, "EXTERNAL_REPOSITORY_ID_INVALID", "externalRepositoryId 必须为空或不超过 500 字符的安全仓库标识");
+  }
+  return normalized;
+}
+
+function assertProjectRepositoryMode(repositoryPath: string, externalRepositoryId: string): void {
+  if (repositoryPath && externalRepositoryId) {
+    throw new ProjectRepositoryError(400, "PROJECT_REPOSITORY_MODE_CONFLICT", "repositoryPath 与 externalRepositoryId 不能同时设置");
+  }
+}
 
 /**
  * 子画布镜像根节点索引：diagramId → 指向该画布的父节点标签集合。
@@ -145,7 +167,7 @@ export interface DesignDocPageQuery {
 interface ProjectRow {
   id: string; code: string; name: string; summary: string; stage: string; health: string;
   progress: number; risk_level: string; risk_summary: string; blocker_summary: string;
-  next_step: string; repository_path: string; start_at: string; due_at: string;
+  next_step: string; repository_path: string; external_repository_id: string; start_at: string; due_at: string;
   created_at: string; updated_at: string;
 }
 
@@ -298,7 +320,7 @@ function mapProject(r: ProjectRow): Project {
     stage: r.stage as Project["stage"], health: r.health as Project["health"],
     progress: r.progress, riskLevel: r.risk_level as Project["riskLevel"],
     riskSummary: r.risk_summary, blockerSummary: r.blocker_summary, nextStep: r.next_step,
-    repositoryPath: r.repository_path, startAt: r.start_at, dueAt: r.due_at,
+    repositoryPath: r.repository_path, externalRepositoryId: r.external_repository_id ?? "", startAt: r.start_at, dueAt: r.due_at,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -801,6 +823,10 @@ export class Store {
     this.db = new Database(filePath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
+    const projectColumns = this.db.prepare("PRAGMA table_info(projects)").all() as Array<{ name: string }>;
+    if (!projectColumns.some((column) => column.name === "external_repository_id")) {
+      this.db.exec("ALTER TABLE projects ADD COLUMN external_repository_id TEXT NOT NULL DEFAULT ''");
+    }
     ensureAgentSecuritySchema(this);
     try { this.db.exec("ALTER TABLE diagrams ADD COLUMN groups TEXT NOT NULL DEFAULT '[]'"); } catch { /* column exists */ }
     try { this.db.exec("ALTER TABLE diagrams ADD COLUMN type TEXT NOT NULL DEFAULT 'free'"); } catch { /* column exists */ }
@@ -1156,20 +1182,22 @@ export class Store {
   }
 
   insertProject(input: Omit<Project, "id" | "createdAt" | "updatedAt"> & { id?: string }): Project {
+    const externalRepositoryId = normalizeExternalRepositoryId(input.externalRepositoryId);
+    assertProjectRepositoryMode(input.repositoryPath, externalRepositoryId);
     const ts = nowIso();
     const row: ProjectRow = {
       id: input.id ?? newId(), code: input.code, name: input.name, summary: input.summary,
       stage: input.stage, health: input.health, progress: input.progress,
       risk_level: input.riskLevel, risk_summary: input.riskSummary,
       blocker_summary: input.blockerSummary, next_step: input.nextStep,
-      repository_path: input.repositoryPath, start_at: input.startAt, due_at: input.dueAt,
+      repository_path: input.repositoryPath, external_repository_id: externalRepositoryId, start_at: input.startAt, due_at: input.dueAt,
       created_at: ts, updated_at: ts,
     };
     this.db.prepare(
       `INSERT INTO projects (id, code, name, summary, stage, health, progress, risk_level,
-        risk_summary, blocker_summary, next_step, repository_path, start_at, due_at, created_at, updated_at)
+        risk_summary, blocker_summary, next_step, repository_path, external_repository_id, start_at, due_at, created_at, updated_at)
        VALUES (@id, @code, @name, @summary, @stage, @health, @progress, @risk_level,
-        @risk_summary, @blocker_summary, @next_step, @repository_path, @start_at, @due_at, @created_at, @updated_at)`
+        @risk_summary, @blocker_summary, @next_step, @repository_path, @external_repository_id, @start_at, @due_at, @created_at, @updated_at)`
     ).run(row);
     const project = mapProject(row);
     this.ensureProjectMainDiagram(project);
@@ -1177,16 +1205,31 @@ export class Store {
   }
 
   updateProject(id: string, patch: Partial<Project>): Project | undefined {
-    const current = this.getProject(id);
-    if (!current) return undefined;
-    const next: Project = { ...current, ...patch, id: current.id, createdAt: current.createdAt, updatedAt: nowIso() };
-    this.db.prepare(
-      `UPDATE projects SET code=@code, name=@name, summary=@summary, stage=@stage, health=@health,
-        progress=@progress, risk_level=@riskLevel, risk_summary=@riskSummary,
-        blocker_summary=@blockerSummary, next_step=@nextStep, repository_path=@repositoryPath,
-        start_at=@startAt, due_at=@dueAt, updated_at=@updatedAt WHERE id=@id`
-    ).run(next);
-    return next;
+    return this.db.transaction(() => {
+      const current = this.getProject(id);
+      if (!current) return undefined;
+      const externalRepositoryId = normalizeExternalRepositoryId(patch.externalRepositoryId === undefined ? current.externalRepositoryId : patch.externalRepositoryId);
+      const next: Project = { ...current, ...patch, externalRepositoryId, id: current.id, createdAt: current.createdAt, updatedAt: nowIso() };
+      assertProjectRepositoryMode(next.repositoryPath, externalRepositoryId);
+      if (next.repositoryPath !== current.repositoryPath || externalRepositoryId !== (current.externalRepositoryId ?? "")) {
+        const timestamp = nowIso();
+        // The lease schemas are initialized lazily. Inspect existing tables without creating them.
+        const taskLeasesExist = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_task_leases'").get();
+        const coordinationLeasesExist = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_coordination_leases'").get();
+        const taskLease = taskLeasesExist && this.db.prepare("SELECT 1 FROM agent_task_leases WHERE project_id=? AND status IN ('claimed','running') AND lease_expires_at>? LIMIT 1").get(id, timestamp);
+        const coordinationLease = coordinationLeasesExist && this.db.prepare("SELECT 1 FROM agent_coordination_leases WHERE project_id=? AND status IN ('active','paused') AND lease_expires_at>? LIMIT 1").get(id, timestamp);
+        if (taskLease || coordinationLease) {
+          throw new ProjectRepositoryError(409, "PROJECT_REPOSITORY_ACTIVE_LEASE", "项目仍有活动租约，不能更改仓库路径或外部仓库标识");
+        }
+      }
+      this.db.prepare(
+        `UPDATE projects SET code=@code, name=@name, summary=@summary, stage=@stage, health=@health,
+          progress=@progress, risk_level=@riskLevel, risk_summary=@riskSummary,
+          blocker_summary=@blockerSummary, next_step=@nextStep, repository_path=@repositoryPath,
+          external_repository_id=@externalRepositoryId, start_at=@startAt, due_at=@dueAt, updated_at=@updatedAt WHERE id=@id`
+      ).run(next);
+      return next;
+    }).immediate();
   }
 
   /**
@@ -2764,6 +2807,7 @@ CREATE TABLE IF NOT EXISTS projects (
   blocker_summary TEXT NOT NULL DEFAULT '',
   next_step TEXT NOT NULL DEFAULT '',
   repository_path TEXT NOT NULL DEFAULT '',
+  external_repository_id TEXT NOT NULL DEFAULT '',
   start_at TEXT NOT NULL DEFAULT '',
   due_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,

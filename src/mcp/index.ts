@@ -1,3 +1,4 @@
+import { externalWorkspaceSchema } from "../server/externalWorkspace.js";
 import { agentTaskRetryApprovalDigest } from "../server/agentTaskRetry.js";
 import { claimTaskPackage } from "../server/claimTaskPackage.js";
 import { McpServer } from "@modelcontextprotocol/server";
@@ -644,6 +645,8 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     title: "领取外部 Agent 任务包",
     description: "原子领取当前或指定的设计、编码、设计审计或实现审计任务，返回带项目、节点、计划、文档、workflow 摘要、deliveryTrack、auditScope、生产者身份和租约的机器可读交付包。领取后以任务包为上下文真源，不要重复读取全局项目或编排；仅在终态动作或租约/修订错误后刷新 workflow。同一任务修订只能被一个 Agent 持有；生产 Worker 不得自审。",
     inputSchema: {
+      externalWorkspace: externalWorkspaceSchema.optional(),
+      authSessionToken: z.string().min(32).max(300).optional(),
       projectRef: z.string().min(1).describe("项目 code 或 id"),
       role: z.enum(["designer", "builder", "auditor", "approver"]).describe("领取角色"),
       agentId: z.string().trim().min(1).max(200).describe("计划角色身份；必须与受派身份一致"),
@@ -657,16 +660,16 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
       leaseSeconds: z.number().int().min(15).max(1800).default(1800),
       idempotencyKey: z.string().trim().min(1).max(300).describe("客户端生成的幂等键；重试必须复用同一个值"),
     },
-  }, ({ projectRef, role, agentId, workerId, poolId, taskId, taskKey, sessionId, runId, capabilities, leaseSeconds, idempotencyKey }) => {
+  }, ({ externalWorkspace, authSessionToken, projectRef, role, agentId, workerId, poolId, taskId, taskKey, sessionId, runId, capabilities, leaseSeconds, idempotencyKey }) => {
     const project = byRef(store, projectRef);
     if (!project) return { ...toolText(`PROJECT_NOT_FOUND: 未找到项目: ${projectRef}`), isError: true };
     try {
       return toolText(claimTaskPackage(store, {
-        projectId: project.id, taskId, taskKey, role, agentId, workerId,
+        externalWorkspace, authSessionToken, projectId: project.id, taskId, taskKey, role, agentId, workerId,
         poolId, sessionId, runId, capabilities, leaseSeconds, idempotencyKey,
       }, { actor: agentId, source: "mcp", clientId: "productdesign-mcp" }));
     } catch (cause) {
-      if (cause instanceof AgentTaskPackageError || cause instanceof AgentTaskLeaseError) {
+      if (cause instanceof AgentTaskPackageError || cause instanceof AgentTaskLeaseError || cause instanceof AgentSecurityError) {
         return { ...toolText(structuredError(cause)), isError: true };
       }
       throw cause;
@@ -677,6 +680,8 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     title: "由 Worker 池领取下一任务",
     description: "推荐入口。外部 Worker 不选择 taskId，由服务端按层级、优先级、容量、项目阻塞状态和资源范围锁原子派发一个可执行任务，并返回完整任务包作为上下文真源；领取后无需重复读取项目、节点或租约。同一设计缺口的范围审批会原子领取完整审批组，占一个槽位；返回 approvalGroupId 和 scopeApprovals，设计变更提交时携带全部范围租约，续租和释放任一成员会作用于整组。",
     inputSchema: {
+      externalWorkspace: externalWorkspaceSchema.optional(),
+      authSessionToken: z.string().min(32).max(300).optional(),
       projectRef: z.string().min(1).describe("项目 code 或 id"),
       role: z.enum(["designer", "builder", "auditor", "approver"]).describe("Worker 角色"),
       agentId: z.string().trim().min(1).max(200).describe("计划角色身份"),
@@ -688,16 +693,16 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
       leaseSeconds: z.number().int().min(15).max(1800).default(1800),
       idempotencyKey: z.string().trim().min(1).max(300),
     },
-  }, ({ projectRef, role, agentId, workerId, poolId, sessionId, runId, capabilities, leaseSeconds, idempotencyKey }) => {
+  }, ({ externalWorkspace, authSessionToken, projectRef, role, agentId, workerId, poolId, sessionId, runId, capabilities, leaseSeconds, idempotencyKey }) => {
     const project = byRef(store, projectRef);
     if (!project) return { ...toolText(`PROJECT_NOT_FOUND: 未找到项目: ${projectRef}`), isError: true };
     try {
       return toolText(claimTaskPackage(store, {
-        projectId: project.id, role, agentId, workerId, poolId,
+        externalWorkspace, authSessionToken, projectId: project.id, role, agentId, workerId, poolId,
         sessionId, runId, capabilities, leaseSeconds, idempotencyKey,
       }, { actor: `worker:${workerId}`, source: "mcp", clientId: "productdesign-mcp" }));
     } catch (cause) {
-      if (cause instanceof AgentTaskPackageError || cause instanceof AgentTaskLeaseError) {
+      if (cause instanceof AgentTaskPackageError || cause instanceof AgentTaskLeaseError || cause instanceof AgentSecurityError) {
         return { ...toolText(structuredError(cause)), isError: true };
       }
       throw cause;
@@ -758,6 +763,8 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     title: "子 Agent 领取已派发任务包",
     description: "子 Agent 只能凭 Main Agent 生成的一次性 dispatchId 领取精确任务包和自己的子 leaseToken；不得自选任务。",
     inputSchema: {
+      externalWorkspace: externalWorkspaceSchema.optional(),
+      authSessionToken: z.string().min(32).max(300).optional(),
       projectRef: z.string().min(1), dispatchId: z.string().trim().min(1).max(300), agentId: z.string().trim().min(1).max(200),
       workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), sessionId: z.string().trim().max(300).optional(),
       runId: z.string().trim().max(300).optional(), capabilities: z.array(z.string().trim().min(1).max(100)).max(50).default([]),
@@ -767,7 +774,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     const project = byRef(store, projectRef);
     if (!project) return { ...toolText(`PROJECT_NOT_FOUND: 未找到项目: ${projectRef}`), isError: true };
     try { return toolText(claimDispatchedChildTask(store, { ...input, projectId: project.id })); }
-    catch (cause) { if (cause instanceof CoordinationLeaseError || cause instanceof AgentTaskLeaseError) return { ...toolText(structuredError(cause)), isError: true }; throw cause; }
+    catch (cause) { if (cause instanceof CoordinationLeaseError || cause instanceof AgentTaskLeaseError || cause instanceof AgentSecurityError) return { ...toolText(structuredError(cause)), isError: true }; throw cause; }
   });
   const parentAction = (name: string, title: string, description: string, schema: Record<string, z.ZodTypeAny>, run: (input: any) => unknown) => server.registerTool(name, { title, description, inputSchema: { ...coordinationParentSchema, ...schema } }, (input: any) => {
     const project = byRef(store, input.projectRef);
@@ -1525,4 +1532,3 @@ if (isDirectRun) {
     process.exit(1);
   }
 }
-
