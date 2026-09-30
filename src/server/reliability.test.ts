@@ -100,6 +100,77 @@ function fakeChild(respond: (method: string) => Record<string, unknown> | undefi
 }
 
 describe("agent lifecycle reliability", () => {
+  it("observes stdin failures and settles the pending run with cleanup", async () => {
+    const { harness, store, mcp } = harnessFixture();
+    const { child, methods } = fakeChild(() => undefined);
+    const run = harness.runTurn("session", "message", "test");
+    // Observe both outcomes immediately; the assertion below also stays safe on old code.
+    const outcome = run.catch((error: Error) => error);
+    await vi.waitFor(() => expect(methods).toContain("initialize"));
+    const observed = child.stdin.listenerCount("error") > 0;
+    if (observed) child.stdin.emit("error", new Error("fixture pipe failure"));
+    else await harness.close();
+    const result = await outcome;
+    expect(observed).toBe(true);
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message).toContain("fixture pipe failure");
+    expect(store.updateAgentMessage).toHaveBeenCalledWith("message", expect.objectContaining({ status: "failed" }));
+    expect(mcp.close).toHaveBeenCalledOnce();
+    expect(harness.isRunning("session")).toBe(false);
+    await harness.close();
+  });
+  it.each([false, true])("contains a streaming persistence failure within its run (persistent=%s)", async (persistent) => {
+    const { harness, store, mcp } = harnessFixture();
+    const { child, methods } = fakeChild((method) => method === "thread/resume"
+      ? { result: { thread: { id: "original-thread" } } } : method === "turn/start"
+        ? { result: { turn: { id: "turn" } } } : { result: {} });
+    const outcome = harness.runTurn("session", "message", "test").catch((error: Error) => error);
+    await vi.waitFor(() => expect(methods).toContain("turn/start"));
+    const persistenceFailure = () => { throw new Error("fixture persistence unavailable"); };
+    if (persistent) store.updateAgentMessage.mockImplementation(persistenceFailure);
+    else store.updateAgentMessage.mockImplementationOnce(persistenceFailure);
+    let escaped: unknown;
+    try { child.stdout.write(`${JSON.stringify({ method: "item/agentMessage/delta", params: { delta: "x".repeat(80) } })}\n`); }
+    catch (error) { escaped = error; }
+    if (escaped) await harness.close();
+    else {
+      child.stdout.write(`${JSON.stringify({ method: "item/agentMessage/delta", params: { delta: "later output" } })}\n`);
+      child.stdout.write(`${JSON.stringify({ method: "turn/completed", params: { turn: { id: "turn", status: "completed" } } })}\n`);
+    }
+    const result = await outcome;
+    expect(escaped).toBeUndefined();
+    expect((result as Error).message).toContain("fixture persistence unavailable");
+    expect(store.updateAgentMessage).toHaveBeenCalledWith("message", expect.objectContaining({ status: "failed" }));
+    expect(mcp.close).toHaveBeenCalledOnce();
+    expect(child.kill).toHaveBeenCalled();
+    expect(store.updateAgentMessage).not.toHaveBeenCalledWith("message", expect.objectContaining({ status: "completed" }));
+    expect(harness.isRunning("session")).toBe(false);
+    await harness.close();
+  });
+  it("throttles full-text writes after 64 characters and flushes the final ordered output", async () => {
+    const { harness, store } = harnessFixture();
+    const { child, methods } = fakeChild((method) => method === "thread/resume"
+      ? { result: { thread: { id: "original-thread" } } } : method === "turn/start"
+        ? { result: { turn: { id: "turn" } } } : { result: {} });
+    const run = harness.runTurn("session", "message", "test");
+    await vi.waitFor(() => expect(methods).toContain("turn/start"));
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000000);
+    store.updateAgentMessage.mockClear();
+    const delta = (text: string) => child.stdout.write(`${JSON.stringify({ method: "item/agentMessage/delta", params: { delta: text } })}\n`);
+    delta("a".repeat(80)); delta("b"); delta("c");
+    const burstWrites = store.updateAgentMessage.mock.calls.length;
+    now.mockReturnValue(1000300); delta("d");
+    const timedWrites = store.updateAgentMessage.mock.calls.length;
+    delta("e");
+    child.stdout.write(`${JSON.stringify({ method: "turn/completed", params: { turn: { id: "turn", status: "completed" } } })}\n`);
+    const result = await run;
+    expect(burstWrites).toBe(1);
+    expect(timedWrites).toBe(2);
+    expect(result.message.content).toBe("a".repeat(80) + "bcde");
+    expect(store.updateAgentMessage).toHaveBeenLastCalledWith("message", { content: "a".repeat(80) + "bcde", status: "completed" });
+    await harness.close();
+  });
+
   it("surfaces resume failures without starting another thread or losing the original identity", async () => {
     const { store, session, harness, mcp } = harnessFixture();
     const { methods } = fakeChild((method) => method === "thread/resume" ? { error: { message: "temporary provider outage" } } : { result: {} });

@@ -287,7 +287,9 @@ export class CodexHarness {
     const turnDone = new Promise<Record<string, unknown>>((resolve, reject) => { finishTurn = resolve; failTurn = reject; });
     // RPC setup can fail before turnDone is awaited. Always observe its rejection.
     void turnDone.catch(() => {});
+    let transportFailure: Error | undefined;
     const failPending = (error: Error): void => {
+      transportFailure ??= error;
       failTurn?.(error);
       for (const waiter of pending.values()) waiter.reject(error);
       pending.clear();
@@ -304,6 +306,7 @@ export class CodexHarness {
     };
     const request = (method: string, params: Record<string, unknown>): Promise<unknown> => {
       controller.signal.throwIfAborted();
+      if (transportFailure) throw transportFailure;
       const id = nextRequestId++;
       return new Promise((resolve, reject) => {
         pending.set(id, { resolve, reject });
@@ -312,9 +315,20 @@ export class CodexHarness {
     };
     const persistOutput = (force = false): void => {
       const now = Date.now();
-      if (!force && output.length < 64 && now - lastPersistAt < 300) return;
+      // Persist at most once per 300ms, regardless of accumulated text size.
+      // Completion explicitly flushes the complete, ordered output.
+      if (!force && now - lastPersistAt < 300) return;
       lastPersistAt = now;
       this.store.updateAgentMessage(assistantMessageId, { content: output, status: "running" });
+    };
+    const persistStreamOutput = (force = false): void => {
+      try {
+        persistOutput(force);
+      } catch (cause) {
+        // readline callbacks run outside runTurn's async try/catch. Fail this
+        // run so its existing failure persistence and resource cleanup execute.
+        failPending(cause instanceof Error ? cause : new Error(String(cause)));
+      }
     };
     const answerServerRequest = async (message: JsonRpcMessage): Promise<void> => {
       if (message.id === undefined || !message.method) return;
@@ -357,6 +371,7 @@ export class CodexHarness {
     const serverRequests = new Set<Promise<void>>();
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => {
+      if (transportFailure) return;
       let message: JsonRpcMessage;
       try { message = JSON.parse(line) as JsonRpcMessage; } catch { return; }
       if (message.id !== undefined && ("result" in message || message.error)) {
@@ -378,7 +393,7 @@ export class CodexHarness {
       if (message.method === "item/agentMessage/delta") {
         const delta = typeof message.params?.delta === "string" ? message.params.delta : "";
         output += delta;
-        persistOutput();
+        persistStreamOutput();
         return;
       }
       if (message.method === "item/completed") {
@@ -386,7 +401,7 @@ export class CodexHarness {
         if (item?.type !== "agentMessage" || typeof item.text !== "string" || !item.text) return;
         if (!output) output = item.text;
         else if (item.text.startsWith(output)) output = item.text;
-        persistOutput(true);
+        persistStreamOutput(true);
         return;
       }
       if (message.method === "turn/completed") {
@@ -404,6 +419,7 @@ export class CodexHarness {
       }
     });
     child.stderr.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString("utf8")}`.slice(-4000); });
+    child.stdin.on("error", (error) => failPending(error));
     child.on("error", (error) => failPending(error));
     child.on("exit", (code) => {
       failPending(new Error(stderr.trim() || `Codex app-server 已退出（code ${code ?? "unknown"}）`));
@@ -480,6 +496,7 @@ export class CodexHarness {
       expectedTurnId = turn?.id ?? "";
       if (!expectedTurnId) throw new Error("Codex app-server 未返回 turn id");
       const finalTurn = completedTurn ?? await turnDone;
+      if (transportFailure) throw transportFailure;
       const status = typeof finalTurn.status === "string" ? finalTurn.status : "failed";
       if (status !== "completed") {
         const error = finalTurn.error as { message?: string } | undefined;

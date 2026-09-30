@@ -1,3 +1,4 @@
+import { agentRunFailureLogFields } from "./agentRunDiagnostics.js";
 import type { CodexDesignRuntime } from "./codexDesignRuntime.js";
 import { designContractSchema, requirementsBaselineSchema } from "../shared/designContract.js";
 import { DesignContractError, validateProjectDesignContract } from "./designContractValidation.js";
@@ -907,7 +908,11 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const contextPrompt = pageContext
       ? `${body.content}\n\n[AG-UI STATE_SNAPSHOT：当前前端上下文]\n${JSON.stringify(pageContext, null, 2)}\n注意：entityRefs 仅用于定位，权威数据必须通过 MCP 读取；visibleContent 是当前前端可见内容，可能包含未保存草稿；draft 标记未保存状态，二者都不得当作已持久化事实。`
       : body.content;
-    void harness.runTurn(id, assistantMessage.id, contextPrompt).catch(() => { /* 失败状态由 harness 持久化 */ });
+    void harness.runTurn(id, assistantMessage.id, contextPrompt).catch((error: unknown) => {
+      // Persistence itself can fail: keep a diagnostic even when the failed
+      // session/message state could not be written to the database.
+      request.log.error(agentRunFailureLogFields(error, id), "Agent turn failed");
+    });
     audit(store, request.body as ActorHint, {
       projectId: session.projectId, entityType: "agentMessage", entityId: userMessage.id,
       action: "send", before: null, after: { sessionId: id, pageContextIncluded: Boolean(pageContext), contextId: pageContext?.contextId },
