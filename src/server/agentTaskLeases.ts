@@ -2701,7 +2701,10 @@ function controlSingleLease(
       `).run({ now, projectId: lease.projectId, workerId: lease.workerId });
     }
     if (row.coordination_dispatch_id && store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_child_task_dispatches'").get()) {
-      const dispatchStatus = operation === "start" ? "running" : operation === "complete" ? "completed" : operation === "release" || operation === "fail" ? "reclaimed" : "claimed";
+      // Project the resulting lease state: heartbeats must not demote running
+      // children, and formal design-gap releases must not leave active dispatches.
+      const dispatchStatus = lease.status === "running" ? "running" : lease.status === "completed" ? "completed"
+        : lease.status === "released" || lease.status === "failed" ? "reclaimed" : "claimed";
       store.db.prepare("UPDATE agent_child_task_dispatches SET status=?, updated_at=? WHERE dispatch_id=? AND status IN ('dispatched','claimed','running')")
         .run(dispatchStatus, now, row.coordination_dispatch_id);
       if (operation === "complete") {

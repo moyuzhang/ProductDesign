@@ -49,3 +49,13 @@ ProductDesign 先通过现有 `POST /api/projects` / `create_product_design_proj
 第一阶段验证命令：`npm run verify`（完整 Vitest + Web/Server 类型检查 + Vite/Server 构建），结果 85 个测试文件、700 通过、1 跳过。新增三组回归共 48 项通过。新测试文件另经严格 TypeScript 检查。构建仅有既有大资源块提示；未执行部署或真实外部 Runner 端到端连接。
 
 可靠派发阶段新增 65 项回归：54 项协调租约用例与 11 项 REST/MCP/并发用例。最终 `npm run verify` 通过：86 个测试文件、765 通过、1 跳过；两份改动测试文件另经严格 TypeScript 检查。并发覆盖使用同一临时 SQLite 数据库的两个独立 Node 进程和启动屏障，验证 dispatch/reassign 的相同请求与冲突请求。没有部署或真实外部 Harness 端到端连接；构建仍只有既有大资源块提示。
+
+### 合成外部 Harness 生命周期回归
+
+`externalHarnessLifecycle.test.ts` 把此前分开的协议步骤串联：一次性 SQLite 中的已批准历史夹具 → 已存在项目的 HTTP 外部源码绑定 → HTTP 合成身份登记与 challenge/response 认证 → 有效父协调租约 → 带固定键的派发/重放 → HTTP 或外部 MCP 子任务领取 → MCP 开工、心跳 → 新 MCP 连接与刷新认证后的原工单重连 → 正式设计缺口报告 → 独立审批队列。另覆盖父租约取消、子任务改派、原子派发回收、晚到心跳与重连拒绝、资源锁释放；拒绝晚到操作后再次验证终态没有复活。
+
+HTTP 使用随机端口的真实 loopback listener；MCP 使用 SDK 的内存 JSON-RPC transport，未以 trustedInternal 放宽子任务调用。预先批准的文档、节点和计划仅为明确标注的测试夹具，运行生命周期开始后不再直接写 Store/SQLite。测试不会启动编码进程、生成实现或冒充测试证据；它验证正式阻塞送审分支，未验证成功实现、独立审计和最终验收。心跳必须保留运行中的派发状态；正式缺口释放必须同步回收派发。
+
+这仍不是外部 Codex 端到端验收。真实 Harness 还需在用户授权的外部执行环境中核实源码与独立工作区，启动并监督子进程，执行实际开发与测试，按既有协议提交真实修订和证据，并走完独立审计与批准；还需验证进程退出、网络断线和凭据生命周期。合成 workspacePath/baselineRevision 只验证声明的协议传递，不能证明远端工作区存在或源码正确。外部证据修复仍受 `EXTERNAL_REPAIR_VERIFIER_REQUIRED` 限制。
+
+该生命周期阶段验证：新增 3 项回归全部通过；最终 `npm run verify` 为 87 个测试文件、784 通过、1 跳过，Web/Server 类型检查与构建通过。新测试文件另经严格 TypeScript 检查，独立审查无阻断项，并复跑协调租约、可靠派发和外部工作区传输既有 107 项回归。构建保留既有大资源块提示；无部署或真实外部 Codex 执行。
