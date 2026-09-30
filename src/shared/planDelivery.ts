@@ -37,6 +37,7 @@ export const PLAN_LIFECYCLE_LABELS: Record<PlanLifecycleStatus, string> = {
   pending_manager: "待主 Agent 验收",
   accepted: "交付已验收",
   rework: "计划待修订",
+  superseded: "已由后续计划取代",
 };
 
 export const PLAN_DELIVERY_STEPS = [
@@ -60,6 +61,7 @@ const LIFECYCLE_STEP: Record<PlanLifecycleStatus, number> = {
   audit_failed: 5,
   pending_manager: 6,
   accepted: 7,
+  superseded: 7,
 };
 
 export function planLifecycleStep(status: PlanLifecycleStatus): number {
@@ -106,6 +108,7 @@ export function planDeliveryActions(plan: Pick<PlanItem, "lifecycleStatus" | "su
         { action: "reject_acceptance", label: "拒绝验收", actorRole: "approver", tone: "danger", requiresReason: true },
       ];
     case "accepted":
+    case "superseded":
       return [];
   }
 }

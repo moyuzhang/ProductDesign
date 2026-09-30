@@ -8,6 +8,10 @@ export function isExecutableDeliveryPlan(plan: Pick<PlanItem, "kind">): boolean 
   return EXECUTABLE_PLAN_KINDS.has(plan.kind);
 }
 
+export function isActiveDeliveryPlan(plan: Pick<PlanItem, "kind" | "lifecycleStatus">): boolean {
+  return isExecutableDeliveryPlan(plan) && plan.lifecycleStatus !== "superseded";
+}
+
 export interface DependencyEditDecision {
   allowed: boolean;
   lifecyclePatch: Partial<PlanItem>;

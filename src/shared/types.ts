@@ -20,6 +20,7 @@ export const PLAN_LIFECYCLE_STATUSES = [
   "pending_manager",
   "accepted",
   "rework",
+  "superseded",
 ] as const;
 export const PLAN_AUDIT_STATUSES = ["not_requested", "pending", "passed", "failed"] as const;
 export const MANAGER_DECISIONS = ["pending", "approved", "rejected"] as const;
@@ -1276,6 +1277,7 @@ export interface AgentOrchestration {
   agentSecurityPolicyVersion: string;
   project: Project;
   workingDirectory: AgentWorkingDirectory;
+  coordinationReadiness?: { ready: boolean; issue: string };
   workflow: ProjectWorkflow;
   recommendedAgents: AgentBlueprint[];
   queues: Record<AgentOrchestrationQueueKey, AgentOrchestrationTask[]>;

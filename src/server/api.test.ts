@@ -29,6 +29,67 @@ afterAll(async () => {
 describe("REST API", () => {
   let projectId = "";
 
+  it("does not let a new project brief skip independent audit and Main Agent approval", async () => {
+    const created = await app.inject({ method: "POST", url: "/api/projects", payload: {
+      code: "REST-BRIEF-GATE", name: "简报审批门禁", summary: "目标与范围",
+    } });
+    const id = created.json().id as string;
+    const approved = await app.inject({ method: "POST", url: "/api/design-docs", payload: {
+      projectId: id, category: "需求文档", title: "项目简报", status: "已批准", content: "直接批准",
+      references: [{ targetType: "project", targetId: id, relationType: "defines" }],
+    } });
+    expect(approved.statusCode).toBe(409);
+    const draft = await app.inject({ method: "POST", url: "/api/design-docs", payload: {
+      projectId: id, category: "需求文档", title: "项目简报", summary: "目标与范围",
+      status: "评审中", content: "目标、范围、约束、成功标准",
+      references: [{ targetType: "project", targetId: id, relationType: "defines" }],
+    } });
+    expect(draft.statusCode).toBe(200);
+    const bypass = await app.inject({ method: "PATCH", url: `/api/design-docs/${draft.json().id}`, payload: { status: "已批准" } });
+    expect(bypass.statusCode).toBe(409);
+  });
+
+  it("does not let REST bypass a pending requirement revision work order", async () => {
+    const created = await app.inject({ method: "POST", url: "/api/projects", payload: { code: "REST-REQ-GATE", name: "需求修订门禁" } });
+    const projectId = created.json().id as string;
+    const fixtureStore = new Store(dbPath, dataDir);
+    const main = fixtureStore.insertDiagram({ projectId, title: "Profile 子画布", type: "functional", nodes: [], edges: [] });
+    const node = { id: "rest-pending-requirement", kind: "feature", label: "待修订需求", description: "旧说明",
+      owner: "designer", acceptanceCriteria: "旧标准", requirementStatus: "草拟中", designStatus: "进行中",
+      developmentStatus: "未开发", acceptanceStatus: "未验收", blockedReason: "设计变更处理中 · 00000000-0000-4000-8000-000000000093",
+      x: 100, y: 100 };
+    fixtureStore.updateDiagram(main.id, { nodes: [...main.nodes, node] });
+    fixtureStore.close();
+    for (const change of [{ acceptanceCriteria: "绕过标准" }, { requirementStatus: "已批准" }, { blockedReason: "" }, { kind: "note" }]) {
+      const bypass = await app.inject({ method: "PATCH", url: `/api/diagrams/${main.id}`, payload: {
+        nodes: [...main.nodes, { ...node, ...change }],
+      } });
+      expect(bypass.statusCode, bypass.body).toBe(409);
+      expect(bypass.json().code).toBe("NODE_REQUIREMENT_REVISION_REQUIRED");
+    }
+    for (const type of ["flow", "free"]) {
+      const migrated = await app.inject({ method: "PATCH", url: `/api/diagrams/${main.id}`, payload: { type } });
+      expect(migrated.statusCode, migrated.body).toBe(409);
+      expect(migrated.json().code).toBe("NODE_REQUIREMENT_REVISION_REQUIRED");
+    }
+    const forged = await app.inject({ method: "PATCH", url: `/api/diagrams/${main.id}`, payload: {
+      nodes: [...main.nodes, { ...node, description: "伪造工单" }], workOrderId: "fake", leaseToken: "fake",
+      taskKey: "fake", taskRevision: "fake", agentId: "designer", workerId: "fake",
+    } });
+    expect(forged.statusCode).toBe(409);
+    const removed = await app.inject({ method: "PATCH", url: `/api/diagrams/${main.id}`, payload: { nodes: main.nodes } });
+    expect(removed.statusCode).toBe(409);
+    const deleted = await app.inject({ method: "DELETE", url: `/api/diagrams/${main.id}` });
+    expect(deleted.statusCode).toBe(409);
+    expect(deleted.json().code).toBe("NODE_REQUIREMENT_REVISION_REQUIRED");
+    const concurrent = await Promise.all(["a", "b"].map((id) => app.inject({ method: "PATCH",
+      url: `/api/diagrams/${main.id}`, payload: { nodes: [...main.nodes, { ...node, acceptanceCriteria: id }] },
+    })));
+    expect(concurrent.map((response) => response.statusCode)).toEqual([409, 409]);
+    const title = await app.inject({ method: "PATCH", url: `/api/diagrams/${main.id}`, payload: { title: "允许的标题更新" } });
+    expect(title.statusCode, title.body).toBe(200);
+  });
+
   it("health check responds ok", async () => {
     const res = await app.inject({ method: "GET", url: "/api/health" });
     expect(res.statusCode).toBe(200);
@@ -50,14 +111,14 @@ describe("REST API", () => {
       method: "PATCH", url: `/api/projects/${restProjectId}`, payload: { repositoryPath: dataDir },
     });
     expect(configured.statusCode, configured.body).toBe(200);
-    const brief = await app.inject({
-      method: "POST", url: "/api/design-docs", payload: {
-        projectId: restProjectId, category: "需求文档", title: "项目简报", summary: "", status: "已批准",
-        version: "1.0", author: "manager", content: "无计划设计任务 REST 合同",
-        references: [{ targetType: "project", targetId: restProjectId, relationType: "defines" }],
-      },
+    const fixtureStore = new Store(dbPath, dataDir);
+    const brief = fixtureStore.insertDesignDoc({
+      projectId: restProjectId, category: "需求文档", title: "项目简报", summary: "", status: "已批准",
+      version: "1.0", author: "manager", content: "无计划设计任务 REST 合同",
     });
-    expect(brief.statusCode, brief.body).toBe(200);
+    fixtureStore.insertDocumentReference({ projectId: restProjectId, documentId: brief.id,
+      targetType: "project", targetId: restProjectId, relationType: "defines" });
+    fixtureStore.close();
     const diagrams = await app.inject({ method: "GET", url: `/api/diagrams?projectId=${restProjectId}` });
     const main = diagrams.json().find((item: { type: string }) => item.type === "main");
     const nodeId = "rest-preplan-design";
@@ -249,7 +310,7 @@ describe("REST API", () => {
     });
     const foreignDocument = await app.inject({
       method: "POST", url: "/api/design-docs",
-      payload: { projectId: foreignProjectId, category: "功能说明", title: "外部设计", summary: "", status: "已批准", version: "1.0", author: "designer", content: "外部设计", references: [{ targetType: "project", targetId: foreignProjectId, relationType: "defines" }] },
+      payload: { projectId: foreignProjectId, category: "功能说明", title: "外部设计", summary: "", status: "已批准", version: "1.0", author: "designer", content: "外部设计", references: [{ targetType: "project", targetId: foreignProjectId, relationType: "references" }] },
     });
     const plan = await app.inject({ method: "POST", url: "/api/plans", payload: { projectId: contractProjectId, diagramId: main.id, diagramNodeId: "rest-change-node", kind: "task", title: "REST 变更计划" } });
     const otherPlan = await app.inject({ method: "POST", url: "/api/plans", payload: { projectId: contractProjectId, diagramId: main.id, diagramNodeId: "rest-other-node", kind: "task", title: "REST 其他计划" } });
@@ -387,6 +448,12 @@ describe("REST API", () => {
   });
 
   it("keeps documents project-owned and references immutable revisions", async () => {
+    const fixtureStore = new Store(dbPath, dataDir);
+    const brief = fixtureStore.insertDesignDoc({ projectId, category: "需求文档", title: "既有项目简报",
+      summary: "已批准基线", status: "已批准", version: "v1.0", author: "manager", content: "既有项目范围" });
+    fixtureStore.insertDocumentReference({ projectId, documentId: brief.id, targetType: "project",
+      targetId: projectId, relationType: "defines" });
+    fixtureStore.close();
     const created = await app.inject({
       method: "POST",
       url: "/api/design-docs",

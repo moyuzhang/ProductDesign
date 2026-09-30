@@ -16,12 +16,13 @@ import type {
   RequirementStatus,
 } from "../shared/types.js";
 import { PROJECT_WORKFLOW_POLICY } from "../shared/workflowPolicy.js";
-import { isExecutableDeliveryPlan } from "./planPolicy.js";
+import { isActiveDeliveryPlan } from "./planPolicy.js";
 import { analyzePlanLayers, isDesignPhaseAction } from "./planLayers.js";
 import type { ProjectWorkspaceReadData, Store } from "./db.js";
 import { matchesImplementationEvidencePolicy } from "./evidencePolicy.js";
 import { deriveEvidenceRepairState, getEvidenceRepairState } from "./evidenceRepair.js";
 import { getDesignGap } from "./designGap.js";
+import { hasRequirementChangeMarker, pendingRequirementRevision, requirementChangeSource } from "./nodeRequirementRevision.js";
 
 /**
  * Batch-loaded per-project data keyed so per-node inspection can avoid N+1 queries.
@@ -209,7 +210,7 @@ export function inspectNodeWorkflow(store: Store, diagram: Diagram, node: Diagra
   const plans = (bundle
     ? (bundle.plansByNode.get(nodeKey(diagram.id, node.id)) ?? [])
     : store.listPlans(diagram.projectId, diagram.id, node.id))
-    .filter(isExecutableDeliveryPlan);
+    .filter(isActiveDeliveryPlan);
   const deliveryPlans = plans.filter((plan) => ["legacy", "approved", "in_progress", "pending_audit", "audit_failed", "pending_manager", "accepted"].includes(plan.lifecycleStatus));
   const pendingApprovalPlan = plans.find((plan) => plan.lifecycleStatus === "pending_approval");
   const pendingDesignAuditPlan = plans.find((plan) => plan.lifecycleStatus === "pending_approval" && plan.auditStatus !== "passed");
@@ -297,6 +298,11 @@ export function inspectNodeWorkflow(store: Store, diagram: Diagram, node: Diagra
     missing.unshift(designGap.reason);
     nextAction = action("request_design_change", `处理节点“${node.label}”的开工前设计缺口`, designGap.reason,
       "plan", nodeHref(diagram.id, node.id, "development"), { ...ids, entityId: designGapPlan.id });
+  } else if (hasRequirementChangeMarker(node) && !requirementChangeSource(store, diagram, node)
+    && requirementStatus !== "已批准") {
+    nextAction = action("resolve_node_blocker", `核对节点“${node.label}”的设计变更来源`, "设计变更标记缺少同项目正式请求及有效需求影响裁决；须走正式变更流程。", "node", nodeHref(diagram.id, node.id, "delivery"), ids);
+  } else if (pendingRequirementRevision(store, diagram, node)) {
+    nextAction = action("revise_node_requirement", `修订节点“${node.label}”的需求`, "由 Designer 修正当前变更涉及的节点需求与验收标准，完成后再交独立批准。", "node", nodeHref(diagram.id, node.id, "overview"), ids);
   } else if (!descriptionReady || !ownerReady || !criteriaReady) {
     nextAction = action("complete_node_definition", `补全节点“${node.label}”`, "填写功能边界、负责人和可验证的验收标准。", "node", nodeHref(diagram.id, node.id, "overview"), ids);
   } else if (!requirementReady) {
@@ -437,7 +443,7 @@ export function buildProjectWorkflow(store: Store, projectId: string, input: Wor
   });
   const nodes = nodeInspections.map((inspection) => {
     const state = inspection.state;
-    const plans = (bundle.plansByNode.get(nodeKey(state.diagramId, state.nodeId)) ?? []).filter(isExecutableDeliveryPlan);
+    const plans = (bundle.plansByNode.get(nodeKey(state.diagramId, state.nodeId)) ?? []).filter(isActiveDeliveryPlan);
     const actionPlan = state.nextAction?.entityType === "plan" && state.nextAction.entityId
       ? plans.find((plan) => plan.id === state.nextAction?.entityId)
       : undefined;

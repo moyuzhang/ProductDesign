@@ -15,6 +15,7 @@ import type {
   AgentTaskPackage,
   AgentOrchestrationQueueKey,
   Paginated,
+  DiagramNode,
 } from "../shared/types.js";
 import { normalizeAgentId } from "../shared/planRoles.js";
 import {
@@ -26,6 +27,7 @@ import { buildAgentOrchestration } from "./orchestration.js";
 import {
   AgentSecurityError,
   assertAgentWorkOrderContext,
+  assertLocalAgentIdentityAudience,
   isAgentSecurityEnforced,
   resolveAuthPrincipal,
   type WorkOrderContextInput,
@@ -38,9 +40,12 @@ import {
   openEvidenceRepairState,
 } from "./evidenceRepair.js";
 import { matchesImplementationEvidencePolicy } from "./evidencePolicy.js";
-import { isExecutableDeliveryPlan } from "./planPolicy.js";
+import { isActiveDeliveryPlan, isExecutableDeliveryPlan } from "./planPolicy.js";
 import { getAgentTaskAssignmentGeneration } from "./agentTaskReassignment.js";
 import { assertNoDesignGap, developmentTaskRevision, getDesignGap } from "./designGap.js";
+import { isRequirementDeliveryNode, pendingRequirementRevision, requirementChangeSource, requirementFields } from "./nodeRequirementRevision.js";
+import { isProjectBriefTask, projectBriefProgress } from "./projectBrief.js";
+import { staleDesignChangeIntentsForGovernancePath } from "./designChangeIntent.js";
 
 const DEFAULT_LEASE_SECONDS = 1_800;
 const MIN_LEASE_SECONDS = 15;
@@ -319,6 +324,23 @@ function withoutToken(lease: AgentTaskLease): Omit<AgentTaskLease, "leaseToken">
 }
 
 function revisionForTask(store: Store, task: AgentOrchestrationTask): string {
+  if (task.actionCode === "add_function_node") {
+    return `add_function_node:${task.documentRevisionIds[0]}:${task.diagramId}`;
+  }
+  if (isProjectBriefTask(task.actionCode)) {
+    const brief = projectBriefProgress(store, task.projectId);
+    const revisionId = brief.revisionId || "initial";
+    const retry = brief.evidence?.resultStatus === "fail" ? brief.evidence.id
+      : brief.approval?.result_digest.startsWith("rejected:") ? brief.approval.id : "";
+    return task.actionCode === "prepare_project_brief"
+      ? `prepare_project_brief:${revisionId}:${retry}`
+      : `${task.actionCode}:${revisionId}`;
+  }
+  if (task.actionCode === "revise_node_requirement" && task.diagramId && task.nodeId) {
+    const diagram = store.getDiagram(task.diagramId);
+    const node = diagram?.nodes.find((item) => item.id === task.nodeId);
+    return `revise_node_requirement:${diagram && node ? pendingRequirementRevision(store, diagram, node) : ""}`;
+  }
   if (task.planItemId) {
     const plan = store.getPlan(task.planItemId);
     if (!plan) return "0";
@@ -362,7 +384,9 @@ function revisionForTask(store: Store, task: AgentOrchestrationTask): string {
       const node = store.getDiagram(task.diagramId || "")?.nodes.find((item) => item.id === task.nodeId);
       return `${task.actionCode}:${createHash("sha256").update(JSON.stringify([
         node?.description?.trim() || "", node?.owner?.trim() || "",
-        node?.acceptanceCriteria?.trim() || "", node?.requirementStatus || "",
+        node?.acceptanceCriteria?.trim() || "", node?.preconditions?.trim() || "",
+        node?.mainFlow?.trim() || "", node?.alternateFlow?.trim() || "",
+        node?.postconditions?.trim() || "", node?.requirementStatus || "",
       ])).digest("hex")}`;
     }
     const currentRevisionIds = store.listDocumentReferences({
@@ -425,6 +449,10 @@ function normalizeLeaseSeconds(seconds: number | undefined): number {
 
 function requestHash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function requirementBaseline(node: DiagramNode): string {
+  return requestHash(requirementFields.map((field) => node[field] ?? ""));
 }
 
 function evidenceRepairStartPayload(input: Partial<StartInput>): Record<string, unknown> {
@@ -750,7 +778,7 @@ export function expireStaleAgentTasks(store: Store, projectId?: string): number 
   const rows = store.db.prepare(`
     SELECT l.* FROM agent_task_leases l
     WHERE l.status IN ('claimed', 'running') AND (l.lease_expires_at <= @now OR
-      EXISTS (SELECT 1 FROM agent_runner_registrations r WHERE r.project_id=l.project_id AND lower(r.worker_id)=lower(l.worker_id) AND r.status='stale' AND r.last_seen_at <= @staleAt) OR
+      EXISTS (SELECT 1 FROM agent_runner_registrations r WHERE r.project_id=l.project_id AND r.worker_id=l.worker_id AND r.status='stale' AND r.last_seen_at <= @staleAt) OR
       (approval_group_id <> '' AND approval_group_id IN (SELECT approval_group_id FROM agent_task_leases
         WHERE status IN ('claimed', 'running') AND lease_expires_at <= @now)))
       ${projectId ? "AND l.project_id = @projectId" : ""}
@@ -780,6 +808,12 @@ export function expireStaleAgentTasks(store: Store, projectId?: string): number 
       status: row.status, leaseExpiresAt: row.lease_expires_at,
     });
   }
+  store.db.prepare(`DELETE FROM agent_task_resource_locks
+    WHERE ${projectId ? "project_id=@projectId AND " : ""}NOT EXISTS (
+      SELECT 1 FROM agent_task_leases l WHERE l.lease_token=agent_task_resource_locks.lease_token
+        AND l.project_id=agent_task_resource_locks.project_id
+        AND l.status IN ('claimed','running') AND l.lease_expires_at>@now
+    )`).run({ now, ...(projectId ? { projectId } : {}) });
   return rows.length;
   }).immediate();
 }
@@ -1021,6 +1055,15 @@ export function decorateAgentOrchestrationWithLeases(store: Store, orchestration
     roleActive[lease.role] += 1;
   }
   const active = roleActive.designer + roleActive.builder + roleActive.auditor + roleActive.approver;
+  const mainAgentCredentials = store.db.prepare(`SELECT allowed_roles_json, allowed_projects_json
+    FROM agent_credentials WHERE lower(agent_id)='main agent' AND status='active' AND expires_at>?`)
+    .all(now) as Array<{ allowed_roles_json: string; allowed_projects_json: string }>;
+  const coordinationReady = mainAgentCredentials.some((credential) => {
+    try {
+      return (JSON.parse(credential.allowed_roles_json) as string[]).includes("approver")
+        && (JSON.parse(credential.allowed_projects_json) as string[]).includes(orchestration.project.id);
+    } catch { return false; }
+  });
   const leaseSummary: AgentTaskLeaseSummary = {
     available: claimableTasks.filter((task) => task.available).length,
     claimed: count("claimed"), running: count("running"), completed: count("completed"),
@@ -1055,6 +1098,8 @@ export function decorateAgentOrchestrationWithLeases(store: Store, orchestration
   };
   return {
     ...orchestration,
+    coordinationReadiness: { ready: coordinationReady,
+      issue: coordinationReady ? "" : "缺少当前项目有效的 Main Agent Approver 凭据；管理员须通过受保护的凭据登记完成配置，不能绕过认证" },
     schemaVersion: "1.3",
     queueCounts: {
       design: orchestration.queues.design.length,
@@ -1289,6 +1334,7 @@ export function claimAgentTask(
   orchestration?: AgentOrchestration,
 ): AgentTaskLease {
   ensureAgentTaskLeaseSchema(store);
+  assertLocalAgentIdentityAudience(store, input.agentId, input.workerId ?? "");
   return store.db.transaction(() => {
     const hash = requestHash(input);
     const cached = cachedResponse<AgentTaskLease>(store, "claim_group", input.idempotencyKey, hash);
@@ -1658,6 +1704,7 @@ export function requiredLeaseRoleForPlanAction(action: string): AgentBlueprintKe
 
 function expectedAuditScope(row: LeaseRow): AgentAuditScope | null {
   if (row.role !== "auditor") return null;
+  if (row.action_code === "audit_project_brief") return "design";
   if (row.action_code === "audit_design") return "design";
   if (row.action_code === "audit_completed_plan") return "implementation";
   return null;
@@ -1669,26 +1716,30 @@ function assertIndependentAuditWorker(store: Store, row: LeaseRow): void {
   const planId = row.task_id.slice(row.task_id.indexOf(":") + 1);
   const producerTaskId = `${scope === "design" ? "design" : "development"}:${planId}`;
   const producer = store.db.prepare(`
-    SELECT worker_id FROM agent_task_leases
+    SELECT worker_id, agent_id FROM agent_task_leases
     WHERE project_id=? AND task_id=? AND status='completed'
     ORDER BY completed_at DESC, updated_at DESC LIMIT 1
-  `).get(row.project_id, producerTaskId) as { worker_id: string } | undefined;
-  if (producer?.worker_id && normalizeAgentId(producer.worker_id) === normalizeAgentId(row.worker_id || row.agent_id)) {
-    throw new AgentTaskLeaseError(409, "SELF_AUDIT_FORBIDDEN", "Auditor 的 workerId 必须不同于被审计生产任务的 producerWorkerId");
+  `).get(row.project_id, producerTaskId) as { worker_id: string; agent_id: string } | undefined;
+  if (producer && [producer.worker_id, producer.agent_id].map(normalizeAgentId)
+    .some((id) => [row.worker_id, row.agent_id].map(normalizeAgentId).includes(id))) {
+    throw new AgentTaskLeaseError(409, "SELF_AUDIT_FORBIDDEN", "Auditor 身份必须不同于被审计生产任务");
   }
 }
 
 function assertIndependentApprover(store: Store, row: LeaseRow): void {
   if (row.role !== "approver") return;
-  const planId = row.task_id.slice(row.task_id.indexOf(":") + 1);
-  const plan = store.getPlan(planId);
   const nodeApproval = ["approve_node_requirement", "approve_node_document"].includes(row.action_code);
-  const nodeScope = nodeApproval ? mapLease(row).workScopes.find((scope) => scope.endsWith(`:${planId}`)) : undefined;
-  const scopeDiagramId = nodeScope?.split(":")[1];
-  const plans = nodeApproval && scopeDiagramId
-    ? store.listPlans(row.project_id, scopeDiagramId, planId).filter(isExecutableDeliveryPlan)
+  const queued = nodeApproval ? listClaimableAgentTasks(store, row.project_id)
+    .find((task) => task.taskKey === row.task_key && task.id === row.task_id && task.actionCode === row.action_code) : undefined;
+  if (nodeApproval && (!queued?.diagramId || !queued.nodeId
+    || !mapLease(row).workScopes.includes(`node:${queued.diagramId}:${queued.nodeId}`)))
+    throw new AgentTaskLeaseError(409, "LEASE_TASK_MISMATCH", "节点审批必须绑定当前队列与精确画布节点作用域");
+  const planId = nodeApproval ? queued!.nodeId! : row.task_id.slice(row.task_id.indexOf(":") + 1);
+  const plan = store.getPlan(planId);
+  const plans = nodeApproval && queued?.diagramId
+    ? store.listPlans(row.project_id, queued.diagramId, planId).filter(isActiveDeliveryPlan)
     : row.action_code === "accept_node" && plan?.diagramId && plan.diagramNodeId
-    ? store.listPlans(plan.projectId, plan.diagramId, plan.diagramNodeId).filter(isExecutableDeliveryPlan)
+    ? store.listPlans(plan.projectId, plan.diagramId, plan.diagramNodeId).filter(isActiveDeliveryPlan)
     : plan ? [plan] : [];
   const approverIds = [row.worker_id, row.agent_id].map(normalizeAgentId).filter(Boolean);
   if (plans.some((item) => Object.values(item.roleAssignments).some((assignment) => approverIds.includes(normalizeAgentId(assignment.agentId))))) {
@@ -1696,10 +1747,10 @@ function assertIndependentApprover(store: Store, row: LeaseRow): void {
   }
   const taskIds = (plans.length ? plans.map((item) => item.id) : [planId])
     .flatMap((id) => [`design:${id}`, `development:${id}`, `audit:${id}`]);
-  if (nodeApproval) taskIds.push(`design:${planId}`);
+  if (nodeApproval) taskIds.push(`design:${queued!.id.slice(queued!.id.indexOf(":") + 1)}`);
   const producers = store.db.prepare(`
     SELECT worker_id, agent_id FROM agent_task_leases
-    WHERE project_id=? AND task_id IN (${taskIds.map(() => "?").join(",")}) AND ${nodeApproval ? "role='designer'" : "status='completed'"}
+    WHERE project_id=? AND task_id IN (${taskIds.map(() => "?").join(",")}) ${nodeApproval ? "" : "AND status='completed'"}
   `).all(row.project_id, ...taskIds) as Array<{ worker_id: string; agent_id: string }>;
   if (producers.some((producer) => [producer.worker_id, producer.agent_id].map(normalizeAgentId).some((id) => approverIds.includes(id)))) {
     throw new AgentTaskLeaseError(409, "SELF_APPROVAL_FORBIDDEN", "Approver 身份必须不同于 Designer、Builder 和 Auditor 的生产身份");
@@ -1727,7 +1778,7 @@ function approveNodeRequirementForLease(store: Store, row: LeaseRow, input: Comp
     throw new AgentTaskLeaseError(409, "WORK_ORDER_CONTEXT_INVALID", "节点需求批准必须精确绑定当前工单与修订");
   }
   const queued = listClaimableAgentTasks(store, row.project_id).find((task) => task.taskKey === row.task_key);
-  const nodeId = row.task_id.slice(row.task_id.indexOf(":") + 1);
+  const nodeId = queued?.nodeId ?? "";
   if (!queued || queued.projectId !== row.project_id || queued.id !== row.task_id
     || queued.taskRevision !== row.task_revision || queued.actionCode !== "approve_node_requirement"
     || queued.queue !== "approval" || queued.nodeId !== nodeId || !queued.diagramId) {
@@ -1736,13 +1787,14 @@ function approveNodeRequirementForLease(store: Store, row: LeaseRow, input: Comp
   const diagram = store.getDiagram(queued.diagramId);
   const node = diagram?.nodes.find((item) => item.id === nodeId);
   const scopes = mapLease(row).workScopes;
-  if (!diagram || diagram.projectId !== row.project_id || diagram.type !== "main" || !node
+  if (!diagram || diagram.projectId !== row.project_id || !node || !isRequirementDeliveryNode(diagram, node)
     || !scopes.includes(`node:${diagram.id}:${nodeId}`)) {
     throw new AgentTaskLeaseError(409, "LEASE_TASK_MISMATCH", "节点需求批准必须属于当前项目主画布及工单作用域");
   }
   assertIndependentApprover(store, row);
   if (!node.description?.trim() || !node.owner?.trim() || !node.acceptanceCriteria?.trim()
     || node.requirementStatus === "已批准"
+    || (/^设计变更处理中 · [0-9a-f-]{36}$/i.test(node.blockedReason ?? "") && node.requirementStatus !== "待评审")
     || buildAgentOrchestration(store, row.project_id)?.workflow.nodes.find((item) => item.nodeId === nodeId && item.diagramId === diagram.id)?.nextAction?.code !== "approve_node_requirement") {
     throw new AgentTaskLeaseError(409, "NODE_REQUIREMENT_APPROVAL_INVALID", "节点资料不足、已批准或当前流程动作已变化");
   }
@@ -1758,25 +1810,29 @@ function approveNodeRequirementForLease(store: Store, row: LeaseRow, input: Comp
   });
 }
 
-function approveNodeDocumentsForLease(store: Store, row: LeaseRow, input: CompleteInput, context: AgentTaskLeaseContext): void {
-  if (row.queue !== "approval" || row.role !== "approver" || row.action_code !== "approve_node_document"
+function approveNodeDocumentsForLease(
+  store: Store,
+  row: LeaseRow,
+  input: CompleteInput,
+  context: AgentTaskLeaseContext,
+): void {
+  if (row.role !== "approver" || row.queue !== "approval" || row.action_code !== "approve_node_document"
     || row.status !== "running" || !row.started_at || !input.resultDigest?.trim()) {
     throw new AgentTaskLeaseError(409, "NODE_DOCUMENT_APPROVAL_INVALID", "节点文档批准必须由已开工的独立 Approver 工单提交审核结论");
   }
-  if (input.workOrderId !== row.id || input.taskKey !== row.task_key || input.taskRevision !== row.task_revision
-    || input.workerId !== row.worker_id || input.role !== row.role) {
-    throw new AgentTaskLeaseError(409, "WORK_ORDER_CONTEXT_INVALID", "节点文档批准必须精确绑定当前工单与修订");
-  }
   const queued = listClaimableAgentTasks(store, row.project_id).find((task) => task.taskKey === row.task_key);
-  const nodeId = row.task_id.slice(row.task_id.indexOf(":") + 1);
-  const diagram = queued?.diagramId ? store.getDiagram(queued.diagramId) : undefined;
-  if (!queued || queued.projectId !== row.project_id || queued.id !== row.task_id
-    || queued.taskRevision !== row.task_revision || queued.actionCode !== "approve_node_document"
-    || queued.queue !== "approval" || queued.nodeId !== nodeId || !diagram
-    || diagram.projectId !== row.project_id || diagram.type !== "main"
-    || !diagram.nodes.some((node) => node.id === nodeId)
-    || !mapLease(row).workScopes.includes(`node:${diagram.id}:${nodeId}`)) {
-    throw new AgentTaskLeaseError(409, "TASK_REVISION_DRIFT", "节点文档审批工单已离开队列、修订已变化或节点不在工单范围");
+  if (!queued || queued.taskRevision !== row.task_revision || queued.id !== row.task_id
+    || queued.actionCode !== "approve_node_document") {
+    throw new AgentTaskLeaseError(409, "TASK_REVISION_DRIFT", "节点文档审批工单已离开队列或修订已变化");
+  }
+  const nodeId = queued.nodeId;
+  if (!queued.diagramId || !nodeId) {
+    throw new AgentTaskLeaseError(409, "LEASE_TASK_MISMATCH", "节点文档审批必须绑定精确画布节点");
+  }
+  let workScopes: string[] = [];
+  try { workScopes = JSON.parse(row.work_scopes_json || "[]") as string[]; } catch { workScopes = []; }
+  if (!workScopes.includes(`node:${queued.diagramId}:${nodeId}`)) {
+    throw new AgentTaskLeaseError(409, "LEASE_TASK_MISMATCH", "节点文档审批只能更新当前工单作用域内的节点引用");
   }
   assertIndependentApprover(store, row);
 
@@ -1786,22 +1842,26 @@ function approveNodeDocumentsForLease(store: Store, row: LeaseRow, input: Comple
     if (!document || document.projectId !== row.project_id) {
       throw new AgentTaskLeaseError(409, "DOCUMENT_SCOPE_INVALID", "节点文档引用缺失或跨项目，拒绝审批");
     }
-    return reference.documentRevisionId !== document.currentRevisionId || document.status !== "已批准"
+    const revision = store.getDocumentRevision(document.currentRevisionId);
+    return reference.documentRevisionId !== document.currentRevisionId || revision?.status !== "已批准"
       ? [document.id] : [];
   }));
-  if (!pendingDocumentIds.size) throw new AgentTaskLeaseError(409, "TASK_REVISION_DRIFT", "节点已不存在待批准或待固定的文档修订");
+  if (pendingDocumentIds.size === 0) {
+    throw new AgentTaskLeaseError(409, "TASK_REVISION_DRIFT", "节点已不存在待批准或待固定的文档修订");
+  }
 
+  // 完成审批工单时原子批准当前修订并固定引用，避免文档已批但引用仍停留在旧版本。
   for (const documentId of pendingDocumentIds) {
-    const document = store.getDesignDoc(documentId)!;
-    if (document.status === "已废弃") {
+    const before = store.getDesignDoc(documentId)!;
+    if (before.status === "已废弃") {
       throw new AgentTaskLeaseError(409, "DOCUMENT_REVISION_NOT_APPROVABLE", "已废弃文档不能通过节点审批工单重新批准");
     }
-    const approved = document.status === "已批准" ? document : store.updateDesignDoc(document.id, { status: "已批准" })!;
-    if (approved.currentRevisionId !== document.currentRevisionId) {
+    const approved = before.status === "已批准" ? before : store.updateDesignDoc(documentId, { status: "已批准" })!;
+    if (approved.currentRevisionId !== before.currentRevisionId) {
       store.recordAudit({
-        projectId: row.project_id, entityType: "designDoc", entityId: document.id, action: "approve",
-        before: { status: document.status, currentRevisionId: document.currentRevisionId },
-        after: { status: approved.status, currentRevisionId: approved.currentRevisionId, workOrderId: row.id, resultDigest: input.resultDigest.trim() },
+        projectId: row.project_id, entityType: "designDoc", entityId: documentId, action: "approve",
+        before: { status: before.status, currentRevisionId: before.currentRevisionId },
+        after: { status: approved.status, currentRevisionId: approved.currentRevisionId },
         actor: context.actor?.trim() || `agent:${row.agent_id}`, source: context.source ?? "system",
         correlationId: row.task_id, clientId: context.clientId, sessionId: context.sessionId || row.session_id || undefined,
         model: context.model,
@@ -1820,7 +1880,6 @@ function approveNodeDocumentsForLease(store: Store, row: LeaseRow, input: Comple
     }
   }
 }
-
 
 export function assertAgentTaskLeaseForPlanAction(store: Store, input: {
   leaseToken?: string;
@@ -1851,6 +1910,7 @@ export function assertAgentTaskLeaseForPlanAction(store: Store, input: {
   if (!input.leaseToken?.trim()) throw new AgentTaskLeaseError(409, "TASK_LEASE_REQUIRED", "Agent 动作必须携带有效 leaseToken；请先领取任务包");
   if (!input.agentId?.trim()) throw new AgentTaskLeaseError(400, "AGENT_ID_REQUIRED", "Agent 动作必须提供 agentId");
   const row = store.db.prepare("SELECT * FROM agent_task_leases WHERE lease_token = ?").get(input.leaseToken) as LeaseRow | undefined;
+  if (row) assertLocalAgentIdentityAudience(store, row.agent_id, row.worker_id);
   const now = new Date().toISOString();
   if (!row || !(["claimed", "running"] as AgentTaskLeaseStatus[]).includes(row.status) || row.lease_expires_at <= now) {
     throw new AgentTaskLeaseError(409, "LEASE_LOST", "任务租约不存在、已过期或已结束；停止工作并重新领取任务");
@@ -1887,6 +1947,7 @@ export function assertAgentTaskLeaseForWrite(store: Store, input: {
   if (!input.leaseToken?.trim()) throw new AgentTaskLeaseError(409, "TASK_LEASE_REQUIRED", "Agent 写操作必须携带有效 leaseToken");
   if (!input.agentId?.trim()) throw new AgentTaskLeaseError(400, "AGENT_ID_REQUIRED", "Agent 写操作必须提供 agentId");
   const row = store.db.prepare("SELECT * FROM agent_task_leases WHERE lease_token = ?").get(input.leaseToken) as LeaseRow | undefined;
+  if (row) assertLocalAgentIdentityAudience(store, row.agent_id, row.worker_id);
   const now = new Date().toISOString();
   if (!row || !(["claimed", "running"] as AgentTaskLeaseStatus[]).includes(row.status) || row.lease_expires_at <= now) {
     throw new AgentTaskLeaseError(409, "LEASE_LOST", "任务租约不存在、已过期或已结束；停止写入并重新领取任务");
@@ -2065,6 +2126,7 @@ function controlLease(
   ensureAgentTaskLeaseSchema(store);
   const row = store.db.prepare("SELECT * FROM agent_task_leases WHERE lease_token=? AND agent_id=?")
     .get(input.leaseToken, input.agentId) as LeaseRow | undefined;
+  if (row) assertLocalAgentIdentityAudience(store, row.agent_id, row.worker_id);
   if (row && operation === "heartbeat") {
     // A heartbeat is itself proof of liveness; revive a runner before the sweeper evaluates stale state.
     store.db.prepare("UPDATE agent_runner_registrations SET status='online', last_seen_at=?, updated_at=? WHERE project_id=? AND lower(worker_id)=lower(?)")
@@ -2142,6 +2204,7 @@ function controlSingleLease(
       throw new AgentTaskLeaseError(409, "LEASE_LOST", "租约已结束或过期；停止写入并重新领取任务");
     }
     let gapError = "";
+    let reportedGapPlanIds: string[] = [];
     if (operation === "report_design_gap" || operation === "dismiss_design_gap") {
       const gapInput = input as DesignGapControlInput;
       if (!gapInput.error?.trim() || !gapInput.idempotencyKey?.trim()) {
@@ -2162,16 +2225,18 @@ function controlSingleLease(
       }
       if (operation === "report_design_gap") {
         if (currentRow.role !== "builder" || currentRow.queue !== "development"
-          || !["start_development", "complete_development"].includes(currentRow.action_code)
-          || !["approved", "in_progress"].includes(plan.lifecycleStatus)) {
+          || !["start_development", "complete_development", "reopen_rework"].includes(currentRow.action_code)
+          || !["approved", "in_progress"].includes(plan.lifecycleStatus)
+          || (currentRow.action_code === "reopen_rework" && plan.lifecycleStatus !== "in_progress")) {
           throw new AgentTaskLeaseError(409, "LEASE_TASK_MISMATCH", "只有当前施工 Builder 可以报告开工前或施工中的设计缺口");
         }
         const impactedPlanIds = [...new Set([plan.id, ...(gapInput.impactedPlanIds ?? [])])];
         if (impactedPlanIds.some((planId) => {
           const impacted = store.getPlan(planId);
-          return !impacted || impacted.projectId !== plan.projectId || !isExecutableDeliveryPlan(impacted);
+          return !impacted || impacted.projectId !== plan.projectId || !isActiveDeliveryPlan(impacted);
         })) throw new AgentTaskLeaseError(409, "DESIGN_GAP_SCOPE_INVALID", "设计缺口只能声明当前项目内的可施工计划");
         gapError = `design_gap:${JSON.stringify({ reason: gapInput.error.trim(), impactedPlanIds })}`;
+        reportedGapPlanIds = impactedPlanIds;
       } else {
         const gap = getDesignGap(store, plan);
         if (currentRow.role !== "approver" || currentRow.queue !== "approval"
@@ -2191,6 +2256,23 @@ function controlSingleLease(
     const workspacePath = input.workspacePath?.trim() || currentRow.workspace_path || "";
     const workspaceBranch = input.workspaceBranch?.trim() || currentRow.workspace_branch || "";
     let baselineRevision = input.baselineRevision?.trim() || currentRow.baseline_revision || "";
+    if (operation === "start" && currentRow.action_code === "revise_node_requirement") {
+      // Designer 没有 Git 基线；服务端固定字段摘要，拒绝调用者伪造和先改后恢复的空返工。
+      if (currentRow.started_at) {
+        baselineRevision = currentRow.baseline_revision;
+      } else {
+        const queued = listClaimableAgentTasks(store, currentRow.project_id).find((task) => task.taskKey === currentRow.task_key);
+        const diagram = queued?.diagramId ? store.getDiagram(queued.diagramId) : undefined;
+        const node = diagram?.nodes.find((item) => item.id === queued?.nodeId);
+        if (!diagram || !node || diagram.projectId !== currentRow.project_id || !isRequirementDeliveryNode(diagram, node)
+          || queued?.actionCode !== "revise_node_requirement"
+          || pendingRequirementRevision(store, diagram, node) !== currentRow.task_revision.slice("revise_node_requirement:".length)
+          || !mapLease(currentRow).workScopes.includes(`node:${diagram.id}:${node.id}`)) {
+          throw new AgentTaskLeaseError(409, "REQUIREMENT_CHANGE_SOURCE_INVALID", "节点需求修订来源、主图、节点或工单修订已失效");
+        }
+        baselineRevision = requirementBaseline(node);
+      }
+    }
     if (operation === "start" && currentRow.action_code === "submit_evidence_repair") {
       const planId = currentRow.task_id.slice(currentRow.task_id.indexOf(":") + 1);
       const plan = store.getPlan(planId);
@@ -2288,7 +2370,120 @@ function controlSingleLease(
         throw new AgentTaskLeaseError(409, "WORKSPACE_ALREADY_RESERVED", "该工作区已由另一个 Builder 使用");
       }
     }
+    let projectBriefDigest: string | null = null;
     if (operation === "complete") {
+      if (currentRow.action_code === "add_function_node") {
+        const completion = input as CompleteInput;
+        const scopes = mapLease(currentRow).workScopes;
+        const diagram = store.getDiagram(scopes.find((scope) => scope.startsWith("diagram:"))?.slice(8) ?? "");
+        const writes = store.db.prepare(`SELECT details_json FROM security_audit_events
+          WHERE work_order_id=? AND action='mutate_diagram' AND result='success' AND occurred_at>=?`)
+          .all(currentRow.id, currentRow.started_at) as Array<{ details_json: string }>;
+        const wroteNodes = writes.some(({ details_json }) => {
+          try {
+            const details = JSON.parse(details_json) as { diagramId?: string; addedNodeIds?: string[] };
+            return details.diagramId === diagram?.id && (details.addedNodeIds?.length ?? 0) > 0
+              && details.addedNodeIds!.every((id) => diagram?.nodes.some((node) => node.id === id));
+          } catch { return false; }
+        });
+        if (currentRow.status !== "running" || !currentRow.started_at || !diagram || diagram.type !== "main"
+          || !scopes.includes(`diagram:${diagram.id}`) || !wroteNodes || !completion.resultDigest?.trim()
+          || completion.workOrderId !== currentRow.id || completion.taskKey !== currentRow.task_key
+          || completion.taskRevision !== currentRow.task_revision || completion.workerId !== currentRow.worker_id
+          || completion.role !== currentRow.role) {
+          throw new AgentTaskLeaseError(409, "FUNCTION_NODE_DELIVERY_INVALID", "节点拆分须由当前 Designer 在主画布实际新增节点并提交结论");
+        }
+      }
+      if (isProjectBriefTask(currentRow.action_code)) {
+        const completion = input as CompleteInput;
+        const brief = projectBriefProgress(store, currentRow.project_id);
+        const document = brief.document;
+        const exactContext = currentRow.status === "running" && Boolean(currentRow.started_at)
+          && completion.workOrderId === currentRow.id && completion.taskKey === currentRow.task_key
+          && completion.taskRevision === currentRow.task_revision && completion.workerId === currentRow.worker_id
+          && completion.role === currentRow.role && mapLease(currentRow).workScopes.includes(`project:${currentRow.project_id}`);
+        if (!exactContext || !document || document.projectId !== currentRow.project_id
+          || !["需求文档", "功能说明"].includes(document.category) || !document.title.trim()
+          || !document.summary.trim() || !document.content.trim()
+          || !store.getProject(currentRow.project_id)?.summary.trim()) {
+          throw new AgentTaskLeaseError(409, "PROJECT_BRIEF_INVALID", "项目简报缺少当前工单、项目目标、文档摘要或正文");
+        }
+        if (currentRow.action_code === "prepare_project_brief") {
+          if (brief.stage !== "design" || completion.documentRevisionId !== brief.revisionId
+            || document.status === "已批准" || (brief.evidence?.resultStatus === "fail"
+              && brief.evidence.documentRevisionId === brief.revisionId)
+            || brief.approval?.result_digest.startsWith("rejected:")) {
+            throw new AgentTaskLeaseError(409, "PROJECT_BRIEF_REVISION_REQUIRED", "设计返工必须提交新的当前文档修订");
+          }
+          projectBriefDigest = brief.revisionId;
+        } else if (currentRow.action_code === "audit_project_brief") {
+          const evidence = completion.evidenceId ? store.getEvidence(completion.evidenceId) : undefined;
+          if (brief.stage !== "audit" || !brief.design || !evidence
+            || evidence.projectId !== currentRow.project_id || evidence.planItemId !== null || evidence.nodeId !== null
+            || evidence.documentRevisionId !== brief.revisionId || evidence.actorRole !== "auditor"
+            || evidence.agentId !== currentRow.agent_id || evidence.details.auditScope !== "design"
+            || evidence.status !== "active" || evidence.resultStatus !== completion.verdict
+            || !["pass", "fail"].includes(evidence.resultStatus)
+            || (completion.verdict === "fail" && !completion.reworkConditions?.trim())) {
+            throw new AgentTaskLeaseError(409, "PROJECT_BRIEF_AUDIT_INVALID", "独立审计必须提交绑定当前简报修订的通过或失败证据");
+          }
+          assertIndependentAuditWorker(store, currentRow);
+          projectBriefDigest = evidence.id;
+        } else {
+          if (brief.stage !== "approval" || brief.evidence?.resultStatus !== "pass"
+            || currentRow.agent_id !== "Main Agent" || !["pass", "fail"].includes(completion.verdict || "")
+            || !completion.resultDigest?.trim() || (completion.verdict === "fail" && !completion.reworkConditions?.trim())) {
+            throw new AgentTaskLeaseError(409, "PROJECT_BRIEF_APPROVAL_INVALID", "Main Agent 必须复核当前独立设计审计并给出批准或退回结论");
+          }
+          assertIndependentApprover(store, currentRow);
+          if (completion.verdict === "pass") {
+            const approved = store.updateDesignDoc(document.id, { status: "已批准" })!;
+            for (const reference of store.listDocumentReferences({ projectId: currentRow.project_id, targetType: "project", targetId: currentRow.project_id })
+              .filter((item) => item.documentId === document.id && item.relationType === "defines")) {
+              store.updateDocumentReferenceRevision(reference.id, approved.currentRevisionId);
+            }
+            projectBriefDigest = `approved:${approved.currentRevisionId}`;
+          } else projectBriefDigest = `rejected:${completion.reworkConditions!.trim()}`;
+        }
+      }
+      if (currentRow.action_code === "revise_node_requirement") {
+        const queued = listClaimableAgentTasks(store, currentRow.project_id).find((task) => task.taskKey === currentRow.task_key);
+        const nodeId = queued?.nodeId ?? "";
+        const scope = mapLease(currentRow).workScopes;
+        const diagramId = queued?.diagramId;
+        const diagram = diagramId ? store.getDiagram(diagramId) : undefined;
+        const node = diagram?.nodes.find((item) => item.id === nodeId);
+        const completion = input as CompleteInput;
+        if (!queued || queued.id !== currentRow.task_id || queued.queue !== currentRow.queue
+          || queued.actionCode !== currentRow.action_code || queued.nodeId !== nodeId
+          || queued.taskRevision !== currentRow.task_revision || queued.diagramId !== diagram?.id
+          || !scope.includes(`node:${diagramId}:${nodeId}`)
+          || currentRow.role !== "designer" || currentRow.queue !== "design" || currentRow.status !== "running"
+          || !currentRow.started_at || !completion.resultDigest?.trim() || !diagram
+          || diagram.projectId !== currentRow.project_id || !node || !node.description?.trim()
+          || !isRequirementDeliveryNode(diagram, node)
+          || !node.owner?.trim() || !node.acceptanceCriteria?.trim() || node.requirementStatus !== "待评审"
+          || completion.workOrderId !== currentRow.id || completion.taskKey !== currentRow.task_key
+          || completion.taskRevision !== currentRow.task_revision || completion.workerId !== currentRow.worker_id
+          || completion.role !== currentRow.role
+          || currentRow.task_revision !== `revise_node_requirement:${diagram && node ? requirementChangeSource(store, diagram, node) : ""}`
+          || pendingRequirementRevision(store, diagram, node) !== currentRow.task_revision.slice("revise_node_requirement:".length)) {
+          throw new AgentTaskLeaseError(409, "NODE_REQUIREMENT_REVISION_INVALID", "节点需求修订必须由当前 Designer 完成并提交为待评审");
+        }
+        isAgentSecurityEnforced(store, currentRow.agent_id);
+        const mutations = store.db.prepare(`SELECT details_json FROM security_audit_events
+          WHERE work_order_id=? AND action='mutate_diagram' AND result='success' AND occurred_at>=?`)
+          .all(currentRow.id, currentRow.started_at) as Array<{ details_json: string }>;
+        const changed = mutations.some(({ details_json }) => {
+          try {
+            const details = JSON.parse(details_json) as Record<string, unknown>;
+            return details.diagramId === diagram.id && details.nodeId === nodeId
+              && Array.isArray(details.changedFields) && details.changedFields.length > 0;
+          } catch { return false; }
+        });
+        if (!changed || !currentRow.baseline_revision || currentRow.baseline_revision === requirementBaseline(node))
+          throw new AgentTaskLeaseError(409, "NODE_REQUIREMENT_REVISION_INCOMPLETE", "本工单的需求或流程字段相对开工基线没有最终变化");
+      }
       if (currentRow.action_code === "approve_node_requirement") {
         approveNodeRequirementForLease(store, currentRow, input as CompleteInput, context);
       }
@@ -2312,14 +2507,15 @@ function controlSingleLease(
           throw new AgentTaskLeaseError(409, "EVIDENCE_REPAIR_SUBMISSION_INVALID", "证据修复必须先开工并提交与冻结基线、计划和真实命令一致的 Builder 证据");
         }
       }
-      if (isAgentSecurityEnforced(store, currentRow.agent_id)) {
+      if (isAgentSecurityEnforced(store, currentRow.agent_id) && !isProjectBriefTask(currentRow.action_code)) {
         const completion = input as CompleteInput;
         const evidence = completion.evidenceId
           ? store.db.prepare("SELECT id, plan_item_id, agent_id, command, document_revision_id FROM evidence WHERE id=? AND status='active'").get(completion.evidenceId) as Record<string, string> | undefined
           : undefined;
         const planId = currentRow.task_id.includes(":") ? currentRow.task_id.slice(currentRow.task_id.indexOf(":") + 1) : "";
         const incomplete = currentRow.role === "designer"
-          ? !completion.documentRevisionId?.trim()
+          ? ["revise_node_requirement", "add_function_node"].includes(currentRow.action_code)
+            ? !completion.resultDigest?.trim() : !completion.documentRevisionId?.trim()
           : currentRow.role === "builder"
             ? !completion.implementationRevision?.trim() || !completion.testCommand?.trim() || !evidence || evidence.plan_item_id !== planId || evidence.agent_id !== currentRow.agent_id
             : currentRow.role === "auditor"
@@ -2329,7 +2525,8 @@ function controlSingleLease(
       }
       const stillQueued = listClaimableAgentTasks(store, currentRow.project_id)
         .some((task) => task.taskKey === currentRow.task_key);
-      if (stillQueued) {
+      if (stillQueued && currentRow.action_code !== "revise_node_requirement"
+        && !isProjectBriefTask(currentRow.action_code)) {
         throw new AgentTaskLeaseError(409, "TASK_WORKFLOW_NOT_COMPLETED", "任务仍在当前执行队列中；请先使用 transition_plan_delivery 完成对应流程动作");
       }
     }
@@ -2339,7 +2536,7 @@ function controlSingleLease(
           : ["release", "report_design_gap", "dismiss_design_gap"].includes(operation) ? "released"
             : currentRow.status;
     const leaseExpiresAt = operation === "heartbeat" ? isoAfter(leaseSeconds!) : currentRow.lease_expires_at;
-    const resultDigest = operation === "complete" ? input.resultDigest ?? "" : currentRow.result_digest;
+    const resultDigest = operation === "complete" ? projectBriefDigest ?? input.resultDigest ?? "" : currentRow.result_digest;
     const lastError = gapError || (operation === "fail" ? input.error?.trim() || "任务执行失败" : currentRow.last_error);
     const capacity = getAgentTaskCapacity(store, currentRow.project_id);
     const retryAvailableAt = operation === "fail" ? isoAfterFrom(capacity.retryBackoffSeconds) : currentRow.retry_available_at;
@@ -2444,6 +2641,7 @@ function controlSingleLease(
         }
       }
     }
+    if (operation === "report_design_gap") staleDesignChangeIntentsForGovernancePath(store, row.project_id, reportedGapPlanIds);
     cacheResponse(store, operation, input.idempotencyKey, hash, lease, now);
     audit(store, lease, operation, context, { status: currentRow.status, leaseExpiresAt: currentRow.lease_expires_at });
     return lease;

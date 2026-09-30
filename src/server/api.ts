@@ -104,6 +104,8 @@ import {
   syncManagedProject,
 } from "./projectFiles.js";
 import { buildProjectWorkflow } from "./workflow.js";
+import { isInitialProjectBriefApproval } from "./projectBrief.js";
+import { changesProtectedRequirement, hasRequirementChangeMarker } from "./nodeRequirementRevision.js";
 import { getProjectedProjectWorkspace, listProjectedProjects } from "./projectProjection.js";
 import { decideDependencyEdit, isExecutableDeliveryPlan } from "./planPolicy.js";
 import { AgentTaskPackageError, buildAgentOrchestration } from "./orchestration.js";
@@ -1975,6 +1977,11 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       const targetError = validateDocumentReferenceTarget(store, body.projectId, reference.targetType, reference.targetId);
       if (targetError) throw httpError(400, targetError);
     }
+    if (body.status === "已批准" && body.references.some((reference) => reference.targetType === "project"
+      && reference.targetId === body.projectId && reference.relationType === "defines")
+      && isInitialProjectBriefApproval(store, body.projectId, { id: "", category: body.category })) {
+      throw httpError(409, "首个项目简报必须经独立设计审计和 Main Agent 工单批准");
+    }
     const { references, ...documentInput } = body;
     const doc = store.insertDesignDoc(documentInput);
     for (const reference of references) store.insertDocumentReference({ ...reference, projectId: doc.projectId, documentId: doc.id });
@@ -2001,6 +2008,10 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       sourceUrl: z.string().max(2000).optional(),
       content: z.string().max(100_000).optional(),
     }), request.body);
+    if (patch.status === "已批准" && isInitialProjectBriefApproval(store, before.projectId,
+      { id: before.id, category: patch.category ?? before.category })) {
+      throw httpError(409, "首个项目简报必须经独立设计审计和 Main Agent 工单批准");
+    }
     const doc = store.updateDesignDoc(id, patch);
     if (doc) {
       const project = store.getProject(doc.projectId);
@@ -2055,6 +2066,11 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     if (!document || document.projectId !== body.projectId) throw httpError(400, "设计文档不存在或不属于当前项目");
     const targetError = validateDocumentReferenceTarget(store, body.projectId, body.targetType, body.targetId);
     if (targetError) throw httpError(400, targetError);
+    if (body.targetType === "project" && body.targetId === body.projectId && body.relationType === "defines"
+      && document.status === "已批准"
+      && isInitialProjectBriefApproval(store, body.projectId, { id: "", category: document.category })) {
+      throw httpError(409, "首个项目简报必须经独立设计审计和 Main Agent 工单批准");
+    }
     const reference = store.insertDocumentReference(body);
     audit(store, request.body as ActorHint, {
       projectId: body.projectId, entityType: "documentReference", entityId: reference.id,
@@ -2647,6 +2663,9 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     // 组件同样先走与专用端点同源的 strict schema（未知字段 400），再归一化为规范载荷。
     if (rawComponents !== undefined) write.components = normalizeComponentLibrary(parse(componentLibrarySchema, rawComponents));
     const patch = write;
+    if (changesProtectedRequirement(before, patch.nodes ?? before.nodes, patch.type ?? before.type))
+      return reply.code(409).send({ code: "NODE_REQUIREMENT_REVISION_REQUIRED",
+        message: "待修订节点的需求与流程只能通过专属 Designer 工单提交，并由独立 Approver 批准" });
     if (before.type === "main" && patch.type !== undefined && patch.type !== "main") {
       throw httpError(409, "系统主画布是项目固定入口，不能修改为其他类型");
     }
@@ -2679,6 +2698,9 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const before = store.getDiagram(id);
     if (!before) return reply.code(404).send({ message: "画布不存在" });
     if (before.type === "main") throw httpError(409, "系统主画布是项目固定入口，不能删除");
+    if (before.nodes.some(hasRequirementChangeMarker)) return reply.code(409).send({
+      code: "NODE_REQUIREMENT_REVISION_REQUIRED", message: "画布含未解除设计变更标记的节点，不能删除",
+    });
     store.deleteDiagram(id);
     audit(store, request.query as ActorHint, {
       projectId: before.projectId, entityType: "diagram", entityId: id,

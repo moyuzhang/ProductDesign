@@ -143,7 +143,7 @@ export function SystemGuideView(): ReactElement {
           <h3>3. 主 Agent 只负责编排</h3>
           <div className="system-guide-rule-grid">
             <p><strong>读取与派发</strong><span>每个动作前后读取 <code>get_project_workflow</code>，按 <code>activeSlots</code>、<code>roleSlots</code>、交付层和资源锁创建有限执行 Agent；队列条数不等于并发数。</span></p>
-            <p><strong>租约与身份</strong><span>Main Agent 先领取父协调租约并派发精确任务；子 Agent 只能凭一次性 <code>dispatchId</code> 领取自己的子租约，禁止自行调用 <code>claim_next_agent_task</code>。</span></p>
+            <p><strong>租约与身份</strong><span>Main Agent 派发子任务时领取父协调租约；独立审批工单直接调用 <code>claim_next_agent_task</code> 领取。子 Agent 只能凭一次性 <code>dispatchId</code> 领取自己的子租约。</span></p>
             <p><strong>工单提交</strong><span>每个 Designer、Builder 和 Auditor 都必须提交与本人任务绑定的工单，写明 taskKey、taskRevision、实际产出或证据；未提交工单不得交接或宣告完成。</span></p>
             <p><strong>交接与证据</strong><span>保留 taskKey、taskRevision、关联 ID、sessionId、runId、修订和 evidenceId；旧修订与旧证据只失效，不删除。</span></p>
             <p><strong>审批边界</strong><span>主 Agent 使用独立 <code>approval</code> 租约审批，不能复用 Designer、Builder 或 Auditor 身份；<code>managerApproval</code> 始终交给人类。</span></p>

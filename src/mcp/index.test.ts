@@ -4,9 +4,11 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createMcpServer } from "./index.js";
 import { Store } from "../server/db.js";
+import { syncManagedProject } from "../server/projectFiles.js";
 import { LocalMcpClient, mcpResultText, type AgentMcpResult } from "../server/localMcpClient.js";
 import { createServiceHealthPayload } from "./fullTools.js";
 import { beginAgentAuth, completeAgentAuth, expectedChallengeResponse, registerAgentCredential } from "../server/agentSecurity.js";
+import { listClaimableAgentTasks } from "../server/agentTaskLeases.js";
 
 const dataDir = mkdtempSync(join(tmpdir(), "pcs-mcp-docs-"));
 const dbPath = join(dataDir, "docs.db");
@@ -33,6 +35,48 @@ beforeAll(async () => {
     });
   }
   client = await LocalMcpClient.connect(() => createMcpServer({ store, dbPath, dataDir, trustedInternal: true }));
+});
+
+it("claims a main-canvas node split and limits its write to initial function nodes", async () => {
+  const project = store.insertProject({ code: "MCP-NODE-SPLIT", name: "节点拆分", summary: "已批准的项目目标", stage: "设计",
+    health: "正常", progress: 0, riskLevel: "P1", riskSummary: "", blockerSummary: "", nextStep: "",
+    repositoryPath: "", startAt: "", dueAt: "" });
+  syncManagedProject(store, dataDir, project);
+  const brief = store.insertDesignDoc({ projectId: project.id, category: "需求文档", title: "项目简报", summary: "范围",
+    status: "已批准", version: "1", author: "Main Agent", content: "目标、范围和成功标准" });
+  store.insertDocumentReference({ projectId: project.id, documentId: brief.id, targetType: "project",
+    targetId: project.id, relationType: "defines" });
+  const main = store.listDiagrams(project.id).find((diagram) => diagram.type === "main")!;
+  const task = listClaimableAgentTasks(store, project.id).find((item) => item.actionCode === "add_function_node")!;
+  expect(task).toMatchObject({ available: true, diagramId: main.id, workScopes: [`diagram:${main.id}`] });
+  const external = await LocalMcpClient.connect(() => createMcpServer({ store, dbPath, dataDir }));
+  const call = (name: string, args: Record<string, unknown>) =>
+    (external as unknown as { request: (method: string, params: unknown) => Promise<AgentMcpResult> })
+      .request("tools/call", { name, arguments: args });
+  try {
+    const packet = JSON.parse(mcpResultText(await call("get_agent_task_package", {
+      projectRef: project.id, taskId: task.id, role: "designer", agentId: task.assignee!.agentId,
+      workerId: "node-split-worker", idempotencyKey: "claim-node-split",
+    }), 100_000)) as { lease: { workOrderId: string; leaseToken: string; taskKey: string; taskRevision: string;
+      workerId: string; agentId: string }; documents: Array<{ documentRevisionId: string }> };
+    expect(packet.documents.some((item) => item.documentRevisionId === brief.currentRevisionId)).toBe(true);
+    const context = { workOrderId: packet.lease.workOrderId, leaseToken: packet.lease.leaseToken,
+      taskKey: packet.lease.taskKey, taskRevision: packet.lease.taskRevision, workerId: packet.lease.workerId,
+      agentId: packet.lease.agentId, role: "designer" };
+    expect(mcpResultText(await call("start_agent_task", { ...context, idempotencyKey: "start-node-split" }), 10_000)).toContain("running");
+    expect(mcpResultText(await call("mutate_diagram", { ...context, diagramId: main.id,
+      expectedUpdatedAt: store.getDiagram(main.id)!.updatedAt,
+      operations: [{ op: "add_node", node: { kind: "note", label: "越界", x: 10, y: 10 } }],
+      idempotencyKey: "invalid-node-kind" }), 10_000)).toContain("FUNCTION_NODE_SCOPE_REQUIRED");
+    expect(mcpResultText(await call("mutate_diagram", { ...context, diagramId: main.id,
+      expectedUpdatedAt: store.getDiagram(main.id)!.updatedAt,
+      operations: [{ op: "add_node", node: { kind: "feature", label: "会员与登录", x: 80, y: 80 } }],
+      idempotencyKey: "add-first-function" }), 10_000)).toContain("已原子执行");
+    expect(mcpResultText(await call("complete_agent_task", { ...context,
+      resultDigest: "已建立首批功能节点", idempotencyKey: "finish-node-split" }), 10_000)).toContain("completed");
+    expect(store.getDiagram(main.id)!.nodes.some((node) => node.label === "会员与登录")).toBe(true);
+    expect(listClaimableAgentTasks(store, project.id).some((item) => item.actionCode === "add_function_node")).toBe(false);
+  } finally { await external.close(); }
 });
 
 afterAll(async () => {
@@ -770,6 +814,162 @@ describe("list_design_docs content retrieval", () => {
     expect(mcpResultText(replay, 100_000)).toBe(createdText);
     const conflict = await client.callTool("request_design_change", { ...basePayload, reason: "另一个设计错误" });
     expect(mcpResultText(conflict, 100_000)).toContain("IDEMPOTENCY_CONFLICT");
+  });
+});
+
+describe("scoped requirement revision", () => {
+  it("routes an existing pending change to Designer, limits edits, then unlocks independent approval", async () => {
+    const project = store.insertProject({
+      code: "MCP-REQ-REV", name: "节点需求修订", summary: "修正过时验收条件", stage: "设计", health: "正常",
+      progress: 0, riskLevel: "P1", riskSummary: "", blockerSummary: "", nextStep: "", repositoryPath: dataDir,
+      startAt: "", dueAt: "",
+    });
+    const brief = store.insertDesignDoc({ projectId: project.id, category: "需求文档", title: "项目简报", summary: "",
+      status: "已批准", version: "1", author: "manager", content: "需求必须先修订再批准" });
+    store.insertDocumentReference({ projectId: project.id, documentId: brief.id, targetType: "project", targetId: project.id, relationType: "defines" });
+    const main = store.insertDiagram({ projectId: project.id, title: "Profile 子画布", type: "functional", nodes: [], edges: [] });
+    const changeId = "00000000-0000-4000-8000-000000000091";
+    const targetId = "legacy-pending-requirement";
+    const otherId = "unrelated-requirement";
+    store.updateDiagram(main.id, { nodes: [...main.nodes,
+      { id: targetId, kind: "feature", label: "旧需求", description: "旧说明", owner: "team", acceptanceCriteria: "旧标准",
+        requirementStatus: "待评审", designStatus: "进行中", developmentStatus: "未开发", acceptanceStatus: "未验收",
+        blockedReason: `设计变更处理中 · ${changeId}`, x: 100, y: 100 },
+      { id: otherId, kind: "feature", label: "其他需求", description: "独立范围", owner: "team", acceptanceCriteria: "不变",
+        requirementStatus: "已批准", designStatus: "进行中", developmentStatus: "未开发", acceptanceStatus: "未验收", x: 300, y: 100 },
+    ] });
+    const systemMain = store.listDiagrams(project.id).find((diagram) => diagram.type === "main")!;
+    store.updateDiagram(systemMain.id, { nodes: [...systemMain.nodes, {
+      id: targetId, kind: "feature", label: "同 ID 的另一画布节点", description: "独立需求", owner: "team",
+      acceptanceCriteria: "不受本工单影响", requirementStatus: "已批准", designStatus: "进行中",
+      developmentStatus: "未开发", acceptanceStatus: "未验收", x: 400, y: 100,
+    }] });
+    store.insertGovernance({ id: changeId, projectId: project.id, type: "decision", title: "正式需求变更",
+      content: JSON.stringify({ diagramId: main.id, nodeId: targetId, requirementImpact: true }),
+      rationale: "旧需求错误", status: "有效", author: "Main Agent" });
+    store.db.exec(`CREATE TABLE IF NOT EXISTS design_change_requests (idempotency_key TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
+      change_id TEXT NOT NULL UNIQUE, response_json TEXT NOT NULL, created_at TEXT NOT NULL)`);
+    store.db.prepare("INSERT INTO design_change_requests VALUES (?, ?, ?, ?, ?)").run("mcp-formal-change", "digest", changeId,
+      JSON.stringify({ changeId, projectId: project.id, diagramId: main.id, nodeId: targetId }), new Date().toISOString());
+    const task = listClaimableAgentTasks(store, project.id).find((item) => item.nodeId === targetId && item.actionCode === "revise_node_requirement")!;
+    expect(task).toMatchObject({ available: true, taskRevision: `revise_node_requirement:${changeId}` });
+    expect(task.id).toBe(`design:${main.id}:${targetId}`);
+    expect(listClaimableAgentTasks(store, project.id).some((item) => item.nodeId === targetId && item.actionCode === "approve_node_requirement")).toBe(false);
+    const external = await LocalMcpClient.connect(() => createMcpServer({ store, dbPath, dataDir }));
+    const call = (name: string, args: Record<string, unknown>) =>
+      (external as unknown as { request: (method: string, params: unknown) => Promise<unknown> })
+        .request("tools/call", { name, arguments: args }) as Promise<AgentMcpResult>;
+    try {
+      const packet = JSON.parse(mcpResultText(await call("get_agent_task_package", {
+        projectRef: project.id, taskId: task.id, role: "designer", agentId: task.assignee!.agentId,
+        workerId: "requirement-editor", idempotencyKey: "claim-requirement-editor",
+      }), 100_000)) as { lease: { workOrderId: string; leaseToken: string; taskKey: string; taskRevision: string; workerId: string; agentId: string };
+        roleBlueprint: { allowedMcpTools: string[] } };
+      expect(packet.roleBlueprint.allowedMcpTools).toEqual(expect.arrayContaining(["get_diagram", "mutate_diagram", "validate_diagram"]));
+      expect(packet.roleBlueprint.allowedMcpTools).not.toContain("patch_design_doc");
+      const context = { workOrderId: packet.lease.workOrderId, leaseToken: packet.lease.leaseToken,
+        taskKey: packet.lease.taskKey, taskRevision: packet.lease.taskRevision, workerId: packet.lease.workerId,
+        agentId: packet.lease.agentId, role: "designer" };
+      const update = (nodeId: string, patch: Record<string, unknown>, key: string) => call("mutate_diagram", {
+        ...context, diagramId: main.id, expectedUpdatedAt: store.getDiagram(main.id)!.updatedAt,
+        operations: [{ op: "update_node", nodeId, patch }], idempotencyKey: key,
+      });
+      expect(mcpResultText(await update(targetId, { acceptanceCriteria: "修订标准" }, "before-start"), 10_000)).toContain("NODE_REQUIREMENT_SCOPE_REQUIRED");
+      const started = mcpResultText(await call("start_agent_task", { ...context, baselineRevision: "forged",
+        idempotencyKey: "start-requirement-editor" }), 10_000);
+      expect(started).toContain("running");
+      expect(started).not.toContain("forged");
+      expect(mcpResultText(await call("complete_agent_task", { ...context, idempotencyKey: "premature-requirement-complete",
+        resultDigest: "尚未修改" }), 10_000)).toContain("NODE_REQUIREMENT_REVISION_INCOMPLETE");
+      expect(mcpResultText(await update(targetId, { description: "临时说明" }, "temporary-edit"), 10_000)).toContain("已原子执行");
+      expect(mcpResultText(await update(targetId, { description: "旧说明" }, "restore-original"), 10_000)).toContain("已原子执行");
+      expect(mcpResultText(await call("complete_agent_task", { ...context, idempotencyKey: "restored-complete",
+        resultDigest: "改回原值" }), 10_000)).toContain("NODE_REQUIREMENT_REVISION_INCOMPLETE");
+      const staleDiagram = store.getDiagram(main.id)!;
+      store.updateDiagram(main.id, { nodes: staleDiagram.nodes.map((node) => node.id === targetId
+        ? { ...node, blockedReason: "设计变更处理中 · 00000000-0000-4000-8000-000000000092" } : node) });
+      expect(mcpResultText(await update(targetId, { acceptanceCriteria: "旧租约越界" }, "stale-change"), 10_000)).toContain("NODE_REQUIREMENT_SCOPE_REQUIRED");
+      const restoredDiagram = store.getDiagram(main.id)!;
+      store.updateDiagram(main.id, { nodes: restoredDiagram.nodes.map((node) => node.id === targetId
+        ? { ...node, blockedReason: `设计变更处理中 · ${changeId}` } : node) });
+      expect(mcpResultText(await update(otherId, { acceptanceCriteria: "越界" }, "other-node"), 10_000)).toContain("NODE_REQUIREMENT_SCOPE_REQUIRED");
+      expect(mcpResultText(await update(targetId, { acceptanceStatus: "已通过" }, "forbidden-field"), 10_000)).toContain("NODE_REQUIREMENT_SCOPE_REQUIRED");
+      expect(mcpResultText(await update(targetId, { kind: "note" }, "forbidden-kind"), 10_000)).toContain("NODE_REQUIREMENT_SCOPE_REQUIRED");
+      expect(mcpResultText(await call("update_diagram", { ...context, diagramId: main.id,
+        nodes: store.getDiagram(main.id)!.nodes, idempotencyKey: "whole-diagram" }), 10_000)).toContain("ACTION_MISMATCH");
+      const trusted = await LocalMcpClient.connect(() => createMcpServer({ store, dbPath, dataDir, trustedInternal: true }));
+      try {
+        const deletion = await (trusted as unknown as { request: (method: string, params: unknown) => Promise<AgentMcpResult> })
+          .request("tools/call", { name: "delete_diagram", arguments: { diagramId: main.id, confirm: true } });
+        expect(mcpResultText(deletion, 10_000))
+          .toContain("NODE_REQUIREMENT_REVISION_REQUIRED");
+      } finally { await trusted.close(); }
+      expect(mcpResultText(await update(targetId, { acceptanceCriteria: "新标准", mainFlow: "进入 Profile → 禁用 MFA → 回查因子", requirementStatus: "待评审" }, "edit-requirement"), 10_000)).toContain("已原子执行");
+      expect(listClaimableAgentTasks(store, project.id).some((item) => item.nodeId === targetId && item.actionCode === "approve_node_requirement")).toBe(false);
+      store.updateGovernance(changeId, { status: "已废弃" });
+      expect(mcpResultText(await call("complete_agent_task", { ...context, idempotencyKey: "revoked-complete",
+        resultDigest: "失效来源不得完工" }), 10_000)).toContain("NODE_REQUIREMENT_REVISION_INVALID");
+      store.updateGovernance(changeId, { status: "有效" });
+      expect(mcpResultText(await call("complete_agent_task", { ...context, idempotencyKey: "complete-requirement-editor",
+        resultDigest: "已修正验收标准与流程，提交独立需求审批" }), 10_000)).toContain("completed");
+      expect(listClaimableAgentTasks(store, project.id)).toEqual(expect.arrayContaining([expect.objectContaining({
+        nodeId: targetId, actionCode: "approve_node_requirement", available: true,
+      })]));
+      expect(store.getDiagram(main.id)?.nodes.find((node) => node.id === targetId)?.requirementStatus).toBe("待评审");
+      const approvalRevision = listClaimableAgentTasks(store, project.id)
+        .find((item) => item.nodeId === targetId && item.actionCode === "approve_node_requirement")!.taskRevision;
+      const beforeFlowEdit = store.getDiagram(main.id)!;
+      store.updateDiagram(main.id, { nodes: beforeFlowEdit.nodes.map((node) => node.id === targetId
+        ? { ...node, mainFlow: "修订后的另一流程" } : node) });
+      expect(listClaimableAgentTasks(store, project.id)
+        .find((item) => item.nodeId === targetId && item.actionCode === "approve_node_requirement")!.taskRevision).not.toBe(approvalRevision);
+      const conflictPlan = store.insertPlan({
+        projectId: project.id, diagramId: main.id, diagramNodeId: targetId, parentId: null,
+        kind: "task", title: "同节点实现", description: "", status: "未开始", priority: "P1", progress: 0,
+        owner: "builder", versionTag: "v1", startAt: "", dueAt: "", dependencyIds: [], blockedReason: "", completedAt: "",
+        lifecycleStatus: "approved", proposedBy: "designer", submittedAt: "2026-09-27T00:00:00.000Z",
+        approvedBy: "manager", approvedAt: "2026-09-27T00:01:00.000Z",
+        roleAssignments: { designer: { agentId: "plan-designer", displayName: "Designer" },
+          builder: { agentId: "Main Agent", displayName: "Builder" },
+          auditor: { agentId: "plan-auditor", displayName: "Auditor" } },
+      });
+      let approvalTask = listClaimableAgentTasks(store, project.id)
+        .find((item) => item.nodeId === targetId && item.actionCode === "approve_node_requirement")!;
+      expect(mcpResultText(await call("get_agent_task_package", {
+        projectRef: project.id, taskId: approvalTask.id, taskKey: approvalTask.taskKey,
+        role: "approver", agentId: "Main Agent", workerId: "independent-requirement-approver",
+        idempotencyKey: "reject-self-approval",
+      }), 10_000)).toContain("SELF_APPROVAL_FORBIDDEN");
+      store.updatePlan(conflictPlan.id, { roleAssignments: { ...conflictPlan.roleAssignments,
+        builder: { agentId: "plan-builder", displayName: "Builder" } } });
+      const historicalTaskKey = `historical-builder:${conflictPlan.id}`;
+      store.db.prepare(`INSERT INTO agent_task_leases (id, task_key, task_id, task_revision, project_id, queue, role,
+        action_code, status, lease_token, agent_id, worker_id, lease_expires_at, claimed_at, heartbeat_at, updated_at)
+        VALUES (?, ?, ?, 'old', ?, 'development', 'builder', 'develop_plan', 'completed', ?, ?, ?, ?, ?, ?, ?)`).run(
+        historicalTaskKey, historicalTaskKey, `development:${conflictPlan.id}`, project.id,
+        historicalTaskKey, "Main Agent", "historical-builder", new Date().toISOString(),
+        new Date().toISOString(), new Date().toISOString(), new Date().toISOString());
+      approvalTask = listClaimableAgentTasks(store, project.id)
+        .find((item) => item.nodeId === targetId && item.actionCode === "approve_node_requirement")!;
+      expect(mcpResultText(await call("get_agent_task_package", {
+        projectRef: project.id, taskId: approvalTask.id, taskKey: approvalTask.taskKey,
+        role: "approver", agentId: "Main Agent", workerId: "independent-requirement-approver",
+        idempotencyKey: "reject-historical-builder",
+      }), 10_000)).toContain("SELF_APPROVAL_FORBIDDEN");
+      store.db.prepare("DELETE FROM agent_task_leases WHERE task_key=?").run(historicalTaskKey);
+      const approval = JSON.parse(mcpResultText(await call("get_agent_task_package", {
+        projectRef: project.id, taskId: approvalTask.id, taskKey: approvalTask.taskKey,
+        role: "approver", agentId: "Main Agent", workerId: "independent-requirement-approver",
+        idempotencyKey: "claim-requirement-approver",
+      }), 100_000)) as { lease: typeof packet.lease };
+      const approvalContext = { workOrderId: approval.lease.workOrderId, leaseToken: approval.lease.leaseToken,
+        taskKey: approval.lease.taskKey, taskRevision: approval.lease.taskRevision,
+        workerId: approval.lease.workerId, agentId: approval.lease.agentId, role: "approver" };
+      expect(mcpResultText(await call("start_agent_task", { ...approvalContext, idempotencyKey: "start-requirement-approver" }), 10_000)).toContain("running");
+      expect(mcpResultText(await call("complete_agent_task", { ...approvalContext, idempotencyKey: "complete-requirement-approver",
+        resultDigest: "已独立复核当前需求与流程" }), 10_000)).toContain("completed");
+      expect(store.getDiagram(main.id)?.nodes.find((node) => node.id === targetId)?.requirementStatus).toBe("已批准");
+    } finally { await external.close(); }
   });
 });
 

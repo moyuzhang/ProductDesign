@@ -23,7 +23,7 @@ import {
   type ClaimAgentTaskInput,
 } from "./agentTaskLeases.js";
 import { buildAgentOrchestration, buildAgentTaskPackage } from "./orchestration.js";
-import { assertCoordinationMainAgent, ensureAgentSecuritySchema } from "./agentSecurity.js";
+import { assertCoordinationMainAgent, assertCredentialAudience, ensureAgentSecuritySchema } from "./agentSecurity.js";
 
 const ACTIVE_CHILD_STATUSES: AgentChildDispatchStatus[] = ["dispatched", "claimed", "running"];
 const CHILD_ROLE_BY_STAGE: Partial<Record<AgentCoordinationStage, Exclude<AgentBlueprintKey, "approver">>> = {
@@ -328,6 +328,14 @@ export function invalidateCoordinationByCredential(store: Store, credentialId: s
   for (const row of rows) invalidateParent(store, row, "coordination_credential_revoked");
 }
 
+/** Retire a parent's children before a successor makes its target plan historical. */
+export function invalidateCoordinationByPlan(store: Store, projectId: string, planId: string): void {
+  if (!store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_coordination_leases'").get()) return;
+  const rows = store.db.prepare("SELECT * FROM agent_coordination_leases WHERE project_id=? AND target_plan_id=? AND status IN ('active','paused')")
+    .all(projectId, planId) as CoordinationLeaseRow[];
+  for (const row of rows) invalidateParent(store, row, `plan_superseded:${planId}`);
+}
+
 function expireCoordinationLeases(store: Store, projectId?: string): number {
   ensureCoordinationLeaseSchema(store);
   return store.db.transaction(() => expireCoordinationLeasesInTransaction(store, projectId)).immediate();
@@ -372,6 +380,7 @@ function activeParent(store: Store, projectId: string, id: string, token: string
   if (row.main_agent_id !== mainAgentId) {
     throw new CoordinationLeaseError(409, "MAIN_AGENT_MISMATCH", "父协调租约不属于当前 Main Agent");
   }
+  assertCredentialAudience(store, row.claim_credential_id);
   if (!bindingValid(store, row)) {
     store.db.transaction(() => invalidateParent(store, row, "coordination_credential_lost")).immediate();
     throw new CoordinationLeaseError(409, "COORDINATION_LEASE_LOST", "父协调租约认证绑定已失效");
@@ -499,9 +508,12 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
     if (!targetPlanId) {
       const task = listClaimableAgentTasks(store, input.projectId).find((candidate) => candidate.taskKey === targetTaskKey);
       if (!task || task.taskRevision !== targetTaskRevision) throw new CoordinationLeaseError(409, "COORDINATION_TASK_REVISION_MISMATCH", "目标任务不存在或修订已变化");
-      if (task.planItemId || task.queue !== "design" || task.deliveryTrack !== "design" || task.requiredRole !== "designer") {
-        throw new CoordinationLeaseError(409, "COORDINATION_TASK_INVALID", "只允许绑定无计划的 Designer 设计任务");
+      const briefAudit = task.actionCode === "audit_project_brief" && task.queue === "audit" && task.auditScope === "design" && task.requiredRole === "auditor";
+      if (task.planItemId || task.deliveryTrack !== "design"
+        || !(briefAudit || (task.queue === "design" && task.requiredRole === "designer"))) {
+        throw new CoordinationLeaseError(409, "COORDINATION_TASK_INVALID", "只允许绑定无计划 Designer 任务或项目简报独立设计审计");
       }
+      if (briefAudit) planInitialStage = "design_audit";
       if (!task.assignee?.agentId || !task.poolId || !task.available) {
         throw new CoordinationLeaseError(409, "COORDINATION_TASK_NOT_AVAILABLE", task.availabilityReason || "任务当前不可派发");
       }
@@ -569,9 +581,11 @@ function expectedChild(store: Store, parent: CoordinationLeaseRow, taskId: strin
   if (parent.target_plan_id && task.planItemId !== parent.target_plan_id) {
     throw new CoordinationLeaseError(409, "COORDINATION_PLAN_MISMATCH", "子任务不属于父协调租约的目标计划");
   }
-  if (parent.target_task_key && (parent.stage !== "design" || !taskId || !taskKey
+  if (parent.target_task_key && (!["design", "design_audit"].includes(parent.stage) || !taskId || !taskKey
     || task.taskKey !== taskKey || task.taskKey !== parent.target_task_key || task.taskRevision !== parent.target_task_revision
-    || task.planItemId || task.queue !== "design" || task.deliveryTrack !== "design")) {
+    || task.planItemId || task.deliveryTrack !== "design"
+    || (parent.stage === "design" && task.queue !== "design")
+    || (parent.stage === "design_audit" && (task.queue !== "audit" || task.actionCode !== "audit_project_brief")))) {
     throw new CoordinationLeaseError(409, "COORDINATION_TASK_MISMATCH", "子任务与父协调租约绑定的精确设计任务不一致");
   }
   if (task.requiredRole !== role) throw new CoordinationLeaseError(409, "ROLE_MISMATCH", `任务必须由 ${task.requiredRole} 处理`);

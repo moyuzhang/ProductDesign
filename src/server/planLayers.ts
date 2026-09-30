@@ -1,7 +1,7 @@
 import type { PlanDeliveryLayerGate, PlanDeliveryLayerPlanState, PlanItem } from "../shared/types.js";
 import { assertNoDesignGap } from "./designGap.js";
 import type { Store } from "./db.js";
-import { isExecutableDeliveryPlan } from "./planPolicy.js";
+import { isActiveDeliveryPlan } from "./planPolicy.js";
 
 const DESIGN_PHASE_ACTIONS = new Set([
   "complete_node_definition", "approve_node_requirement", "approve_node_document",
@@ -14,7 +14,7 @@ export function isDesignPhaseAction(action?: string): boolean {
 }
 
 function controlledTasks(plans: PlanItem[]): PlanItem[] {
-  return plans.filter((plan) => isExecutableDeliveryPlan(plan) && Boolean(plan.diagramId && plan.diagramNodeId));
+  return plans.filter((plan) => isActiveDeliveryPlan(plan) && Boolean(plan.diagramId && plan.diagramNodeId));
 }
 
 function isComplete(plan: PlanItem): boolean {
@@ -125,7 +125,7 @@ export function assertPlanImplementationUnlocked(store: Store, plan: PlanItem): 
   assertNoDesignGap(store, plan);
   assertPlanLayerUnlocked(store, plan);
   const incompleteChildren = store.listPlans(plan.projectId)
-    .filter((candidate) => candidate.parentId === plan.id && isExecutableDeliveryPlan(candidate) && !isComplete(candidate));
+    .filter((candidate) => candidate.parentId === plan.id && isActiveDeliveryPlan(candidate) && !isComplete(candidate));
   if (incompleteChildren.length > 0) {
     throw Object.assign(new Error(`父聚合任务必须先完成并验收直接子任务：${incompleteChildren.map((child) => child.title).join("、")}`), {
       statusCode: 409,
@@ -135,7 +135,7 @@ export function assertPlanImplementationUnlocked(store: Store, plan: PlanItem): 
 }
 
 export function isPlanImplementationUnlocked(plans: PlanItem[], plan: PlanItem): boolean {
-  return !plans.some((candidate) => candidate.parentId === plan.id && isExecutableDeliveryPlan(candidate) && !isComplete(candidate));
+  return !plans.some((candidate) => candidate.parentId === plan.id && isActiveDeliveryPlan(candidate) && !isComplete(candidate));
 }
 
 export function validatePlanLayerGraph(plans: PlanItem[]): string | undefined {

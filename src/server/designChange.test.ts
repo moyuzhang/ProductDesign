@@ -21,6 +21,7 @@ import {
   updateAgentTaskCapacity,
 } from "./agentTaskLeases.js";
 import { designChangeBodyDigest, requestDesignChange } from "./designChange.js";
+import { submitDesignChangeIntent } from "./designChangeIntent.js";
 import { getEvidenceRepairState, openEvidenceRepairState, updateEvidenceRepairState } from "./evidenceRepair.js";
 import { Store, nowIso } from "./db.js";
 import { transitionPlanLifecycle } from "./planLifecycle.js";
@@ -432,7 +433,7 @@ describe("design change rework", () => {
     expect(fx.store.getEvidence(fx.evidence.id)?.status).toBe("active");
   });
 
-  it("returns requirement review as the unique node next action when requirements are impacted", () => {
+  it("routes impacted requirements through Designer revision before approval", () => {
     const fx = fixture();
     const result = requestDesignChange(fx.store, {
       projectId: fx.project.id, diagramId: fx.diagram.id, nodeId: fx.nodeId, actor: "Manager",
@@ -441,8 +442,8 @@ describe("design change rework", () => {
       reworkScope: "需求、设计、计划和验证", apiImpact: "", databaseImpact: "", deploymentImpact: "",
       expectedUpdatedAt: fx.diagram.updatedAt, idempotencyKey: "requirement-change",
     }, { source: "mcp" });
-    expect(result.requirementStatus).toBe("待评审");
-    expect(result.nextAction?.code).toBe("approve_node_requirement");
+    expect(result.requirementStatus).toBe("草拟中");
+    expect(result.nextAction?.code).toBe("revise_node_requirement");
   });
 
   it("accepts post-change audit evidence only when it binds the current approved document revision", () => {
@@ -523,6 +524,47 @@ describe("design change rework", () => {
       action: "pass_audit", actor: "Auditor", agentId: "auditor-id",
     }).lifecycleStatus).toBe("pending_manager");
   });
+
+  it("audits each plan against its own documents after a cross-node design change", () => {
+    const fx = fixture();
+    const otherNodeId = "other-change-node";
+    fx.store.updateDiagram(fx.diagram.id, { nodes: [...fx.diagram.nodes, {
+      id: otherNodeId, kind: "feature", label: "其他节点", description: "独立设计", owner: "Team",
+      acceptanceCriteria: "独立验收", requirementStatus: "已批准", designStatus: "已批准",
+      developmentStatus: "开发中", acceptanceStatus: "未验收", x: 900, y: 180,
+    }] });
+    const otherPlan = fx.store.insertPlan({
+      ...fx.activePlan, id: undefined, title: "其他节点计划", diagramNodeId: otherNodeId,
+    });
+    const otherDocument = fx.store.insertDesignDoc({
+      projectId: fx.project.id, category: "功能说明", title: "其他节点设计", summary: "独立设计",
+      status: "已批准", version: "2.0", author: "Designer", sourceUrl: "", content: "其他节点当前设计",
+    });
+    fx.store.insertDocumentReference({
+      projectId: fx.project.id, documentId: otherDocument.id, targetType: "diagramNode",
+      targetId: otherNodeId, relationType: "defines",
+    });
+    const change = fx.store.insertGovernance({
+      projectId: fx.project.id, type: "decision", title: "设计变更 · 跨节点", status: "有效",
+      content: JSON.stringify({ impactedDocumentIds: [fx.document.id, otherDocument.id],
+        impactedPlanIds: [fx.activePlan.id, otherPlan.id] }), rationale: "两个节点分别修订", author: "Main Agent",
+    });
+    fx.store.updatePlan(fx.activePlan.id, {
+      lifecycleStatus: "pending_audit", status: "已完成", progress: 100, completedAt: nowIso(),
+      auditStatus: "pending", implementationRevision: "cross-node", correlationId: change.id,
+      designRevisionIds: [fx.document.currentRevisionId],
+    });
+    fx.store.insertEvidence({
+      projectId: fx.project.id, nodeId: fx.nodeId, planItemId: fx.activePlan.id,
+      documentRevisionId: fx.document.currentRevisionId, sourceType: "manual", sourcePath: "cross-node.json",
+      command: "npm test", resultStatus: "pass", summary: "当前节点独立审计",
+      details: { auditScope: "implementation", implementationRevision: "cross-node" }, commitSha: "cross-node",
+      digest: "cross-node", collectedAt: nowIso(), actorRole: "auditor", agentId: "auditor-id",
+    });
+    expect(transitionPlanLifecycle(fx.store, fx.activePlan.id, {
+      action: "pass_audit", actor: "Auditor", agentId: "auditor-id",
+    }).lifecycleStatus).toBe("pending_manager");
+  });
 });
 
 
@@ -530,6 +572,92 @@ describe("preflight design gap", () => {
   const context = (lease: ReturnType<typeof claimAgentTask>) => ({
     workOrderId: lease.workOrderId, leaseToken: lease.leaseToken, taskKey: lease.taskKey,
     taskRevision: lease.taskRevision, workerId: lease.workerId, agentId: lease.agentId, role: lease.role,
+  });
+  it("stales an overlapping intent when Builder reports a newer design gap", () => {
+    const fx = fixture();
+    const intent = submitDesignChangeIntent(fx.store, {
+      projectId: fx.project.id, diagramId: fx.diagram.id, nodeId: fx.nodeId, rootPlanId: fx.acceptedPlan.id,
+      reason: "已验收范围需要调整", changeSummary: "修订接口", expectedUpdatedAt: fx.diagram.updatedAt,
+      idempotencyKey: "intent-before-gap",
+    });
+    reportDesignGap(fx.store, { ...context(fx.lease), error: "施工发现新设计缺口",
+      idempotencyKey: "report-after-intent" });
+    expect(fx.store.db.prepare("SELECT status FROM design_change_intents WHERE id=?").get(intent.intentId))
+      .toEqual({ status: "stale" });
+    const approvals = buildAgentOrchestration(fx.store, fx.project.id)!.queues.approval
+      .filter((task) => task.actionCode === "request_design_change");
+    expect(approvals.length).toBeGreaterThan(0);
+    expect(approvals.every((task) => task.correlationId.startsWith("design-gap:"))).toBe(true);
+  });
+  it("reports an in-progress reopen_rework gap once and exposes independent approval", () => {
+    const fx = fixture();
+    releaseAgentTask(fx.store, { leaseToken: fx.lease.leaseToken, agentId: fx.lease.agentId, idempotencyKey: "release-before-rework" });
+    fx.store.updatePlan(fx.activePlan.id, { lifecycleStatus: "audit_failed", status: "已完成", auditStatus: "failed" });
+    const lease = claimAgentTask(fx.store, { projectId: fx.project.id, taskId: `development:${fx.activePlan.id}`,
+      role: "builder", agentId: "builder-id", workerId: "rework-builder", idempotencyKey: "claim-rework" });
+    expect(lease.actionCode).toBe("reopen_rework");
+    startAgentTask(fx.store, { leaseToken: lease.leaseToken, agentId: lease.agentId, idempotencyKey: "start-rework" });
+    const approvedInput = { ...context(lease), error: "返工时发现新接口边界", idempotencyKey: "report-rework" };
+    expect(() => reportDesignGap(fx.store, approvedInput)).toThrow();
+    expect(getDesignGap(fx.store, fx.store.getPlan(fx.activePlan.id)!)).toBeUndefined();
+    expect(listAgentTaskLeases(fx.store, fx.project.id).find((item) => item.workOrderId === lease.workOrderId)?.status).toBe("running");
+    expect(buildAgentOrchestration(fx.store, fx.project.id)!.queues.approval.some((task) => task.actionCode === "request_design_change")).toBe(false);
+    transitionPlanLifecycle(fx.store, fx.activePlan.id, { action: "reopen_rework", actor: "Builder", agentId: lease.agentId });
+    expect(reportDesignGap(fx.store, approvedInput).status).toBe("released");
+    expect(reportDesignGap(fx.store, approvedInput).workOrderId).toBe(lease.workOrderId);
+    expect(getDesignGap(fx.store, fx.store.getPlan(fx.activePlan.id)!)).toEqual({
+      id: lease.workOrderId, reason: approvedInput.error, impactedPlanIds: [fx.activePlan.id],
+    });
+    const approvals = buildAgentOrchestration(fx.store, fx.project.id)!.queues.approval
+      .filter((task) => task.planItemId === fx.activePlan.id && task.actionCode === "request_design_change");
+    expect(approvals).toHaveLength(1);
+    expect(buildAgentOrchestration(fx.store, fx.project.id)!.queues.development.some((task) => task.planItemId === fx.activePlan.id)).toBe(false);
+    expect(() => reportDesignGap(fx.store, { ...approvedInput, error: "另一缺口" })).toThrow();
+    expect(getDesignGap(fx.store, fx.store.getPlan(fx.activePlan.id)!)?.id).toBe(lease.workOrderId);
+  });
+  it("rejects invalid reopen_rework reports without releasing a gap or approval", () => {
+    const cases: Array<{ name: string; change: (fx: ReturnType<typeof fixture>, lease: ReturnType<typeof claimAgentTask>, input: ReturnType<typeof context>) => void }> = [
+      { name: "approved before start", change: (fx) => { fx.store.updatePlan(fx.activePlan.id, { lifecycleStatus: "approved" }); } },
+      { name: "wrong worker", change: (_fx, _lease, input) => { input.workerId = "forged"; } },
+      { name: "wrong role", change: (_fx, _lease, input) => { input.role = "auditor"; } },
+      { name: "wrong queue", change: (fx, lease) => { fx.store.db.prepare("UPDATE agent_task_leases SET queue='audit' WHERE id=?").run(lease.workOrderId); } },
+      { name: "wrong action", change: (fx, lease) => { fx.store.db.prepare("UPDATE agent_task_leases SET action_code='audit_design' WHERE id=?").run(lease.workOrderId); } },
+      { name: "wrong scope", change: (fx, lease) => { fx.store.db.prepare("UPDATE agent_task_leases SET work_scopes_json='[]' WHERE id=?").run(lease.workOrderId); } },
+      { name: "wrong revision", change: (_fx, _lease, input) => { input.taskRevision = "stale"; } },
+      { name: "wrong project", change: (fx, lease) => { fx.store.db.prepare("UPDATE agent_task_leases SET project_id='other-project' WHERE id=?").run(lease.workOrderId); } },
+      { name: "expired lease", change: (fx, lease) => { fx.store.db.prepare("UPDATE agent_task_leases SET lease_expires_at='2000-01-01T00:00:00.000Z' WHERE id=?").run(lease.workOrderId); } },
+      { name: "terminal lease", change: (fx, lease) => { releaseAgentTask(fx.store, { leaseToken: lease.leaseToken, agentId: lease.agentId, idempotencyKey: "release-before-report" }); } },
+      { name: "missing impacted plan", change: (_fx, _lease, input) => { Object.assign(input, { impactedPlanIds: ["missing-plan"] }); } },
+      { name: "cross-project impacted plan", change: (fx, _lease, input) => {
+        const other = fx.store.insertProject({ ...fx.project, id: undefined, code: "OTHER" });
+        const plan = fx.store.insertPlan({ ...fx.activePlan, id: undefined, projectId: other.id, title: "异项目计划" });
+        Object.assign(input, { impactedPlanIds: [plan.id] });
+      } },
+      { name: "non-executable impacted plan", change: (fx, _lease, input) => {
+        const goal = fx.store.insertPlan({ ...fx.activePlan, id: undefined, kind: "goal", title: "不可施工目标" });
+        Object.assign(input, { impactedPlanIds: [goal.id] });
+      } },
+    ];
+    for (const testCase of cases) {
+      const fx = fixture();
+      releaseAgentTask(fx.store, { leaseToken: fx.lease.leaseToken, agentId: fx.lease.agentId, idempotencyKey: "release-before-rework" });
+      fx.store.updatePlan(fx.activePlan.id, { lifecycleStatus: "audit_failed", status: "已完成", auditStatus: "failed" });
+      const lease = claimAgentTask(fx.store, { projectId: fx.project.id, taskId: `development:${fx.activePlan.id}`,
+        role: "builder", agentId: "builder-id", workerId: `rework-${testCase.name}`, idempotencyKey: "claim-rework" });
+      startAgentTask(fx.store, { leaseToken: lease.leaseToken, agentId: lease.agentId, idempotencyKey: "start-rework" });
+      transitionPlanLifecycle(fx.store, fx.activePlan.id, { action: "reopen_rework", actor: "Builder", agentId: lease.agentId });
+      const input = context(lease);
+      testCase.change(fx, lease, input);
+      expect(() => reportDesignGap(fx.store, { ...input, error: testCase.name, idempotencyKey: `report-${testCase.name}` }), testCase.name).toThrow();
+      expect(getDesignGap(fx.store, fx.store.getPlan(fx.activePlan.id)!), testCase.name).toBeUndefined();
+      expect(buildAgentOrchestration(fx.store, fx.project.id)!.queues.approval
+        .some((task) => task.planItemId === fx.activePlan.id && task.actionCode === "request_design_change"), testCase.name).toBe(false);
+      expect(designChangeRequestCount(fx.store), testCase.name).toBe(0);
+      const row = fx.store.db.prepare("SELECT status, last_error FROM agent_task_leases WHERE id=?")
+        .get(lease.workOrderId) as { status: string; last_error: string };
+      expect(row.status, testCase.name).toBe(testCase.name === "terminal lease" ? "released" : testCase.name === "expired lease" ? "expired" : "running");
+      expect(row.last_error, testCase.name).not.toMatch(/^design_gap:/);
+    }
   });
   it("reports atomically, rejects old construction and routes independent approval back to Designer", () => {
     const fx = fixture();

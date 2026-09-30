@@ -26,6 +26,7 @@ import {
   updateEvidenceRepairState,
 } from "./evidenceRepair.js";
 import { transitionPlanLifecycle } from "./planLifecycle.js";
+import { submitDesignChangeIntent } from "./designChangeIntent.js";
 import { createMcpServer } from "../mcp/index.js";
 import { LocalMcpClient, mcpResultText } from "./localMcpClient.js";
 import {
@@ -664,14 +665,18 @@ describe("accepted evidence repair", () => {
   });
 
   it("routes an assessed design impact to request_design_change without resetting generation", () => {
-    const { store, project, plan } = acceptedFixture();
+    const { store, project, plan, main, nodeId } = acceptedFixture();
     openEvidenceRepairState(store, plan, 3);
     updateEvidenceRepairState(store, plan.id, { status: "exhausted", attemptCount: 3, disposition: "attempts_exhausted:test" });
+    const intent = submitDesignChangeIntent(store, { projectId: project.id, diagramId: main.id, nodeId,
+      rootPlanId: plan.id, reason: "修改验收口径", changeSummary: "补充设计", expectedUpdatedAt: store.getDiagram(main.id)!.updatedAt,
+      idempotencyKey: "intent-before-repair-assessment" });
     transitionPlanLifecycle(store, plan.id, {
       action: "assess_evidence_repair_failure", actor: "Main Agent", agentId: "Main Agent",
       reason: "验收口径已变化，必须重新设计", repairDisposition: "design_change",
     });
     expect(getEvidenceRepairState(store, plan.id)).toMatchObject({ generation: 0, status: "assessed" });
+    expect(store.db.prepare("SELECT status FROM design_change_intents WHERE id=?").get(intent.intentId)).toEqual({ status: "stale" });
     expect(buildProjectWorkflow(store, project.id)).toMatchObject({ nextAction: { code: "request_design_change", entityId: plan.id } });
     expect(listClaimableAgentTasks(store, project.id).find((task) => task.actionCode === "request_design_change"))
       .toMatchObject({ requiredRole: "approver", taskRevision: `1:request_design_change:repair:0`, available: true });

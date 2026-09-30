@@ -33,6 +33,8 @@ import { collectGitEvidence } from "../server/collectors.js";
 import { newId, nowIso, type Store } from "../server/db.js";
 import { validateDiagramDeliveryTransition, validateDocumentNodeBinding, validateDocumentReferenceTarget } from "../server/domain.js";
 import { ensureManagedProjectDirectory } from "../server/projectFiles.js";
+import { isInitialProjectBriefApproval } from "../server/projectBrief.js";
+import { hasRequirementChangeMarker } from "../server/nodeRequirementRevision.js";
 import { checkLlmProfile, llmProfileSummary } from "../server/llmProfiles.js";
 import { agentProfileProblem, CodexHarness } from "../server/agentHarness.js";
 import { PLAN_TRANSITION_ACTIONS, transitionPlanLifecycle } from "../server/planLifecycle.js";
@@ -1025,6 +1027,10 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
   }, (args) => {
     const before = store.getDesignDoc(args.documentId);
     if (!before) return error(`未找到设计文档: ${args.documentId}`);
+    if (args.status === "已批准" && isInitialProjectBriefApproval(store, before.projectId,
+      { id: before.id, category: args.category ?? before.category })) {
+      return error("PROJECT_BRIEF_APPROVAL_REQUIRED: 首个项目简报必须经独立设计审计和 Main Agent 工单批准");
+    }
     const { documentId, actor, ...patch } = args;
     const updated = store.updateDesignDoc(documentId, patch);
     if (!updated) return error("设计文档更新失败");
@@ -1060,6 +1066,11 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
     if (!document || document.projectId !== project.id) return error("设计文档不存在或不属于当前项目");
     const targetError = validateDocumentReferenceTarget(store, project.id, args.targetType, args.targetId);
     if (targetError) return error(targetError);
+    if (args.targetType === "project" && args.targetId === project.id && args.relationType === "defines"
+      && document.status === "已批准"
+      && isInitialProjectBriefApproval(store, project.id, { id: "", category: document.category })) {
+      return error("PROJECT_BRIEF_APPROVAL_REQUIRED: 首个项目简报必须经独立设计审计和 Main Agent 工单批准");
+    }
     const reference = store.insertDocumentReference({
       projectId: project.id, documentId: document.id, documentRevisionId: args.documentRevisionId,
       targetType: args.targetType, targetId: args.targetId, relationType: args.relationType,
@@ -1162,6 +1173,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
     const before = store.getDiagram(diagramId);
     if (!before) return error(`未找到画布: ${diagramId}`);
     if (before.type === "main") return error("系统主画布不能删除");
+    if (before.nodes.some(hasRequirementChangeMarker)) return error("NODE_REQUIREMENT_REVISION_REQUIRED: 画布含未解除设计变更标记的节点，不能删除");
     store.deleteDiagram(diagramId);
     recordAudit(store, actor, { projectId: before.projectId, entityType: "diagram", entityId: diagramId, action: "delete", before: diagramSummary(before), after: null });
     return result({ ok: true, deletedId: diagramId });

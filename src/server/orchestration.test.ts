@@ -39,6 +39,12 @@ describe("agent orchestration", () => {
       developmentStatus: "未开发" as const, acceptanceStatus: "未验收" as const, x: 100, y: 100 };
     store.updateDiagram(main.id, { nodes: [...main.nodes, original] });
     const orchestration = buildAgentOrchestration(store, project.id)!;
+    const mainAgent = orchestration.recommendedAgents.find((agent) => agent.key === "approver")!;
+    expect(mainAgent.allowedMcpTools).toContain("claim_next_agent_task");
+    expect(buildAgentOrchestration(store, project.id, true)!.bootstrapPrompt)
+      .toContain("approval 队列中的独立 Approver 工单直接调用 claim_next_agent_task");
+    expect(buildAgentOrchestration(store, project.id, true)!.recommendedAgents.find((agent) => agent.key === "approver")!.prompt)
+      .toContain("不领取父协调租约");
     expect(orchestration.queues.design.some((item) => item.actionCode === "approve_node_requirement")).toBe(false);
     expect(orchestration.queues.approval).toEqual(expect.arrayContaining([expect.objectContaining({
       id: `approval:${nodeId}`, queue: "approval", actionCode: "approve_node_requirement",
@@ -133,13 +139,10 @@ describe("agent orchestration", () => {
       projectId: project.id, category: "功能说明", title: "节点设计", summary: "", status: "已批准",
       version: "1.0", author: "designer-id", content: "原固定设计修订",
     });
-    const reference = store.insertDocumentReference({
+    store.insertDocumentReference({
       projectId: project.id, documentId: pending.id, targetType: "diagramNode", targetId: "node-approval", relationType: "defines",
     });
-    const secondReference = store.insertDocumentReference({
-      projectId: project.id, documentId: pending.id, targetType: "diagramNode", targetId: "node-approval", relationType: "supports",
-    });
-    store.updateDesignDoc(pending.id, { status: "评审中", version: "1.1", content: "新的固定设计修订" });
+    store.updateDesignDoc(pending.id, { version: "1.1", content: "新的固定设计修订" });
 
     const upstream = store.insertPlan({
       projectId: project.id, diagramId: main.id, diagramNodeId: "upstream", parentId: null,
@@ -197,60 +200,7 @@ describe("agent orchestration", () => {
       projectId: project.id, role: "approver", agentId: "Main Agent", workerId: "dependent-document-approver", idempotencyKey: "claim-dependent-document",
     }));
     expect(claimed.task.actionCode).toBe("approve_node_document");
-    expect(claimed.launch.prompt).toContain("complete_agent_task(resultDigest=审核结论)");
-    const exact = { leaseToken: claimed.lease.leaseToken, workOrderId: claimed.lease.workOrderId,
-      taskKey: claimed.lease.taskKey, taskRevision: claimed.lease.taskRevision,
-      agentId: "Main Agent", workerId: "dependent-document-approver", role: "approver" } as const;
-    expect(() => completeAgentTask(store, { ...exact, idempotencyKey: "unstarted-document", resultDigest: "批准" }))
-      .toThrow(expect.objectContaining({ code: "NODE_DOCUMENT_APPROVAL_INVALID" }));
-    startAgentTask(store, { ...exact, idempotencyKey: "start-document" });
-    expect(() => completeAgentTask(store, { ...exact, idempotencyKey: "empty-document", resultDigest: " " }))
-      .toThrow(expect.objectContaining({ code: "NODE_DOCUMENT_APPROVAL_INVALID" }));
-    const foreignProject = store.insertProject({
-      code: "FOREIGN-DOC", name: "其它项目", summary: "审批不得越界", stage: "设计", health: "正常",
-      progress: 0, riskLevel: "P1", riskSummary: "", blockerSummary: "", nextStep: "", repositoryPath: dir,
-      startAt: "", dueAt: "",
-    });
-    const foreignDocument = store.insertDesignDoc({
-      projectId: foreignProject.id, category: "功能说明", title: "跨项目文档", summary: "", status: "评审中",
-      version: "1.0", author: "foreign", content: "不得由本项目审批",
-    });
-    const invalidReference = store.insertDocumentReference({
-      projectId: project.id, documentId: foreignDocument.id, targetType: "diagramNode", targetId: "node-approval", relationType: "supports",
-    });
-    expect(() => completeAgentTask(store, { ...exact, idempotencyKey: "changed-document-task", resultDigest: "批准" }))
-      .toThrow(expect.objectContaining({ code: "TASK_REVISION_DRIFT" }));
-    expect(store.getDesignDoc(pending.id)?.status).toBe("评审中");
-    releaseAgentTask(store, { ...exact, idempotencyKey: "release-changed-document" });
-    const foreignClaim = JSON.parse(claimTaskPackage(store, {
-      projectId: project.id, taskId: "approval:node-approval", role: "approver", agentId: "Main Agent",
-      workerId: "foreign-document-approver", idempotencyKey: "claim-foreign-document",
-    }));
-    const foreignExact = { leaseToken: foreignClaim.lease.leaseToken, workOrderId: foreignClaim.lease.workOrderId,
-      taskKey: foreignClaim.lease.taskKey, taskRevision: foreignClaim.lease.taskRevision,
-      agentId: "Main Agent", workerId: "foreign-document-approver", role: "approver" } as const;
-    startAgentTask(store, { ...foreignExact, idempotencyKey: "start-foreign-document" });
-    expect(store.getDesignDoc(pending.id)?.status).toBe("评审中");
-    expect(() => completeAgentTask(store, { ...foreignExact, idempotencyKey: "cross-project-document", resultDigest: "批准" }))
-      .toThrow(expect.objectContaining({ code: "DOCUMENT_SCOPE_INVALID" }));
-    expect(store.getDesignDoc(pending.id)?.status).toBe("评审中");
-    expect(store.getDesignDoc(foreignDocument.id)?.status).toBe("评审中");
-    releaseAgentTask(store, { ...foreignExact, idempotencyKey: "release-foreign-document" });
-    store.deleteDocumentReference(invalidReference.id);
-    const validClaim = JSON.parse(claimTaskPackage(store, {
-      projectId: project.id, taskId: "approval:node-approval", role: "approver", agentId: "Main Agent",
-      workerId: "valid-document-approver", idempotencyKey: "claim-valid-document",
-    }));
-    const validExact = { leaseToken: validClaim.lease.leaseToken, workOrderId: validClaim.lease.workOrderId,
-      taskKey: validClaim.lease.taskKey, taskRevision: validClaim.lease.taskRevision,
-      agentId: "Main Agent", workerId: "valid-document-approver", role: "approver" } as const;
-    startAgentTask(store, { ...validExact, idempotencyKey: "start-valid-document" });
-    const completed = completeAgentTask(store, { ...validExact, idempotencyKey: "approve-document", resultDigest: "当前修订和节点引用已核对" });
-    expect(completed.status).toBe("completed");
-    expect(store.getDesignDoc(pending.id)?.status).toBe("已批准");
-    expect(store.getDocumentReference(reference.id)?.documentRevisionId).toBe(store.getDesignDoc(pending.id)?.currentRevisionId);
-    expect(store.getDocumentReference(secondReference.id)?.documentRevisionId).toBe(store.getDesignDoc(pending.id)?.currentRevisionId);
-    expect(listClaimableAgentTasks(store, project.id).some((item) => item.id === "approval:node-approval")).toBe(false);
+    releaseAgentTask(store, { leaseToken: claimed.lease.leaseToken, agentId: "Main Agent", idempotencyKey: "release-dependent-document" });
     for (const [lifecycleStatus, auditStatus, queue, actionCode] of [
       ["draft", "not_requested", "design", "submit_plan"],
       ["pending_approval", "pending", "audit", "audit_design"],
@@ -302,6 +252,92 @@ describe("agent orchestration", () => {
       actionCode: "approve_node_document",
       assignee: expect.objectContaining({ agentId: "Main Agent" }),
     })]));
+  });
+
+  it("keeps document approval claimable when another node action has higher workflow priority", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pcs-node-doc-competing-action-"));
+    const store = new Store(join(dir, "test.db"));
+    resources.push({ store, dir });
+    const project = store.insertProject({
+      code: "NODE-DOC-COMPETING", name: "节点文档并行动作", summary: "文档审批不得被其它动作遮蔽", stage: "设计", health: "正常",
+      progress: 0, riskLevel: "P1", riskSummary: "", blockerSummary: "", nextStep: "", repositoryPath: dir,
+      startAt: "", dueAt: "",
+    });
+    const main = store.listDiagrams(project.id).find((diagram) => diagram.type === "main")!;
+    const nodeId = "node-doc-competing";
+    store.updateDiagram(main.id, { nodes: [...main.nodes, {
+      id: nodeId, kind: "feature", label: "并行动作节点", description: "完整定义", owner: "team",
+      acceptanceCriteria: "文档审批工单可独立领取", requirementStatus: "已批准", designStatus: "待评审",
+      developmentStatus: "未开发", acceptanceStatus: "未验收", x: 620, y: 160,
+    }] });
+    store.insertDiagram({ projectId: project.id, title: "同 ID 子画布", type: "functional", edges: [], nodes: [{
+      id: nodeId, kind: "feature", label: "同 ID 的独立节点", description: "独立画布", owner: "team",
+      acceptanceCriteria: "保留独立身份", requirementStatus: "已批准", designStatus: "已批准",
+      developmentStatus: "未开发", acceptanceStatus: "未验收", x: 100, y: 100,
+    }] });
+    const approvalTaskId = `approval:${main.id}:${nodeId}`;
+    const brief = store.insertDesignDoc({
+      projectId: project.id, category: "需求文档", title: "项目简报", summary: "", status: "已批准",
+      version: "1.0", author: "manager", content: "节点文档与设计缺口分别治理",
+    });
+    store.insertDocumentReference({ projectId: project.id, documentId: brief.id, targetType: "project", targetId: project.id, relationType: "defines" });
+    const document = store.insertDesignDoc({
+      projectId: project.id, category: "功能说明", title: "节点设计", summary: "", status: "已批准",
+      version: "1.0", author: "designer-id", content: "已固定设计",
+    });
+    const reference = store.insertDocumentReference({
+      projectId: project.id, documentId: document.id, targetType: "diagramNode", targetId: nodeId, relationType: "defines",
+    });
+    store.insertPlan({
+      projectId: project.id, diagramId: main.id, diagramNodeId: nodeId, parentId: null,
+      kind: "task", title: "已有施工计划", description: "", status: "未开始", priority: "P1", progress: 0,
+      owner: "builder", versionTag: "", startAt: "", dueAt: "", dependencyIds: [], blockedReason: "", completedAt: "",
+      lifecycleStatus: "approved", designRevisionIds: [reference.documentRevisionId], submittedAt: "2026-09-20T00:00:00.000Z",
+      approvedAt: "2026-09-20T00:01:00.000Z", auditStatus: "passed", roleAssignments,
+    });
+    store.updateDesignDoc(document.id, { status: "评审中", version: "1.1", content: "待批准设计修订" });
+
+    const result = buildAgentOrchestration(store, project.id)!;
+    expect(result.workflow.nodes.find((item) => item.diagramId === main.id && item.nodeId === nodeId)?.nextAction?.code)
+      .toBe("request_design_change");
+    expect(result.queues.approval).toEqual(expect.arrayContaining([expect.objectContaining({
+      id: approvalTaskId,
+      actionCode: "approve_node_document",
+      href: `#/canvas/${main.id}/node/${nodeId}?tab=documents`,
+    })]));
+
+    const claimed = JSON.parse(claimTaskPackage(store, {
+      projectId: project.id, taskId: approvalTaskId, role: "approver", agentId: "Main Agent",
+      workerId: "node-document-approver", idempotencyKey: "claim-node-document",
+    }));
+    expect(claimed.launch.prompt).toContain("complete_agent_task(resultDigest=审核结论)");
+    startAgentTask(store, {
+      leaseToken: claimed.lease.leaseToken, agentId: "Main Agent", idempotencyKey: "start-node-document",
+    });
+    const completed = completeAgentTask(store, {
+      leaseToken: claimed.lease.leaseToken, agentId: "Main Agent", idempotencyKey: "complete-node-document",
+      resultDigest: "已审核当前待批准文档修订并确认节点引用",
+    });
+    expect(completed.status).toBe("completed");
+    expect(store.getDesignDoc(document.id)?.status).toBe("已批准");
+    expect(store.getDocumentReference(reference.id)?.documentRevisionId).toBe(store.getDesignDoc(document.id)?.currentRevisionId);
+
+    const foreignProject = store.insertProject({
+      code: "FOREIGN-NODE-DOC", name: "外部项目", summary: "", stage: "设计", health: "正常",
+      progress: 0, riskLevel: "P1", riskSummary: "", blockerSummary: "", nextStep: "", repositoryPath: dir,
+      startAt: "", dueAt: "",
+    });
+    const foreignDocument = store.insertDesignDoc({ projectId: foreignProject.id, category: "功能说明",
+      title: "跨项目文档", summary: "", status: "评审中", version: "1.0", author: "other", content: "不能越权审批" });
+    store.insertDocumentReference({ projectId: project.id, documentId: foreignDocument.id,
+      targetType: "diagramNode", targetId: nodeId, relationType: "supports" });
+    const foreignClaim = JSON.parse(claimTaskPackage(store, { projectId: project.id, taskId: approvalTaskId,
+      role: "approver", agentId: "Main Agent", workerId: "foreign-document-approver", idempotencyKey: "claim-foreign-document" }));
+    startAgentTask(store, { leaseToken: foreignClaim.lease.leaseToken, agentId: "Main Agent", idempotencyKey: "start-foreign-document" });
+    expect(() => completeAgentTask(store, { leaseToken: foreignClaim.lease.leaseToken, agentId: "Main Agent",
+      idempotencyKey: "complete-foreign-document", resultDigest: "不能跨项目批准" }))
+      .toThrow(expect.objectContaining({ code: "DOCUMENT_SCOPE_INVALID" }));
+    expect(store.getDesignDoc(foreignDocument.id)?.status).toBe("评审中");
   });
 
   it("derives an independent Designer task for every draft parent and child plan on the same node", () => {

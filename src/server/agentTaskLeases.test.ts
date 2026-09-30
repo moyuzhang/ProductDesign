@@ -576,6 +576,31 @@ describe("agent task leases", () => {
     expect((store.db.prepare("SELECT status FROM agent_task_workspace_reservations WHERE lease_token=?").get(lease.leaseToken) as { status: string }).status).toBe("expired");
   });
 
+  it("clears an orphaned resource lock before reclaiming an expired task", () => {
+    const { store, projectId, planIds } = fixture();
+    const first = claim(store, projectId, "orphan-first", `development:${planIds[0]}`);
+    store.db.prepare("UPDATE agent_task_leases SET status='expired', retry_available_at='2000-01-01T00:00:00.000Z' WHERE id=?")
+      .run(first.workOrderId);
+    expect(listClaimableAgentTasks(store, projectId).find((task) => task.id === first.taskId)?.available).toBe(true);
+    expect((store.db.prepare("SELECT COUNT(*) AS count FROM agent_task_resource_locks WHERE lease_token=?")
+      .get(first.leaseToken) as { count: number }).count).toBe(0);
+    expect(claim(store, projectId, "orphan-reclaim", first.taskId).status).toBe("claimed");
+  });
+
+  it("does not expire a new runner because an older case variant is stale", () => {
+    const { store, projectId, planIds } = fixture();
+    const taskId = `development:${planIds[0]}`;
+    const first = claim(store, projectId, "case-first", taskId, "builder-id", "case-first", "Case-Worker");
+    store.db.prepare("UPDATE agent_task_leases SET lease_expires_at='2000-01-01T00:00:00.000Z' WHERE id=?")
+      .run(first.workOrderId);
+    listAgentTaskLeases(store, projectId);
+    store.db.prepare("UPDATE agent_task_leases SET retry_available_at='2000-01-01T00:00:00.000Z' WHERE task_key=?")
+      .run(first.taskKey);
+    store.db.prepare("UPDATE agent_runner_registrations SET status='stale', last_seen_at='2000-01-01T00:00:00.000Z' WHERE worker_id='Case-Worker'").run();
+    const second = claim(store, projectId, "case-second", taskId, "builder-id", "case-second", "case-worker");
+    expect(listAgentTaskLeases(store, projectId).find((lease) => lease.workOrderId === second.workOrderId)?.status).toBe("claimed");
+  });
+
   it("allows takeover only after expiry and invalidates the old token", () => {
     const { store, projectId, planIds } = fixture();
     const taskId = `development:${planIds[0]}`;

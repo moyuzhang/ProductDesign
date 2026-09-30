@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { Store } from "./db.js";
 import { invalidateCoordinationByCredential } from "./coordinationLeases.js";
 
@@ -19,7 +20,7 @@ export type AgentRole = "designer" | "builder" | "auditor" | "approver";
 export interface AuthPrincipal {
   principalId: string;
   actorType: "agent";
-  authenticationMethod: "hmac-sha256";
+  authenticationMethod: "hmac-sha256" | "local-process";
   credentialId: string;
   agentId: string;
   workerId: string;
@@ -70,6 +71,27 @@ const sha256 = (value: string) => createHash("sha256").update(value).digest("hex
 const secretHash = (secret: string) => sha256(`productdesign-agent-credential:${secret}`);
 const json = <T>(value: string): T => JSON.parse(value) as T;
 const expiresIn = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString();
+// Only a server-owned stdio connection can enter this context; no request flag is trusted.
+const localConnection = new AsyncLocalStorage<string>();
+export function withLocalAgentConnection<T>(connectionId: string, operation: () => T): T {
+  return localConnection.run(connectionId, operation);
+}
+
+export function assertCredentialAudience(store: Store, credentialId: string): void {
+  const credential = store.db.prepare("SELECT authentication_method, connection_id FROM agent_credentials WHERE credential_id=?")
+    .get(credentialId) as { authentication_method: string; connection_id: string } | undefined;
+  if (credential?.authentication_method === "local-process" && credential.connection_id !== localConnection.getStore()) {
+    throw new AgentSecurityError(403, "TOKEN_AUDIENCE_MISMATCH", "Local authorization belongs to another server connection");
+  }
+}
+
+export function assertLocalAgentIdentityAudience(store: Store, agentId: string, workerId: string): void {
+  ensureAgentSecuritySchema(store);
+  const local = store.db.prepare(`SELECT credential_id FROM agent_credentials
+    WHERE lower(agent_id)=lower(?) AND lower(worker_id)=lower(?) AND authentication_method='local-process' ORDER BY issued_at DESC LIMIT 1`)
+    .get(agentId, workerId) as { credential_id: string } | undefined;
+  if (local) assertCredentialAudience(store, local.credential_id);
+}
 
 export function ensureAgentSecuritySchema(store: Store): void {
   store.db.exec(`
@@ -111,6 +133,66 @@ export function ensureAgentSecuritySchema(store: Store): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_credentials_identity
       ON agent_credentials(principal_id, agent_id, worker_id, credential_id);
   `);
+  const columns = store.db.prepare("PRAGMA table_info(agent_credentials)").all() as Array<{ name: string }>;
+  for (const [name, definition] of [["authentication_method", "TEXT NOT NULL DEFAULT 'hmac-sha256'"],
+    ["connection_id", "TEXT NOT NULL DEFAULT ''"]]) {
+    if (!columns.some((column) => column.name === name)) store.db.exec(`ALTER TABLE agent_credentials ADD COLUMN ${name} ${definition}`);
+  }
+}
+
+/** Host-only, short-lived authorization. Never exported as an MCP registration tool. */
+export function createLocalAgentSession(store: Store, input: { projectId: string; workerId: string; connectionId: string }) {
+  ensureAgentSecuritySchema(store);
+  if (!store.getProject(input.projectId) || !input.workerId.trim() || input.connectionId.length < 16) {
+    throw new AgentSecurityError(400, "LOCAL_SCOPE_INVALID", "Local authorization needs an existing project and unique worker/connection");
+  }
+  const credentialId = randomUUID();
+  const authSessionToken = randomBytes(32).toString("base64url");
+  const principal: AuthPrincipal = { principalId: `local-process/${input.connectionId}`, actorType: "agent",
+    authenticationMethod: "local-process", credentialId, agentId: "Main Agent", workerId: input.workerId,
+    allowedRoles: ["approver"], allowedProjects: [input.projectId], connectionId: input.connectionId,
+    issuedAt: new Date().toISOString(), expiresAt: expiresIn(900) };
+  store.db.transaction(() => {
+    store.db.prepare(`INSERT INTO agent_credentials (credential_id,principal_id,agent_id,worker_id,secret_hash,
+      allowed_roles_json,allowed_projects_json,issued_at,expires_at,authentication_method,connection_id)
+      VALUES (?,?,?,?,?,?,?,?,?,'local-process',?)`).run(credentialId, principal.principalId, principal.agentId,
+      principal.workerId, secretHash(randomBytes(32).toString("base64url")), '["approver"]', JSON.stringify(principal.allowedProjects),
+      principal.issuedAt, principal.expiresAt, principal.connectionId);
+    store.db.prepare(`INSERT INTO agent_auth_sessions (session_token_hash,credential_id,principal_id,agent_id,worker_id,
+      allowed_roles_json,allowed_projects_json,connection_id,issued_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(sha256(authSessionToken), credentialId, principal.principalId, principal.agentId, principal.workerId,
+        '["approver"]', JSON.stringify(principal.allowedProjects), principal.connectionId, principal.issuedAt, principal.expiresAt);
+    audit(store, "auth.local_process", "success", { actorType: "system", authenticationMethod: "local-process",
+      credentialId, principalId: principal.principalId, connectionId: principal.connectionId });
+  }).immediate();
+  return { ...principal, authSessionToken };
+}
+
+export function closeLocalAgentSession(store: Store, credentialId: string): void {
+  ensureAgentSecuritySchema(store);
+  const now = new Date().toISOString();
+  store.db.transaction(() => {
+    const changed = store.db.prepare(`UPDATE agent_credentials SET status='revoked',revoked_at=?,revocation_version=revocation_version+1
+      WHERE credential_id=? AND authentication_method='local-process' AND status='active'`).run(now, credentialId);
+    if (!changed.changes) return;
+    store.db.prepare("UPDATE agent_tokens SET revoked_at=? WHERE credential_id=? AND revoked_at=''").run(now, credentialId);
+    store.db.prepare("UPDATE agent_auth_sessions SET revoked_at=? WHERE credential_id=? AND revoked_at=''").run(now, credentialId);
+    invalidateCoordinationByCredential(store, credentialId);
+    if (store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_task_leases'").get()) {
+      const identity = store.db.prepare("SELECT agent_id,worker_id FROM agent_credentials WHERE credential_id=?")
+        .get(credentialId) as { agent_id: string; worker_id: string };
+      const leases = store.db.prepare("SELECT lease_token FROM agent_task_leases WHERE agent_id=? AND worker_id=? AND status IN ('claimed','running')")
+        .all(identity.agent_id, identity.worker_id) as Array<{ lease_token: string }>;
+      for (const lease of leases) {
+        store.db.prepare("UPDATE agent_task_leases SET status='released',completed_at=?,updated_at=? WHERE lease_token=?").run(now, now, lease.lease_token);
+        store.db.prepare("DELETE FROM agent_task_resource_locks WHERE lease_token=?").run(lease.lease_token);
+        store.db.prepare("UPDATE agent_task_workspace_reservations SET status='released',updated_at=? WHERE lease_token=?").run(now, lease.lease_token);
+      }
+      store.db.prepare("UPDATE agent_runner_registrations SET status='offline',last_seen_at=?,updated_at=? WHERE agent_id=? AND worker_id=?")
+        .run(now, now, identity.agent_id, identity.worker_id);
+    }
+    audit(store, "auth.local_process.close", "success", { actorType: "system", authenticationMethod: "local-process", credentialId });
+  }).immediate();
 }
 
 export function isAgentSecurityEnforced(store: Store, agentId?: string): boolean {
@@ -197,6 +279,7 @@ export function revokeAgentCredential(store: Store, credentialId: string): void 
 
 export function beginAgentAuth(store: Store, credentialId: string, connectionId: string) {
   ensureAgentSecuritySchema(store);
+  assertCredentialAudience(store, credentialId);
   const row = store.db.prepare("SELECT * FROM agent_credentials WHERE credential_id=?").get(credentialId) as CredentialRow | undefined;
   const now = new Date().toISOString();
   if (!row || row.status !== "active" || row.expires_at <= now) {
@@ -236,6 +319,7 @@ export function completeAgentAuth(store: Store, input: {
     if (consumed.changes !== 1) throw new AgentSecurityError(409, "TOKEN_REPLAYED", "Challenge was consumed concurrently");
     const credential = store.db.prepare("SELECT * FROM agent_credentials WHERE credential_id=?")
       .get(challengeRow.credential_id) as CredentialRow | undefined;
+    assertCredentialAudience(store, challengeRow.credential_id);
     if (!credential || credential.status !== "active" || credential.expires_at <= now) {
       throw new AgentSecurityError(401, "CREDENTIAL_REJECTED", "Credential is revoked or expired");
     }
@@ -272,11 +356,12 @@ export function resolveAuthPrincipal(store: Store, authSessionToken: string): Au
     .get(sha256(authSessionToken)) as Record<string, string> | undefined;
   const now = new Date().toISOString();
   if (!row || row.revoked_at || row.expires_at <= now) throw new AgentSecurityError(401, "AUTH_REQUIRED", "Authenticated Agent session is required");
-  const credential = store.db.prepare("SELECT status, expires_at FROM agent_credentials WHERE credential_id=?")
-    .get(row.credential_id) as { status: string; expires_at: string } | undefined;
+  assertCredentialAudience(store, row.credential_id);
+  const credential = store.db.prepare("SELECT status, expires_at, authentication_method FROM agent_credentials WHERE credential_id=?")
+    .get(row.credential_id) as { status: string; expires_at: string; authentication_method: AuthPrincipal["authenticationMethod"] } | undefined;
   if (!credential || credential.status !== "active" || credential.expires_at <= now) throw new AgentSecurityError(401, "TOKEN_REVOKED", "Credential was revoked or expired");
   return {
-    principalId: row.principal_id, actorType: "agent", authenticationMethod: "hmac-sha256",
+    principalId: row.principal_id, actorType: "agent", authenticationMethod: credential.authentication_method,
     credentialId: row.credential_id, agentId: row.agent_id, workerId: row.worker_id,
     allowedRoles: json<AgentRole[]>(row.allowed_roles_json), allowedProjects: json<string[]>(row.allowed_projects_json),
     connectionId: row.connection_id, issuedAt: row.issued_at, expiresAt: row.expires_at,
@@ -301,6 +386,7 @@ export function acknowledgeAgentPolicy(store: Store, principal: AuthPrincipal, i
   role: AgentRole; projectId: string; policyVersion: string;
 }): { policyAckToken: string; tokenId: string; expiresAt: string; policyVersion: string } {
   ensureAgentSecuritySchema(store);
+  assertCredentialAudience(store, principal.credentialId);
   if (input.policyVersion !== AGENT_POLICY_VERSION) throw new AgentSecurityError(409, "POLICY_VERSION_STALE", "Current policy version must be acknowledged");
   if (!principal.allowedRoles.includes(input.role) || !principal.allowedProjects.includes(input.projectId)) {
     throw new AgentSecurityError(403, "PERMISSION_DENIED", "Credential does not allow this role or project");
@@ -327,10 +413,11 @@ export function issueOneTimeNonce(store: Store, input: {
   policyAckToken: string; workOrderId: string; action: string; target: string; bodyDigest: string;
 }): { nonceId: string; expiresAt: string } {
   ensureAgentSecuritySchema(store);
-  const token = store.db.prepare("SELECT token_id, expires_at, revoked_at FROM agent_tokens WHERE token_hash=?")
-    .get(sha256(input.policyAckToken)) as Pick<TokenRow, "token_id" | "expires_at" | "revoked_at"> | undefined;
+  const token = store.db.prepare("SELECT token_id, credential_id, expires_at, revoked_at FROM agent_tokens WHERE token_hash=?")
+    .get(sha256(input.policyAckToken)) as Pick<TokenRow, "token_id" | "credential_id" | "expires_at" | "revoked_at"> | undefined;
   const now = new Date().toISOString();
   if (!token || token.revoked_at || token.expires_at <= now) throw new AgentSecurityError(401, "TOKEN_EXPIRED", "Policy token is invalid or expired");
+  assertCredentialAudience(store, token.credential_id);
   const nonceId = randomUUID();
   const expiresAt = expiresIn(120);
   store.db.prepare(`INSERT INTO one_time_nonces
@@ -350,6 +437,7 @@ export function assertAgentWorkOrderContext(store: Store, input: WorkOrderContex
   return store.db.transaction(() => {
     const token = store.db.prepare("SELECT * FROM agent_tokens WHERE token_hash=?").get(sha256(input.policyAckToken!)) as TokenRow | undefined;
     if (!token) throw new AgentSecurityError(401, "POLICY_ACK_REQUIRED", "Current policy acknowledgment is required");
+    assertCredentialAudience(store, token.credential_id);
     if (token.expires_at <= now) throw new AgentSecurityError(401, "TOKEN_EXPIRED", "Policy token expired");
     if (token.revoked_at) throw new AgentSecurityError(401, "TOKEN_REVOKED", "Policy token revoked");
     if (token.policy_version !== AGENT_POLICY_VERSION) throw new AgentSecurityError(409, "POLICY_VERSION_STALE", "Policy token is stale");

@@ -22,9 +22,12 @@ import { AGENT_POLICY_VERSION } from "./agentSecurity.js";
 import { PROJECT_WORKFLOW_POLICY } from "../shared/workflowPolicy.js";
 import type { Store } from "./db.js";
 import { buildProjectWorkflow } from "./workflow.js";
-import { getDesignGap, transitiveDependentPlanIds, type DesignGap } from "./designGap.js";
-import { isExecutableDeliveryPlan } from "./planPolicy.js";
+import { designChangeImpactedPlanIds, getDesignGap, type DesignGap } from "./designGap.js";
+import { isActiveDeliveryPlan } from "./planPolicy.js";
 import { getProjectedProjectWorkspace } from "./projectProjection.js";
+import { managedProjectPath } from "./projectFiles.js";
+import { isProjectBriefTask, projectBriefProgress, projectBriefTaskSuffix } from "./projectBrief.js";
+import { inspectProjectFoundation } from "./workflow.js";
 import { normalizeAgentId, roleAssignmentErrors } from "../shared/planRoles.js";
 import { effectiveAgentTaskAssignment } from "../shared/agentTaskAssignment.js";
 import { assertPlanImplementationUnlocked, assertPlanLayerUnlocked, isPlanImplementationUnlocked, isDesignPhaseAction } from "./planLayers.js";
@@ -37,14 +40,14 @@ import {
 } from "./agentTaskReassignment.js";
 
 const DESIGN_ACTIONS = new Set([
-  "complete_node_definition", "approve_node_document",
+  "complete_node_definition", "revise_node_requirement", "approve_node_document",
   "approve_node_design", "bind_node_database", "create_node_plan", "submit_plan",
 ]);
 
 // An accepted node only surfaces these actions again; everything else stays suppressed
 // so an already-delivered node cannot silently reopen its delivery workflow.
 const ACCEPTED_NODE_ACTIONS = new Set([
-  "submit_plan", "submit_evidence_repair", "assess_evidence_repair_failure",
+  "submit_plan", "revise_node_requirement", "submit_evidence_repair", "assess_evidence_repair_failure",
   "reset_evidence_repair_attempt", "request_design_change",
 ]);
 
@@ -322,11 +325,11 @@ function agentBlueprints(store: Store, includePrompts: boolean): AgentBlueprint[
       purpose: "仅在独立审计通过后，以全新 approval 工单审核施工计划或执行最终验收。",
       responsibilities: ["重新领取独立 approval 工单", "核对当前审计、验收标准与证据", "批准计划、批准验收或给出可执行的返工条件", "在当前工单节点范围内发起需要重新设计的常规变更"],
       boundaries: ["不得复用审计租约", "不得与 Designer、Builder 或 Auditor 生产身份冲突", "不得批准 human-only 高风险动作"],
-      allowedMcpTools: ["get_project_workflow", "claim_coordination_lease", "heartbeat_coordination_lease", "dispatch_child_task", "claim_dispatched_child_task", "reclaim_child_task", "reassign_child_task", "pause_coordination_lease", "release_coordination_lease", "advance_coordination_stage", "get_agent_task_package", "start_agent_task", "heartbeat_agent_task", "get_plan_item", "list_evidence", "submit_design_change_intent", "request_design_change", "dismiss_design_change_intent", "request_evidence_repair_assessment", "dismiss_design_gap", "approve_agent_reassignment", "transition_plan_delivery", "complete_agent_task", "release_agent_task"],
+      allowedMcpTools: ["get_project_workflow", "claim_next_agent_task", "claim_coordination_lease", "heartbeat_coordination_lease", "dispatch_child_task", "claim_dispatched_child_task", "reclaim_child_task", "reassign_child_task", "pause_coordination_lease", "release_coordination_lease", "advance_coordination_stage", "get_agent_task_package", "start_agent_task", "heartbeat_agent_task", "get_plan_item", "list_evidence", "submit_design_change_intent", "request_design_change", "dismiss_design_change_intent", "request_evidence_repair_assessment", "dismiss_design_gap", "approve_agent_reassignment", "transition_plan_delivery", "complete_agent_task", "release_agent_task"],
       consumes: ["已通过的独立审计", "当前固定修订", "证据"],
       produces: ["可追溯的计划批准、最终验收或返工决定"],
       completionConditions: ["独立 approval workOrderId", "独立审计已通过且证据完整", "无生产者身份冲突", "高风险事项未被自动批准"],
-      prompt: includePrompts ? "你是 Main Agent。先确定唯一目标：已有计划传 planId；无计划 design/Designer 任务从当前可领取列表取精确 taskKey+taskRevision，二者恰选其一领取父租约。只有你可以选择、派发、暂停、回收和重派；任务型父租约只派绑定的设计任务，完成后自动释放，不进入计划阶段。计划型按 Designer → Design Auditor → 你批准 → Builder → Implementation Auditor → 你验收推进。子 Agent 禁止自行领取；只能凭一次性 dispatchId 获取精确任务包。父租约或 Runner 失联时回收并重派，旧子 leaseToken 永不复用。" : "",
+      prompt: includePrompts ? "你是 Main Agent。先按工作流和队列确定任务：approval 队列中的独立 Approver 工单直接调用 claim_next_agent_task(role=approver, agentId=Main Agent) 领取，开工后按任务包完成审批，不领取父协调租约；需要派发 Designer、Builder 或 Auditor 时，已有计划传 planId，无计划设计或项目简报审计传精确 taskKey+taskRevision，二者恰选其一领取父协调租约。只有你可以选择、派发、暂停、回收和重派；任务型父租约只派绑定任务，完成后自动释放。计划型按 Designer → Design Auditor → 你批准 → Builder → Implementation Auditor → 你验收推进。子 Agent 禁止自行领取；只能凭一次性 dispatchId 获取精确任务包。父租约或 Runner 失联时回收并重派，旧子 leaseToken 永不复用。" : "",
     },
   ];
   // Merge any globally-shared, user-edited overrides onto the editable fields only.
@@ -365,12 +368,65 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
   const project = getProjectedProjectWorkspace(store, projectId, workflow)?.project;
   if (!project || !workflow) return undefined;
   const queues: AgentOrchestration["queues"] = { design: [], development: [], audit: [], approval: [], managerApproval: [] };
+  if (inspectProjectFoundation(store, projectId).approvedBriefCount === 0) {
+    const brief = projectBriefProgress(store, projectId);
+    const suffix = projectBriefTaskSuffix(projectId);
+    const queue = brief.stage;
+    const role = queue === "design" ? "designer" : queue === "audit" ? "auditor" : "approver";
+    const actionCode = queue === "design" ? "prepare_project_brief"
+      : queue === "audit" ? "audit_project_brief" : "approve_project_brief";
+    const failedRevision = brief.evidence?.resultStatus === "fail" ? brief.evidence.id
+      : brief.approval?.result_digest.startsWith("rejected:") ? brief.approval.id : "";
+    const assignee = role === "approver" ? MAIN_AGENT_APPROVER : {
+      agentId: `project-brief-${role}:${projectId}`,
+      displayName: `项目简报 ${role === "designer" ? "Designer" : "Design Auditor"}`,
+    };
+    queues[queue].push({
+      id: `${queue}:${suffix}`, queue, projectId, diagramId: null, nodeId: null, planItemId: null,
+      correlationId: suffix, title: `项目简报：${project.name}`,
+      reason: queue === "design" ? "形成项目级需求简报；提交者不得自审"
+        : queue === "audit" ? "独立审计当前项目简报修订" : "Main Agent 复核独立设计审计并批准或退回",
+      priority: "P1", deliveryLayer: 0, dueAt: "", createdAt: project.createdAt,
+      actionCode, deliveryTrack: "design", auditScope: queue === "design" ? null : "design",
+      deliveryAttempt: 1, producerTaskKey: queue === "audit" ? brief.design?.task_key ?? null
+        : queue === "approval" ? brief.audit?.task_key ?? null : null,
+      producerWorkerId: queue === "audit" ? brief.design?.worker_id ?? null
+        : queue === "approval" ? brief.audit?.worker_id ?? null : null,
+      documentRevisionIds: brief.revisionId ? [brief.revisionId] : [], implementationRevision: "",
+      supersedesEvidenceIds: failedRevision ? [failedRevision] : [], managerApprovalRequired: false,
+      href: `#/projects/${projectId}?tab=documents`, assignee,
+      workScopes: [`project:${projectId}`],
+    });
+  }
+  if (workflow.nextAction?.code === "add_function_node" && workflow.nextAction.diagramId) {
+    const diagramId = workflow.nextAction.diagramId;
+    const briefReferences = store.listDocumentReferences({ projectId, targetType: "project", targetId: projectId })
+      .filter((reference) => reference.relationType === "defines");
+    const approvedBrief = store.listDesignDocs(projectId).find((document) => document.status === "已批准"
+      && ["需求文档", "功能说明"].includes(document.category)
+      && briefReferences.some((reference) => reference.documentId === document.id
+        && reference.documentRevisionId === document.currentRevisionId));
+    if (!approvedBrief) throw new AgentTaskPackageError(409, "PROJECT_BRIEF_REQUIRED", "节点拆分缺少已批准的项目简报");
+    queues.design.push({
+      id: `design:project-nodes:${projectId}`, queue: "design", projectId, diagramId, nodeId: null, planItemId: null,
+      correlationId: `project-nodes:${projectId}`, title: `拆分功能节点：${project.name}`,
+      reason: "按已批准项目简报在系统主画布建立首批可交付功能节点",
+      priority: "P1", deliveryLayer: 0, dueAt: "", createdAt: project.createdAt,
+      actionCode: "add_function_node", deliveryTrack: "design", auditScope: null,
+      deliveryAttempt: 1, producerTaskKey: null, producerWorkerId: null,
+      documentRevisionIds: [approvedBrief.currentRevisionId], implementationRevision: "",
+      supersedesEvidenceIds: [], managerApprovalRequired: false,
+      href: workflow.nextAction.href,
+      assignee: { agentId: `project-nodes-designer:${projectId}`, displayName: "功能节点 Designer" },
+      workScopes: [`diagram:${diagramId}`],
+    });
+  }
   const layerStateByPlanId = new Map(workflow.layerGate.plans.map((state) => [state.planId, state]));
   // Load plans once per project and index by `${diagramId}|${nodeId}` to avoid re-querying per node.
   const plansByNode = new Map<string, PlanItem[]>();
   const projectPlans = store.listPlans(projectId);
   for (const plan of projectPlans) {
-    if (!isExecutableDeliveryPlan(plan) || !plan.diagramId || !plan.diagramNodeId) continue;
+    if (!isActiveDeliveryPlan(plan) || !plan.diagramId || !plan.diagramNodeId) continue;
     const key = `${plan.diagramId}|${plan.diagramNodeId}`;
     const list = plansByNode.get(key) ?? [];
     list.push(plan);
@@ -380,7 +436,7 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
   for (const rootPlan of projectPlans) {
     const gap = getDesignGap(store, rootPlan);
     if (!gap) continue;
-    for (const planId of transitiveDependentPlanIds(projectPlans, gap.impactedPlanIds)) {
+    for (const planId of designChangeImpactedPlanIds(projectPlans, gap.impactedPlanIds)) {
       if (!designGapByPlanId.has(planId)) designGapByPlanId.set(planId, { rootPlan, gap });
     }
   }
@@ -388,15 +444,17 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
   for (const node of workflow.nodes) {
     const plans = plansByNode.get(`${node.diagramId}|${node.nodeId}`) ?? [];
     const action = node.nextAction;
-    const pendingNodeDocumentApproval = action?.code === "approve_node_document"
-      && hasPendingNodeDocumentRevision(store, projectId, node.nodeId);
+    const pendingNodeDocumentApproval = hasPendingNodeDocumentRevision(store, projectId, node.nodeId);
+    const nodeDocumentApprovalIsNext = action?.code === "approve_node_document";
     // A later approved revision of a shared node document supersedes the revision this node
     // pinned. The node must keep getting its approve_node_document task, otherwise it loses
     // the only chance to re-pin and silently drops out of every queue.
     if (node.acceptanceStatus === "已通过"
       && !ACCEPTED_NODE_ACTIONS.has(action?.code ?? "")
       && !pendingNodeDocumentApproval) continue;
-    if (action && DESIGN_ACTIONS.has(action.code) && !pendingNodeDocumentApproval && workflow.layerGate.issues.length === 0) {
+    if (action && DESIGN_ACTIONS.has(action.code)
+      && !(nodeDocumentApprovalIsNext && pendingNodeDocumentApproval)
+      && workflow.layerGate.issues.length === 0) {
       const actionPlan = action.entityType === "plan" && action.entityId
         ? plans.find((plan) => plan.id === action.entityId) ?? null
         : null;
@@ -405,8 +463,11 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
     if (action?.code === "approve_node_requirement" && workflow.layerGate.issues.length === 0) {
       queues.approval.push(task(store, "approval", projectId, node, null, action.code, action.description));
     }
-    if (action && pendingNodeDocumentApproval && workflow.layerGate.issues.length === 0) {
-      queues.approval.push(task(store, "approval", projectId, node, null, action.code, `${action.description} 由 Main Agent 使用独立 approval 工单审核。`));
+    if (pendingNodeDocumentApproval && action?.code !== "approve_node_requirement" && workflow.layerGate.issues.length === 0) {
+      const approval = task(store, "approval", projectId, node, null, "approve_node_document",
+        "节点存在未批准或未固定的当前文档修订，由 Main Agent 使用独立 approval 工单审核。");
+      approval.href = `#/canvas/${node.diagramId}/node/${node.nodeId}?tab=documents`;
+      queues.approval.push(approval);
     }
     if (action?.code === "submit_evidence_repair" && action.entityId && !node.layerLocked) {
       const repairPlan = plans.find((plan) => plan.id === action.entityId);
@@ -487,7 +548,7 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
     if (queuedGapScopes.has(`${impact.gap.id}:${scope}`)) continue;
     const node = workflow.nodes.find((item) => item.diagramId === plan.diagramId && item.nodeId === plan.diagramNodeId);
     if (!node) continue;
-    const impactedPlanIds = transitiveDependentPlanIds(projectPlans, impact.gap.impactedPlanIds);
+    const impactedPlanIds = designChangeImpactedPlanIds(projectPlans, impact.gap.impactedPlanIds);
     const approval = task(store, "approval", projectId, node, plan, "request_design_change",
       `${impact.gap.reason}；本次影响计划=${impactedPlanIds.join(",")}`);
     approval.correlationId = `design-gap:${impact.gap.id}:${impact.rootPlan.id}`;
@@ -496,10 +557,8 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
   }
 
   for (const intent of listPendingDesignChangeIntents(store, projectId)) {
-    if (queues.approval.some((queued) => queued.actionCode === "request_design_change"
-      && Boolean(queued.planItemId && intent.impactedPlanIds.includes(queued.planItemId)))) continue;
     const plans = intent.impactedPlanIds.map((id) => projectPlans.find((plan) => plan.id === id))
-      .filter((plan): plan is PlanItem => Boolean(plan?.diagramId && plan.diagramNodeId));
+      .filter((plan): plan is PlanItem => Boolean(plan && isActiveDeliveryPlan(plan) && plan.diagramId && plan.diagramNodeId));
     const byScope = new Map<string, PlanItem>();
     for (const plan of plans) {
       const scope = `${plan.diagramId}:${plan.diagramNodeId}`;
@@ -563,8 +622,12 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
   }
 
   const priorityRank = { P0: 0, P1: 1, P2: 2, P3: 3 } as const;
+  // 设计缺口会阻断已有施工，自动领取时优先于仍可按 taskId 精确领取的文档审批。
+  const approvalActionRank = (item: AgentOrchestrationTask) => item.actionCode === "request_design_change"
+    ? 0 : item.actionCode === "approve_node_document" ? 2 : 1;
   const compareTasks = (left: AgentOrchestrationTask, right: AgentOrchestrationTask) =>
-    (left.deliveryLayer ?? Number.MAX_SAFE_INTEGER) - (right.deliveryLayer ?? Number.MAX_SAFE_INTEGER)
+    (left.queue === "approval" && right.queue === "approval" ? approvalActionRank(left) - approvalActionRank(right) : 0)
+    || (left.deliveryLayer ?? Number.MAX_SAFE_INTEGER) - (right.deliveryLayer ?? Number.MAX_SAFE_INTEGER)
     || priorityRank[left.priority] - priorityRank[right.priority]
     || (left.dueAt || "9999-12-31").localeCompare(right.dueAt || "9999-12-31")
     || left.createdAt.localeCompare(right.createdAt)
@@ -592,13 +655,13 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
     bootstrapPrompt: includePrompts
       ? [
         `你是外部通用 Agent 编排器。连接 ProductDesign 项目 ${project.code}（${project.id}）。`,
-        `目标代码工作目录是 ${project.repositoryPath || "（未配置）"}；必须由用户在该目录手动启动 Codex、Trae 或其他外部 Agent。`,
+        `设计任务使用托管项目目录 ${managedProjectPath(store.dataDir, projectId)}；开发任务的目标代码目录是 ${project.repositoryPath || "（未配置）"}，必须由用户在该目录手动启动。`,
         "ProductDesign 只提供编排蓝图和任务包，不启动外部进程，也不替外部 Agent 编写目标项目代码。",
         `编排器或会话初始化时读取一次 get_agent_orchestration；队列长度仅代表待办数（designer=${counts.design}，builder=${counts.development}，auditor=${counts.audit}），绝不能按任务数创建 Agent。Worker 领取任务后以任务包为上下文真源，不再重复读取全局编排。`,
         "只按 leaseSummary.activeSlots 与 leaseSummary.roleSlots 创建有限 Worker；每个外部进程使用唯一且稳定的 workerId，同一 workerId/sessionId 一次只领取一个任务。",
         `managerApproval=${counts.managerApproval} 仅保留 human-only 高风险执行授权，禁止自动创建管理员 Agent；施工计划批准和证据充分的最终验收由 Main Agent 领取独立 approval 工单。`,
-        "Main Agent 必须先确定唯一目标：已有计划传 planId；无计划 design/Designer 任务从当前可领取列表取精确 taskKey+taskRevision。二者恰选其一领取父协调租约；任务型只派绑定的设计任务，完成后自动释放，不进入计划阶段。只有 Main Agent 可以选择、派发、暂停、回收、重派和推进计划型阶段。",
-        "Main Agent 通过 dispatch_child_task 按当前阶段派发精确任务包；Designer、Builder、Auditor 禁止调用 claim_next_agent_task 自行领取任务，必须使用 claim_dispatched_child_task 并校验一次性 dispatchId。",
+        "Main Agent 先按工作流和队列确定任务：approval 队列中的独立 Approver 工单直接调用 claim_next_agent_task(role=approver, agentId=Main Agent) 领取，开工后按任务包完成审批；无需父协调租约。派发子 Agent 时才领取父协调租约：已有计划传 planId；无计划设计任务及项目简报审计传精确 taskKey+taskRevision，二者恰选其一。任务型只派绑定任务，完成后自动释放。只有 Main Agent 可以选择、派发、暂停、回收、重派和推进计划型阶段。",
+        "Main Agent 通过 dispatch_child_task 按当前阶段派发精确任务包；Designer、Builder、Auditor 禁止调用 claim_next_agent_task 自行领取任务，必须使用 claim_dispatched_child_task 并校验一次性 dispatchId。子 Agent 不共享 Main Agent 的 authSessionToken；未登记凭据的本机子身份凭派发和子租约执行，已登记凭据的身份仍按其自身认证策略执行。",
         "子 Agent 只接收自己的任务包和子租约；Main Agent 响应永不返回子 Agent 的 leaseToken。父租约暂停、回收、过期或 Runner 失联时，服务端级联释放子租约、资源锁和工作区预留，旧心跳必须返回 LEASE_LOST。",
         "阶段严格按 设计 → 审核 → 批准 → 编码 → 审计 → 验收推进；禁止跨阶段派发和并行验收。",
         "每个 Designer、Builder 和 Auditor 都必须提交与本人任务绑定的工单，写明 taskKey、taskRevision、实际产出或证据；未提交工单不得交接或宣告完成。",
@@ -654,13 +717,37 @@ export function buildAgentTaskPackage(
   const orchestration = orchestrationOverride ?? buildAgentOrchestration(store, projectId, true);
   if (!orchestration) throw new AgentTaskPackageError(404, "PROJECT_NOT_FOUND", "项目不存在");
   validateAgentTaskPackageSelector(store, orchestration, selector);
-  const workingDirectory = orchestration.workingDirectory;
+  const { queue, task } = selectTask(orchestration, selector);
+  const managedDirectory = inspectAgentWorkingDirectory(managedProjectPath(store.dataDir, projectId));
+  const workingDirectory = queue === "development" ? orchestration.workingDirectory
+    : managedDirectory.ready || isProjectBriefTask(task.actionCode) || task.actionCode === "add_function_node"
+      ? managedDirectory : orchestration.workingDirectory;
   if (!workingDirectory.ready) {
     throw new AgentTaskPackageError(409, "WORKING_DIRECTORY_NOT_READY", workingDirectory.issue);
   }
-  const { queue, task } = selectTask(orchestration, selector);
   const role = ROLE_BY_QUEUE[queue];
-  const roleBlueprint = orchestration.recommendedAgents.find((item) => item.key === role);
+  const configuredBlueprint = orchestration.recommendedAgents.find((item) => item.key === role);
+  const roleBlueprint = configuredBlueprint && task.actionCode === "add_function_node"
+    ? { ...configuredBlueprint, allowedMcpTools: canonicalAgentTools([
+      "get_project_workflow", "get_project_workspace", "get_diagram", "get_design_doc", "validate_diagram",
+      "start_agent_task", "heartbeat_agent_task", "mutate_diagram", "complete_agent_task", "fail_agent_task", "release_agent_task",
+    ]) }
+    : configuredBlueprint && isProjectBriefTask(task.actionCode)
+    ? { ...configuredBlueprint, allowedMcpTools: canonicalAgentTools(task.actionCode === "prepare_project_brief"
+      ? ["get_project_workflow", "get_project_workspace", "get_design_doc", "create_design_doc", "patch_design_doc",
+        "create_document_reference", "start_agent_task", "heartbeat_agent_task", "complete_agent_task", "fail_agent_task", "release_agent_task"]
+      : task.actionCode === "audit_project_brief"
+        ? ["get_project_workflow", "get_design_doc", "create_evidence", "start_agent_task", "heartbeat_agent_task",
+          "complete_agent_task", "fail_agent_task", "release_agent_task"]
+        : ["get_project_workflow", "get_design_doc", "list_evidence", "start_agent_task", "heartbeat_agent_task",
+          "complete_agent_task", "release_agent_task"]) }
+    : configuredBlueprint && task.actionCode === "revise_node_requirement"
+    ? { ...configuredBlueprint, allowedMcpTools: canonicalAgentTools([
+      "get_project_workflow", "get_project_workspace", "get_diagram", "get_design_doc", "validate_diagram",
+      "claim_dispatched_child_task", "start_agent_task", "heartbeat_agent_task", "mutate_diagram",
+      "complete_agent_task", "fail_agent_task", "release_agent_task",
+    ]) }
+    : configuredBlueprint;
   if (!roleBlueprint) throw new AgentTaskPackageError(500, "AGENT_BLUEPRINT_MISSING", `缺少 ${role} 角色蓝图`);
   const assignmentFromTask = effectiveAgentTaskAssignment(task, role);
   const effectiveAssignment = selector.allowCoordinationAssignmentOverride && selector.lease
@@ -679,7 +766,7 @@ export function buildAgentTaskPackage(
   }
   const plan = task.planItemId ? store.getPlan(task.planItemId) ?? null : null;
   if (task.planItemId && !plan) throw new AgentTaskPackageError(404, "PLAN_NOT_FOUND", "任务关联的开发计划不存在");
-  if (!plan && (role === "builder" || role === "auditor")) {
+  if (!plan && (role === "builder" || (role === "auditor" && task.actionCode !== "audit_project_brief"))) {
     throw new AgentTaskPackageError(409, "ROLE_ASSIGNMENT_REQUIRED", "Builder 与 Auditor 必须由已批准开发计划明确分配");
   }
   if (plan) {
@@ -729,6 +816,9 @@ export function buildAgentTaskPackage(
     : null;
   const documentsById = new Map(store.listDesignDocs(projectId).map((doc) => [doc.id, doc]));
   const documentReferences = [
+    ...((isProjectBriefTask(task.actionCode) || task.actionCode === "add_function_node")
+      ? store.listDocumentReferences({ projectId, targetType: "project", targetId: projectId })
+      : []),
     ...(nodeSnapshot
       ? store.listDocumentReferences({ projectId, targetType: "diagramNode", targetId: nodeSnapshot.nodeId })
       : []),
@@ -744,7 +834,8 @@ export function buildAgentTaskPackage(
     if (seenRevisionIds.has(revisionId)) continue;
     const revision = store.getDocumentRevision(revisionId);
     const doc = revision ? documentsById.get(revision.documentId) : undefined;
-    if (!doc || !revision || revision.projectId !== projectId || revision.status !== "已批准") continue;
+    if (!doc || !revision || revision.projectId !== projectId
+      || (revision.status !== "已批准" && !isProjectBriefTask(task.actionCode))) continue;
     const reference = documentReferences.find((item) => item.documentRevisionId === revision.id)
       ?? documentReferences.find((item) => item.documentId === revision.documentId);
     seenRevisionIds.add(revisionId);
@@ -775,7 +866,17 @@ export function buildAgentTaskPackage(
   const databaseBindings = nodeSnapshot
     ? store.listNodeDatabaseBindings({ projectId, diagramId: nodeSnapshot.diagramId, diagramNodeId: nodeSnapshot.nodeId })
     : [];
-  const evidenceRequirements = task.actionCode === "approve_node_requirement"
+  const evidenceRequirements = task.actionCode === "add_function_node"
+    ? ["仅在系统主画布新增模块或功能节点", "一次原子提交首批节点", "完成结论与画布写入审计记录"]
+    : task.actionCode === "prepare_project_brief"
+    ? ["项目级 defines 引用", "需求文档或功能说明的当前修订", "非空目标、范围、约束和成功标准"]
+    : task.actionCode === "audit_project_brief"
+      ? ["独立于 Designer 的身份", "当前 documentRevisionId", "details.auditScope=design", "pass/fail 审计证据"]
+    : task.actionCode === "approve_project_brief"
+      ? ["Main Agent 独立 Approver 工单", "当前简报修订", "独立设计审计通过证据", "批准或明确退回条件"]
+    : task.actionCode === "revise_node_requirement"
+    ? ["仅更新当前节点需求及流程字段", "状态提交为待评审", "完成结论与精确工单修订"]
+    : task.actionCode === "approve_node_requirement"
     ? ["非空审核结论", "精确需求工单修订与节点作用域"]
     : role === "designer"
     ? ["固定的 documentRevisionIds", "计划提案修订与依赖", "验收标准、风险与阻塞解除条件"]
@@ -823,10 +924,10 @@ export function buildAgentTaskPackage(
     nodeSnapshot ? `当前节点：${nodeSnapshot.label}（${nodeSnapshot.diagramTitle}）开发状态=${nodeSnapshot.developmentStatus || "-"}，验收状态=${nodeSnapshot.acceptanceStatus || "-"}` : "",
     nodeSnapshot?.acceptanceCriteria ? `验收标准：\n${nodeSnapshot.acceptanceCriteria}` : "",
     documents.length > 0 ? `关联文档：${documents.map((doc) => `${doc.title}(${doc.id}, ${doc.status}, ${doc.relationType})`).join("；")}` : "",
-    "任务包已内嵌 planSnapshot（无计划 design 任务为 null）、node、dependencies、批准文档正文、databaseBindings 与 evidenceRequirements；领取后不得再调用 list_plan_items 定位任务。",
+    "任务包已内嵌 planSnapshot、node、dependencies、当前相关文档正文、databaseBindings 与 evidenceRequirements；领取后不得再调用 list_plan_items 定位任务。",
     plan
       ? "执行期间以 planSnapshot 和本任务包为上下文真源；文档正文未完整内嵌时，仅用 get_design_doc(projectRef, documentId, revisionId, contentOffset) 继续读取。"
-      : "当前为节点级无计划 design 任务；执行期间以本任务包为上下文真源，文档正文未完整内嵌时仅用 get_design_doc(projectRef, documentId, revisionId, contentOffset) 继续读取。",
+      : `${isProjectBriefTask(task.actionCode) ? "当前为项目简报任务" : task.actionCode === "add_function_node" ? "当前为主画布节点拆分任务" : "当前为节点级无计划设计任务"}；执行期间以本任务包为上下文真源，文档正文未完整内嵌时仅用 get_design_doc(projectRef, documentId, revisionId, contentOffset) 继续读取。`,
     "领取后不要重复调用 get_agent_orchestration、get_project_workspace、get_project_snapshot、list_project_workspace_nodes 或 get_project_workflow；关键路径仅用于项目级提示，不作为已领取 Worker 任务的等值校验。仅在终态流转前后、收到 LEASE_LOST/TASK_REVISION_DRIFT/POLICY_VERSION_STALE/WORK_ORDER_CONTEXT_INVALID，或任务包修订与服务端不一致时刷新 workflow。",
     ...roleBlueprint.responsibilities.map((item) => `职责：${item}`),
     ...boundaries.map((item) => `禁止/约束：${item}`),
@@ -838,18 +939,32 @@ export function buildAgentTaskPackage(
       `租约到期：${selector.lease.leaseExpiresAt}；工作期间每 ${selector.lease.heartbeatSeconds} 秒调用 heartbeat_agent_task 续租。`,
       "开始任何目标项目修改前调用 start_agent_task；Builder 并发时必须提交独立 workspacePath、workspaceBranch 和 baselineRevision。所有计划流转必须携带 leaseToken 和唯一 idempotencyKey。",
       "若收到 LEASE_LOST、TASK_ALREADY_CLAIMED 或租约过期，立即停止写入，不得继续抢占任务。",
-      ["approve_node_requirement", "approve_node_document"].includes(task.actionCode)
+      task.actionCode === "add_function_node"
+        ? "在当前主画布一次原子新增首批模块或功能节点，然后以 complete_agent_task(resultDigest=拆分结论) 完工。"
+      : isProjectBriefTask(task.actionCode)
+        ? "项目简报任务以 complete_agent_task 提交固定文档修订、独立审计证据或 Main Agent 结论；不得调用计划流转替代。"
+      : ["revise_node_requirement", "approve_node_document", "approve_node_requirement"].includes(task.actionCode)
         ? "核验当前节点资料后调用 complete_agent_task(resultDigest=审核结论)；服务端会在精确工单修订下原子完成审批。"
         : "transition_plan_delivery 成功后会自动推进或关闭租约；不要在工作流动作完成前单独调用 complete_agent_task。",
     ] : []),
-    role === "auditor" && task.auditScope === "design"
+    task.actionCode === "prepare_project_brief"
+      ? "创建或修订项目级需求简报并以 defines 引用绑定项目，保持评审中；调用 complete_agent_task(documentRevisionId=当前修订) 后交独立审计。"
+      : task.actionCode === "audit_project_brief"
+        ? "只读审计当前项目简报修订，创建 actorRole=auditor、details.auditScope=design、documentRevisionId=当前修订的 pass/fail 证据，再调用 complete_agent_task(evidenceId, verdict)。"
+      : task.actionCode === "approve_project_brief"
+        ? "Main Agent 核对独立审计通过证据后调用 complete_agent_task(verdict=pass/fail, resultDigest=审核结论；拒绝时填写 reworkConditions)；服务端原子批准或退回简报。"
+      : task.actionCode === "add_function_node"
+        ? "仅在本工单主画布一次原子新增首批模块或功能节点；不要修改已有节点或其他画布。"
+      : role === "auditor" && task.auditScope === "design"
       ? "完成后为每个固定 documentRevisionId 创建带 details.auditScope=design 的审计证据，再执行 pass_design_audit 或 fail_design_audit；不得直接批准计划。"
       : role === "auditor"
         ? "完成后创建绑定当前 implementationRevision 且 details.auditScope=implementation 的审计证据，再执行 pass_audit 或 fail_audit；不得直接验收。"
+        : task.actionCode === "revise_node_requirement"
+          ? "本工单只允许 mutate_diagram 修改当前节点需求与流程字段，提交 requirementStatus=待评审 后以 complete_agent_task(resultDigest=修订结论) 完工；不能批准自己。"
         : task.actionCode === "approve_node_requirement"
           ? "本工单只审核当前节点需求；确认后用 complete_agent_task 提交审核结论，不得自行改写节点资料。"
         : task.actionCode === "approve_node_document"
-          ? "本工单只审核当前节点文档修订；确认后用 complete_agent_task 提交审核结论，不得自行改写文档正文。"
+          ? "本工单只审核当前节点待批准或待固定的文档修订；确认后用 complete_agent_task 提交审核结论，不得改写文档正文。"
         : "完成后运行与风险相称的测试，通过 create_evidence 回传命令、结果、当前修订和证据 ID。",
     "普通执行期间只按租约 heartbeat；终态动作或受控写入错误后再刷新 workflow，并以新的 nextAction 作为交接依据。",
   ].filter(Boolean).join("\n");

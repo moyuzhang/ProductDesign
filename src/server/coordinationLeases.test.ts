@@ -102,6 +102,8 @@ describe("Main Agent coordination lease", () => {
       taskKey: task.taskKey, role: "designer", workerId: "revoked-child" });
     const child = JSON.parse(claimDispatchedChildTask(store, { projectId, dispatchId: dispatch.dispatchId,
       agentId: dispatch.agentId, workerId: dispatch.workerId, idempotencyKey: "revoked-child-claim" }));
+    expect(store.db.prepare("SELECT count(*) AS count FROM agent_credentials WHERE agent_id=?")
+      .get(dispatch.agentId)).toEqual({ count: 0 });
     const credential = store.db.prepare("SELECT claim_credential_id AS id FROM agent_coordination_leases WHERE id=?")
       .get(parent.id) as { id: string };
     revokeAgentCredential(store, credential.id);
@@ -488,6 +490,7 @@ describe("Main Agent coordination lease", () => {
     const prompt = buildAgentOrchestration(store, projectId, true)!.bootstrapPrompt;
     expect(prompt).toContain("dispatch_child_task");
     expect(prompt).toContain("禁止调用 claim_next_agent_task");
+    expect(prompt).toContain("子 Agent 不共享 Main Agent 的 authSessionToken");
   });
 
   it("does not replay a terminal parent lease from the idempotency cache", () => {

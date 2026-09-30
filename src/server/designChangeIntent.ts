@@ -7,9 +7,9 @@ import type {
   PlanItem,
 } from "../shared/types.js";
 import { newId, nowIso, type Store } from "./db.js";
-import { getDesignGap, transitiveDependentPlanIds } from "./designGap.js";
+import { designChangeImpactedPlanIds, getDesignGap } from "./designGap.js";
 import { getEvidenceRepairState } from "./evidenceRepair.js";
-import { isExecutableDeliveryPlan } from "./planPolicy.js";
+import { isActiveDeliveryPlan } from "./planPolicy.js";
 import { isWorkflowDeliveryNode } from "./workflow.js";
 
 interface IntentSnapshot {
@@ -144,11 +144,11 @@ function rowById(store: Store, intentId: string): IntentRow | undefined {
 
 export function buildDesignChangeIntentSnapshot(store: Store, projectId: string, rootPlanId: string): IntentSnapshot {
   const root = store.getPlan(rootPlanId);
-  if (!root || root.projectId !== projectId || !isExecutableDeliveryPlan(root) || !root.diagramId || !root.diagramNodeId) {
+  if (!root || root.projectId !== projectId || !isActiveDeliveryPlan(root) || !root.diagramId || !root.diagramNodeId) {
     throw new DesignChangeIntentError(409, "ROOT_PLAN_SCOPE_MISMATCH", "根计划不存在、跨项目或未绑定交付节点");
   }
-  const projectPlans = store.listPlans(projectId).filter(isExecutableDeliveryPlan);
-  const closureIds = transitiveDependentPlanIds(projectPlans, [root.id]);
+  const projectPlans = store.listPlans(projectId).filter(isActiveDeliveryPlan);
+  const closureIds = designChangeImpactedPlanIds(projectPlans, [root.id]);
   const closure = closureIds.map((id) => projectPlans.find((plan) => plan.id === id)).filter((plan): plan is PlanItem => Boolean(plan));
   const nodeScopes = [...new Set(closure.flatMap((plan) => plan.diagramId && plan.diagramNodeId
     ? [`${plan.diagramId}\u001f${plan.diagramNodeId}`] : []))].sort();
@@ -255,7 +255,7 @@ function staleDriftedPendingIntents(store: Store, projectId: string, rootPlanId:
 function assertNoConflictingGovernancePath(store: Store, snapshot: IntentSnapshot): void {
   const scopes = nodeScopes(snapshot);
   const plans = store.listPlans(snapshot.projectId).filter((plan) => plan.diagramId && plan.diagramNodeId
-    && scopes.has(`node:${plan.diagramId}:${plan.diagramNodeId}`) && isExecutableDeliveryPlan(plan));
+    && scopes.has(`node:${plan.diagramId}:${plan.diagramNodeId}`) && isActiveDeliveryPlan(plan));
   for (const plan of plans) {
     const gap = getDesignGap(store, plan);
     if (gap) {
@@ -303,7 +303,7 @@ export function submitDesignChangeIntent(store: Store, raw: DesignChangeIntentIn
     if (!project) throw new DesignChangeIntentError(404, "PROJECT_NOT_FOUND", "项目不存在");
     if (!diagram || diagram.projectId !== project.id) throw new DesignChangeIntentError(409, "DIAGRAM_PROJECT_MISMATCH", "画布不存在或不属于项目");
     if (!root || root.projectId !== project.id || root.diagramId !== diagram.id || root.diagramNodeId !== input.nodeId
-      || root.lifecycleStatus !== "accepted" || !isExecutableDeliveryPlan(root)) {
+      || root.lifecycleStatus !== "accepted" || !isActiveDeliveryPlan(root)) {
       throw new DesignChangeIntentError(409, "ROOT_PLAN_NOT_ACCEPTED", "变更意图必须绑定当前项目、节点下的 accepted 根计划");
     }
     if (diagram.updatedAt !== input.expectedUpdatedAt) throw new DesignChangeIntentError(409, "DIAGRAM_REVISION_CONFLICT", "画布已变化，请刷新后重新申请");
@@ -371,6 +371,26 @@ export function listPendingDesignChangeIntents(store: Store, projectId: string):
       changeSummary: payload.changeSummary,
     }];
   });
+}
+
+/** A newer governed path owns the overlapping approval scope. Keep the old intent as history. */
+export function staleDesignChangeIntentsForGovernancePath(store: Store, projectId: string, impactedPlanIds: string[]): void {
+  ensureSchema(store);
+  const affected = new Set(designChangeImpactedPlanIds(store.listPlans(projectId), impactedPlanIds));
+  const rows = store.db.prepare("SELECT * FROM design_change_intents WHERE project_id=? AND status='pending'")
+    .all(projectId) as IntentRow[];
+  const now = nowIso();
+  for (const row of rows) {
+    const snapshot = JSON.parse(row.snapshot_json) as IntentSnapshot;
+    if (!planIds(snapshot).some((id) => affected.has(id))) continue;
+    store.db.prepare("UPDATE design_change_intents SET status='stale', updated_at=? WHERE id=? AND status='pending'")
+      .run(now, row.id);
+    invalidateIntentLeases(store, projectId, row.id, `design_change_intent_stale:governance_path:${row.id}`, now);
+    store.recordAudit({ projectId, entityType: "designChangeIntent", entityId: row.id, action: "mark_stale",
+      before: { status: "pending" },
+      after: { status: "stale", reason: "受影响范围出现新的正式设计变更路径；先完成当前审批，再按最新范围重新提交变更意图" },
+      actor: "system", source: "system", correlationId: `design-change-intent:${row.id}` });
+  }
 }
 
 export function getDesignChangeIntent(store: Store, intentId: string): {

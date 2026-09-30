@@ -254,11 +254,17 @@ export function AgentOrchestrationView(): ReactElement {
       <section className={`orchestration-workdir ${data.workingDirectory.ready ? "is-ready" : "is-blocked"}`} data-testid="agent-working-directory">
         <FolderOpen />
         <div>
-          <span>外部 Agent 目标工作目录</span>
+          <span>开发任务目标代码目录（设计任务使用托管项目目录）</span>
           <code>{data.workingDirectory.repositoryPath || "未配置 repositoryPath"}</code>
         </div>
-        <strong>{data.workingDirectory.ready ? "可手动启动" : data.workingDirectory.issue}</strong>
+        <strong>{data.workingDirectory.ready ? "开发目录就绪" : data.workingDirectory.issue}</strong>
       </section>
+
+      {data.coordinationReadiness && !data.coordinationReadiness.ready ? (
+        <div className="orchestration-workdir is-blocked" role="status" data-testid="coordination-credential-blocker">
+          <div><span>Main Agent 父协调租约认证未就绪</span><p>{data.coordinationReadiness.issue}</p></div>
+        </div>
+      ) : null}
 
       {data.capacity && data.leaseSummary ? (
         <section className="orchestration-runtime" aria-label="Agent 运行容量">
@@ -324,7 +330,7 @@ export function AgentOrchestrationView(): ReactElement {
           const items = data.queues[queue.key];
           const executableQueue: AgentExecutableQueueKey | null = queue.key === "managerApproval" ? null : queue.key;
           const claimCandidate = executableQueue
-            ? items.find((item) => item.available !== false && (item.planItemId || executableQueue === "design"))
+            ? items.find((item) => item.available !== false)
             : undefined;
           // Refreshes preserve the current page when possible and clamp to a real page boundary when the queue shrinks.
           const pagination = paginateOrchestrationQueue(items, offsets[queue.key]);
@@ -334,8 +340,10 @@ export function AgentOrchestrationView(): ReactElement {
               <div className="orchestration-owner">责任主体 · {queue.owner}</div>
               {executableQueue ? (
                 <p className="orchestration-quiet">{claimCandidate
-                  ? "请由已认证的 Main Agent 在 MCP 中领取父协调租约并派发；本页面不保存凭据或匿名领取。"
-                  : "当前没有可派发任务。"}</p>
+                  ? executableQueue === "approval"
+                    ? "请由已认证的 Main Agent 在 MCP 中领取独立 Approver 工单并审核；本页面不保存凭据。"
+                    : "请由已认证的 Main Agent 在 MCP 中领取父协调租约并派发；本页面不保存凭据。"
+                  : items.length > 0 ? "当前任务暂不可领取，请查看任务的阻塞原因。" : "当前无任务。"}</p>
               ) : null}
               <div className="orchestration-task-list">
                 {items.length === 0 && <div className="orchestration-quiet">当前无任务</div>}

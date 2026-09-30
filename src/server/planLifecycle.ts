@@ -1,10 +1,13 @@
 import type { PlanItem } from "../shared/types.js";
 import { nowIso, type Store } from "./db.js";
-import { isExecutableDeliveryPlan } from "./planPolicy.js";
+import { isActiveDeliveryPlan, isExecutableDeliveryPlan } from "./planPolicy.js";
+import { releaseAgentTaskLeasesForDesignChange } from "./agentTaskLeases.js";
+import { invalidateCoordinationByPlan } from "./coordinationLeases.js";
+import { staleDesignChangeIntentsForGovernancePath } from "./designChangeIntent.js";
 import { assertPlanActionIdentity } from "./planRolePolicy.js";
 import { assertPlanImplementationUnlocked, assertPlanLayerUnlocked } from "./planLayers.js";
 import { hasImplementationEvidence, matchesImplementationEvidencePolicy } from "./evidencePolicy.js";
-import { assessEvidenceRepairFailure, getEvidenceRepairState, inspectEvidenceRepairPreflight, openEvidenceRepairState, resetEvidenceRepairAttempt, updateEvidenceRepairState } from "./evidenceRepair.js";
+import { assessEvidenceRepairFailure, getEvidenceRepairState, inspectEvidenceRepairPreflight, openEvidenceRepairState, resetEvidenceRepairAttempt, supersedeEvidenceRepairStates, updateEvidenceRepairState } from "./evidenceRepair.js";
 import { inspectNodeWorkflow } from "./workflow.js";
 
 export const PLAN_TRANSITION_ACTIONS = [
@@ -75,7 +78,7 @@ function syncBoundNode(store: Store, plan: PlanItem, action: PlanTransitionActio
   if (!plan.diagramId || !plan.diagramNodeId) return;
   const diagram = store.getDiagram(plan.diagramId);
   if (!diagram) return;
-  const siblingPlans = store.listPlans(plan.projectId, plan.diagramId, plan.diagramNodeId).filter(isExecutableDeliveryPlan);
+  const siblingPlans = store.listPlans(plan.projectId, plan.diagramId, plan.diagramNodeId).filter(isActiveDeliveryPlan);
   const { developmentStatus, acceptanceStatus } = planDeliveryProjection(siblingPlans);
   let changed = false;
   const nodes = diagram.nodes.map((node) => {
@@ -149,7 +152,7 @@ export function reconcilePlanDeliveryProjections(store: Store): number {
   for (const project of store.listProjects()) {
     const groups = new Map<string, PlanItem[]>();
     for (const plan of store.listPlans(project.id)) {
-      if (!isExecutableDeliveryPlan(plan) || !plan.diagramId || !plan.diagramNodeId) continue;
+      if (!isActiveDeliveryPlan(plan) || !plan.diagramId || !plan.diagramNodeId) continue;
       const key = `${plan.diagramId}|${plan.diagramNodeId}`;
       const group = groups.get(key) ?? [];
       group.push(plan);
@@ -203,7 +206,12 @@ export function transitionPlanLifecycle(store: Store, planId: string, input: Pla
     if (!input.repairDisposition) {
       throw Object.assign(new Error("证据修复失败评估必须明确 repairDisposition=reset 或 design_change"), { statusCode: 400 });
     }
-    assessEvidenceRepairFailure(store, plan.id, input.repairDisposition, input.reason?.trim() || "");
+    store.db.transaction(() => {
+      assessEvidenceRepairFailure(store, plan.id, input.repairDisposition!, input.reason?.trim() || "");
+      if (input.repairDisposition === "design_change") {
+        staleDesignChangeIntentsForGovernancePath(store, plan.projectId, [plan.id]);
+      }
+    }).immediate();
     return store.getPlan(plan.id)!;
   }
   if (input.action === "reset_evidence_repair_attempt") {
@@ -219,7 +227,7 @@ export function transitionPlanLifecycle(store: Store, planId: string, input: Pla
       if (!diagram || !node || !input.agentId?.trim()) {
         throw Object.assign(new Error("节点验收必须由 Main Agent 使用节点绑定的独立 Approver 工单执行"), { statusCode: 409 });
       }
-      const siblings = store.listPlans(plan.projectId, diagram.id, node.id).filter(isExecutableDeliveryPlan);
+      const siblings = store.listPlans(plan.projectId, diagram.id, node.id).filter(isActiveDeliveryPlan);
       const missing = inspectNodeWorkflow(store, diagram, node).state.missing.filter((item) => item !== "验收通过");
       if (missing.length || siblings.some((item) => item.lifecycleStatus !== "accepted"
         || item.auditStatus !== "passed" || item.managerDecision !== "approved"
@@ -353,8 +361,15 @@ export function transitionPlanLifecycle(store: Store, planId: string, input: Pla
           ...(plan.diagramNodeId ? store.listDocumentReferences({ projectId: plan.projectId, targetType: "diagramNode", targetId: plan.diagramNodeId }) : []),
           ...store.listDocumentReferences({ projectId: plan.projectId, targetType: "plan", targetId: plan.id }),
         ];
+        const frozenDocumentIds = new Set(plan.designRevisionIds
+          .map((id) => store.getDocumentRevision(id)?.documentId).filter((id): id is string => Boolean(id)));
+        const relevantDocumentIds = impactedDocumentIds.filter((id) => frozenDocumentIds.has(id)
+          || scopedReferences.some((reference) => reference.documentId === id));
+        if (relevantDocumentIds.length === 0) {
+          throw Object.assign(new Error("设计变更后的审计缺少当前计划的受影响设计文档"), { statusCode: 409 });
+        }
         currentApprovedRevisionIds = new Set<string>();
-        for (const documentId of impactedDocumentIds) {
+        for (const documentId of relevantDocumentIds) {
           const document = store.getDesignDoc(documentId);
           const documentReferences = scopedReferences.filter((reference) => reference.documentId === documentId);
           if (!document || document.projectId !== plan.projectId || document.status !== "已批准"
@@ -399,12 +414,38 @@ export function transitionPlanLifecycle(store: Store, planId: string, input: Pla
       };
       break;
   }
-  const updated = store.updatePlan(plan.id, patch)!;
-  if (input.action === "approve_acceptance") {
-    const repair = getEvidenceRepairState(store, plan.id);
-    if (repair?.status === "submitted") updateEvidenceRepairState(store, plan.id, { status: "closed", disposition: "accepted" });
-    else if (!repair && updated.diagramId && updated.diagramNodeId) openEvidenceRepairState(store, updated, 3);
-  }
-  syncBoundNode(store, updated, input.action, input.reason);
-  return updated;
+  const persist = () => {
+    const updated = store.updatePlan(plan.id, patch)!;
+    if (input.action === "approve_acceptance") {
+      const superseded: string[] = [];
+      const seen = new Set([updated.id]);
+      let ancestorId = updated.reworkOfPlanId;
+      while (ancestorId && !seen.has(ancestorId)) {
+        seen.add(ancestorId);
+        const ancestor = store.getPlan(ancestorId);
+        if (!ancestor || ancestor.projectId !== updated.projectId || ancestor.diagramId !== updated.diagramId
+          || ancestor.diagramNodeId !== updated.diagramNodeId) break;
+        if (ancestor.lifecycleStatus !== "accepted" && ancestor.lifecycleStatus !== "superseded") {
+          invalidateCoordinationByPlan(store, updated.projectId, ancestor.id);
+          store.updatePlan(ancestor.id, { lifecycleStatus: "superseded", blockedReason: `已由计划 ${updated.id} 取代` });
+          superseded.push(ancestor.id);
+          store.recordAudit({ projectId: updated.projectId, entityType: "plan", entityId: ancestor.id,
+            action: "supersede", before: { lifecycleStatus: ancestor.lifecycleStatus },
+            after: { lifecycleStatus: "superseded", successorPlanId: updated.id }, actor: input.actor,
+            source: "system", correlationId: updated.correlationId });
+        }
+        ancestorId = ancestor.reworkOfPlanId;
+      }
+      if (superseded.length) {
+        releaseAgentTaskLeasesForDesignChange(store, updated.projectId, superseded, updated.id);
+        supersedeEvidenceRepairStates(store, superseded, updated.id);
+      }
+      const repair = getEvidenceRepairState(store, plan.id);
+      if (repair?.status === "submitted") updateEvidenceRepairState(store, plan.id, { status: "closed", disposition: "accepted" });
+      else if (!repair && updated.diagramId && updated.diagramNodeId) openEvidenceRepairState(store, updated, 3);
+    }
+    syncBoundNode(store, updated, input.action, input.reason);
+    return updated;
+  };
+  return input.action === "approve_acceptance" ? store.db.transaction(persist).immediate() : persist();
 }

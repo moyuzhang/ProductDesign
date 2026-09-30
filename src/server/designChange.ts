@@ -9,11 +9,11 @@ import type {
 import { assertApprovalGroupCurrent, approvalGroupLeases, ensureAgentTaskLeaseSchema, listClaimableAgentTasks, releaseAgentTaskLeasesForDesignChange } from "./agentTaskLeases.js";
 import { normalizeAgentId } from "../shared/planRoles.js";
 import { newId, nowIso, type Store } from "./db.js";
-import { isExecutableDeliveryPlan } from "./planPolicy.js";
+import { isActiveDeliveryPlan } from "./planPolicy.js";
 import { reconcilePlanDeliveryProjections } from "./planLifecycle.js";
 import { buildProjectWorkflow, isWorkflowDeliveryNode } from "./workflow.js";
 import { getEvidenceRepairState, supersedeEvidenceRepairStates } from "./evidenceRepair.js";
-import { getDesignGap, transitiveDependentPlanIds } from "./designGap.js";
+import { designChangeImpactedPlanIds, getDesignGap } from "./designGap.js";
 import {
   assertDesignChangeIntentCurrent,
   finishDesignChangeIntent,
@@ -569,7 +569,7 @@ function requestDesignChangeInTransaction(
   }
 
   const plans = input.impactedPlanIds.map((id) => store.getPlan(id));
-  if (plans.some((plan) => !plan || plan.projectId !== project.id || !isExecutableDeliveryPlan(plan))) {
+  if (plans.some((plan) => !plan || plan.projectId !== project.id || !isActiveDeliveryPlan(plan))) {
     throw new DesignChangeError(409, "PLAN_SCOPE_MISMATCH", "受影响计划不存在、跨项目或不是可施工 task");
   }
   const typedPlans = plans as PlanItem[];
@@ -577,9 +577,9 @@ function requestDesignChangeInTransaction(
   if (rootPlanIds.length === 0) {
     throw new DesignChangeError(409, "PLAN_SCOPE_MISMATCH", "受影响计划必须至少包含当前节点的一张根计划");
   }
-  const projectPlans = store.listPlans(project.id).filter(isExecutableDeliveryPlan);
+  const projectPlans = store.listPlans(project.id).filter(isActiveDeliveryPlan);
   const reportedGap = typedPlans.map((plan) => getDesignGap(store, plan)).find(Boolean);
-  const requiredClosure = transitiveDependentPlanIds(projectPlans, reportedGap?.impactedPlanIds ?? rootPlanIds);
+  const requiredClosure = designChangeImpactedPlanIds(projectPlans, reportedGap?.impactedPlanIds ?? rootPlanIds);
   const requestedPlanIds = [...input.impactedPlanIds].sort();
   if (requiredClosure.join("\u001f") !== requestedPlanIds.join("\u001f")) {
     const missing = requiredClosure.filter((id) => !requestedPlanIds.includes(id));
@@ -674,6 +674,19 @@ function requestDesignChangeInTransaction(
     const reworkPlanIds: string[] = [];
     for (const plan of typedPlans) {
       if (plan.lifecycleStatus === "accepted") {
+        const hasActiveRework = typedPlans.some((candidate) => {
+          if (candidate.lifecycleStatus === "accepted" || candidate.lifecycleStatus === "legacy"
+            || candidate.diagramId !== plan.diagramId || candidate.diagramNodeId !== plan.diagramNodeId) return false;
+          const seen = new Set<string>();
+          let ancestor = candidate.reworkOfPlanId;
+          while (ancestor && !seen.has(ancestor)) {
+            if (ancestor === plan.id) return true;
+            seen.add(ancestor);
+            ancestor = store.getPlan(ancestor)?.reworkOfPlanId ?? null;
+          }
+          return false;
+        });
+        if (hasActiveRework) continue;
         reworkPlanIds.push(cloneAcceptedPlan(store, plan, changeId, input.reason).id);
       } else {
         store.updatePlan(plan.id, reworkPatch(plan, changeId, input.reason));
@@ -708,7 +721,7 @@ function requestDesignChangeInTransaction(
     supersedeEvidenceRepairStates(store, input.impactedPlanIds, changeId);
     const nextNodes = diagram.nodes.map((item) => item.id === node.id ? {
       ...item,
-      requirementStatus: input.requirementImpact ? "待评审" as const : item.requirementStatus,
+      requirementStatus: input.requirementImpact ? "草拟中" as const : item.requirementStatus,
       designStatus: "进行中" as const,
       blockedReason: `设计变更处理中 · ${changeId}`,
       deliveryUpdatedAt: createdAt,
@@ -716,13 +729,12 @@ function requestDesignChangeInTransaction(
     store.updateDiagram(diagram.id, { nodes: nextNodes });
     reconcilePlanDeliveryProjections(store);
 
-    const workflow = buildProjectWorkflow(store, project.id);
     const result: DesignChangeResult = {
       changeId,
       projectId: project.id,
       diagramId: diagram.id,
       nodeId: node.id,
-      requirementStatus: input.requirementImpact ? "待评审" : (node.requirementStatus ?? "待整理"),
+      requirementStatus: input.requirementImpact ? "草拟中" : (node.requirementStatus ?? "待整理"),
       designStatus: "进行中",
       revisedDocuments,
       impactedPlanIds: input.impactedPlanIds,
@@ -730,9 +742,15 @@ function requestDesignChangeInTransaction(
       releasedLeaseTaskKeys,
       revokedEvidenceIds,
       retainedEvidenceIds,
-      nextAction: workflow?.nodes.find((item) => item.diagramId === diagram.id && item.nodeId === node.id)?.nextAction ?? null,
+      nextAction: null,
       createdAt,
     };
+    // 同一事务中先记录正式请求，再计算下一动作；失败会连裁决一起回滚。
+    store.db.prepare(
+      "INSERT INTO design_change_requests (idempotency_key, request_hash, change_id, response_json, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(input.idempotencyKey, hash, changeId, JSON.stringify(result), createdAt);
+    const workflow = buildProjectWorkflow(store, project.id);
+    result.nextAction = workflow?.nodes.find((item) => item.diagramId === diagram.id && item.nodeId === node.id)?.nextAction ?? null;
     if (input.intentId) finishDesignChangeIntent(store, input.intentId, "applied", changeId);
     store.recordAudit({
       projectId: project.id,
@@ -754,9 +772,8 @@ function requestDesignChangeInTransaction(
       sessionId: input.sessionId,
       model: input.model,
     });
-    store.db.prepare(
-      "INSERT INTO design_change_requests (idempotency_key, request_hash, change_id, response_json, created_at) VALUES (?, ?, ?, ?, ?)",
-    ).run(input.idempotencyKey, hash, changeId, JSON.stringify(result), createdAt);
+    store.db.prepare("UPDATE design_change_requests SET response_json=? WHERE idempotency_key=?")
+      .run(JSON.stringify(result), input.idempotencyKey);
     return result;
   }).immediate();
 }

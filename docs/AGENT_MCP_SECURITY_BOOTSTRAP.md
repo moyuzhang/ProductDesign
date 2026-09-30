@@ -1,5 +1,22 @@
 # Agent MCP 2.3 接入
 
+## 本机 Main Agent：免人工登记的 stdio 接入
+
+由受保护的本机宿主配置启动以下命令（scope 是进程环境，不是工具参数）：
+
+```powershell
+$env:PCS_DB = 'D:\project\ProductDesign\data\control-surface.db'
+$env:PCS_LOCAL_MCP_PROJECT = 'FIVEBEAR'
+$env:PCS_LOCAL_MCP_WORKER = 'codex-main-fivebear-' + [guid]::NewGuid().ToString()
+node 'D:\project\ProductDesign\dist\node\mcp\index.js'
+```
+
+MCP 客户端应把原 HTTP 连接改为上述 `node` 命令的 **stdio** 连接，并在宿主的 MCP 配置里提供这三个环境值；工作进程的 workerId 在一次连接内稳定，重启使用新值。保护配置文件/启动账户的 OS 权限，不能把用户可编辑的工具参数当授权配置。没有这两个 scope 值的 stdio 不自动授权；HTTP 服务不读取它们，也不接受本机 session、policy token 或父租约。
+
+initialize 会返回项目、workerId 和 15 分钟有效期，但不会返回凭据/session/policy secret。本机连接仅授权 `Main Agent` 的 `approver` 角色；认证与 nonce 由宿主注入，仍须提交精确工单/租约上下文。Main Agent 不能领取 Designer、Builder 或 Auditor 工单，不能自审，也不能执行 human-only 高风险动作。子 Agent 使用既有受限 dispatchId，独立领取自己的任务；不继承主身份。
+
+正常 EOF、SIGINT/SIGTERM 和关闭连接会撤销本机授权并释放父子租约、锁与本进程审批工单。强杀或断电不能保证即时清理：依赖短期凭据/父租约 TTL 和下次租约扫描失效回收。到期后关闭并重建 stdio 连接，不以 HTTP 降级。此接入不替代正式需求/设计/独立审计/批准，也不修改用户现有 MCP 配置。
+
 远程或需要强认证的 Worker 由管理员预登记一次最小权限凭证。本机未登记凭据的 Worker 使用精确租约上下文；一旦某个 `agentId` 已登记凭据，该身份的所有受控写都强制走下述认证流程。`workerId` 必须稳定且唯一；角色和项目只授予该工单池实际需要的值。先用 `-DryRun` 检查服务和登记对象，此模式不会读取管理员令牌、不会写入：
 
 ```powershell

@@ -1,5 +1,6 @@
 import type { PlanItem } from "../shared/types.js";
 import type { Store } from "./db.js";
+import { isActiveDeliveryPlan } from "./planPolicy.js";
 
 export interface DesignGap {
   id: string;
@@ -38,6 +39,23 @@ export function transitiveDependentPlanIds(plans: PlanItem[], rootPlanIds: Itera
   return [...closure].sort();
 }
 
+export function designChangeImpactedPlanIds(plans: PlanItem[], rootPlanIds: Iterable<string>): string[] {
+  const executable = plans.filter(isActiveDeliveryPlan);
+  const included = new Set([...rootPlanIds]);
+  let size = -1;
+  while (size !== included.size) {
+    size = included.size;
+    const scopes = new Set(executable.filter((plan) => included.has(plan.id) && plan.diagramId && plan.diagramNodeId)
+      .map((plan) => `${plan.diagramId}:${plan.diagramNodeId}`));
+    for (const plan of executable) {
+      if (plan.lifecycleStatus !== "accepted" && plan.lifecycleStatus !== "legacy"
+        && scopes.has(`${plan.diagramId}:${plan.diagramNodeId}`)) included.add(plan.id);
+    }
+    for (const id of transitiveDependentPlanIds(executable, included)) included.add(id);
+  }
+  return [...included].filter((id) => executable.some((plan) => plan.id === id)).sort();
+}
+
 export function getDesignGap(store: Store, plan: PlanItem): DesignGap | undefined {
   if (!["approved", "in_progress"].includes(plan.lifecycleStatus)) return undefined;
   for (const id of plan.designRevisionIds) {
@@ -52,7 +70,7 @@ export function getDesignGap(store: Store, plan: PlanItem): DesignGap | undefine
   if (!hasLeases(store)) return undefined;
   const row = store.db.prepare(`SELECT id, last_error FROM agent_task_leases
     WHERE project_id=? AND task_id=? AND task_revision=? AND role='builder'
-      AND action_code IN ('start_development', 'complete_development')
+      AND action_code IN ('start_development', 'complete_development', 'reopen_rework')
       AND status='released' AND last_error LIKE 'design_gap:%'
     ORDER BY rowid DESC LIMIT 1`)
     .get(plan.projectId, `development:${plan.id}`, developmentTaskRevision(store, plan)) as { id: string; last_error: string } | undefined;

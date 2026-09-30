@@ -50,7 +50,7 @@ import type {
   WorkNode,
 } from "../shared/types.js";
 import { PROJECT_WORKFLOW_POLICY } from "../shared/workflowPolicy.js";
-import { isExecutableDeliveryPlan } from "./planPolicy.js";
+import { isActiveDeliveryPlan, isExecutableDeliveryPlan } from "./planPolicy.js";
 import { assertNoIntroducedDiagramGroupOverlap } from "../shared/diagramGroups.js";
 import { normalizeAgentId, normalizeRoleAssignments } from "../shared/planRoles.js";
 import { ensureAgentSecuritySchema } from "./agentSecurity.js";
@@ -699,8 +699,9 @@ interface ProjectWorkspaceDerivation {
 function deriveProjectWorkspace(data: ResolvedProjectWorkspaceReadData): ProjectWorkspaceDerivation {
   const { project: base, workspaceNodes: nodes, plans, documents, evidence } = data;
   const deliveryNodeIds = new Set(nodes.map(({ node }) => node.id));
-  const deliveryPlans = plans.filter((plan) => isExecutableDeliveryPlan(plan) && Boolean(plan.diagramNodeId && deliveryNodeIds.has(plan.diagramNodeId)));
-  const backlogPlans = plans.filter((plan) => !isExecutableDeliveryPlan(plan) || !plan.diagramNodeId || !deliveryNodeIds.has(plan.diagramNodeId));
+  const deliveryPlans = plans.filter((plan) => isActiveDeliveryPlan(plan) && Boolean(plan.diagramNodeId && deliveryNodeIds.has(plan.diagramNodeId)));
+  const backlogPlans = plans.filter((plan) => plan.lifecycleStatus !== "superseded"
+    && (!isExecutableDeliveryPlan(plan) || !plan.diagramNodeId || !deliveryNodeIds.has(plan.diagramNodeId)));
   const activeEvidence = evidence.filter((item) => item.status === "active");
   const passingEvidenceNodeIds = new Set(activeEvidence.filter((item) => item.resultStatus === "pass" && item.nodeId).map((item) => item.nodeId!));
   const plansByNode = new Map<string, PlanItem[]>();
@@ -789,11 +790,13 @@ function databaseTextMatches(value: unknown, query: string): boolean {
 
 export class Store {
   readonly db: Database.Database;
+  readonly dataDir: string;
   private readonly credentials: LlmCredentialVault;
 
   constructor(filePath: string, dataDir?: string) {
     mkdirSync(dirname(filePath), { recursive: true });
-    this.credentials = new LlmCredentialVault(join(dataDir ?? dirname(filePath), "store"));
+    this.dataDir = dataDir ?? dirname(filePath);
+    this.credentials = new LlmCredentialVault(join(this.dataDir, "store"));
     this.db = new Database(filePath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
@@ -1050,7 +1053,7 @@ export class Store {
     const diagrams = input.diagrams ?? this.listDiagrams(projectId);
     const latestPlanByNode = new Map<string, PlanItem>();
     for (const plan of input.plans ?? this.listPlans(projectId)) {
-      if (!isExecutableDeliveryPlan(plan) || !plan.diagramNodeId) continue;
+      if (!isActiveDeliveryPlan(plan) || !plan.diagramNodeId) continue;
       const current = latestPlanByNode.get(plan.diagramNodeId);
       if (!current || current.updatedAt.localeCompare(plan.updatedAt) < 0) latestPlanByNode.set(plan.diagramNodeId, plan);
     }

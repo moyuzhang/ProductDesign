@@ -15,7 +15,8 @@ export function safeCoordinationHandoff(store: Store, projectId: string, target:
   let payload: object;
   if (target.planId) {
     const plan = store.getPlan(target.planId);
-    if (!plan || plan.projectId !== projectId || !isExecutableDeliveryPlan(plan) || plan.lifecycleStatus === "accepted"
+    if (!plan || plan.projectId !== projectId || !isExecutableDeliveryPlan(plan)
+      || ["accepted", "superseded"].includes(plan.lifecycleStatus)
       || store.listPlans(projectId).some((item) => item.reworkOfPlanId === plan.id && item.id !== plan.id))
       throw new CoordinationLeaseError(409, "HANDOFF_TARGET_STALE", "目标计划不可交接，请刷新");
     if (target.expectedProposalRevision !== undefined && plan.proposalRevision !== target.expectedProposalRevision)

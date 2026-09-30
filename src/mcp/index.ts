@@ -4,6 +4,7 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { createHash, randomUUID } from "node:crypto";
 import {
   DESIGN_STATUSES,
   DEVELOPMENT_STATUSES,
@@ -15,12 +16,15 @@ import {
   PROJECT_STAGES,
   REQUIREMENT_STATUSES,
   TEST_STATUSES,
+  type DiagramNode,
 } from "../shared/types.js";
 import { collectGitEvidence } from "../server/collectors.js";
 import { Store, nowIso } from "../server/db.js";
 import { validateDocumentReferenceTarget } from "../server/domain.js";
 import { ensureManagedProjectDirectory, syncManagedProject, syncManagedProjectStorage } from "../server/projectFiles.js";
 import { buildProjectWorkflow } from "../server/workflow.js";
+import { isInitialProjectBriefApproval } from "../server/projectBrief.js";
+import { changesProtectedRequirement, hasRequirementChangeMarker, isRequirementDeliveryNode, pendingRequirementRevision, protectedRequirementFields, requirementFields } from "../server/nodeRequirementRevision.js";
 import { AgentTaskPackageError, buildAgentOrchestration } from "../server/orchestration.js";
 import {
   AgentTaskLeaseError,
@@ -58,6 +62,9 @@ import {
   assertAgentWorkOrderContext,
   isAgentSecurityEnforced,
   resolveAuthPrincipal,
+  createLocalAgentSession,
+  closeLocalAgentSession,
+  withLocalAgentConnection,
 } from "../server/agentSecurity.js";
 import { classifyMcpTool, DELEGABLE_HIGH_RISK_MCP, SCOPE_GUARDED_CONTROLLED_MCP } from "../server/controlledWriteRegistry.js";
 import { agentWriteContextSchema, leaseWriteContextSchema, optionalLeaseWriteContextSchema, AGENT_WRITE_CONTEXT_DESCRIPTION } from "./agentWriteSchema.js";
@@ -118,18 +125,30 @@ export interface McpServerOptions {
   harness?: CodexHarness;
   /** Only in-process application/test clients may bypass external Agent write authentication. */
   trustedInternal?: boolean;
+  /** Host configuration only. The stdio entry point never forwards this to HTTP. */
+  localAuthorization?: { projectRef: string; workerId: string };
 }
 
 export function createMcpServer(options: McpServerOptions = {}): McpServer {
   const dbPath = options.dbPath ?? process.env.PCS_DB ?? resolve("data/control-surface.db");
   const store = options.store ?? createStore(dbPath);
   const dataDir = options.dataDir ?? process.env.PCS_DATA_DIR ?? dirname(dbPath);
+  if (options.localAuthorization && options.trustedInternal) throw new Error("Local authorization cannot bypass work-order security");
+  const localProject = options.localAuthorization ? byRef(store, options.localAuthorization.projectRef) : undefined;
+  if (options.localAuthorization && !localProject) throw new Error("Local authorization project not found");
+  const localSession = options.localAuthorization && localProject ? createLocalAgentSession(store, {
+    projectId: localProject.id, workerId: options.localAuthorization.workerId, connectionId: `local-process/${randomUUID()}`,
+  }) : undefined;
+  const localPolicy = localSession ? withLocalAgentConnection(localSession.connectionId, () => acknowledgeAgentPolicy(store,
+    localSession, { role: "approver", projectId: localProject!.id, policyVersion: AGENT_POLICY_VERSION })) : undefined;
   let harness = options.harness;
   if (!harness) harness = new CodexHarness(store, dataDir, () => createMcpServer({ store, dbPath, dataDir, harness, trustedInternal: true }));
   const server = new McpServer(
     { name: "product-design-control-surface", version: "0.1.0" },
-    { instructions: `${AGENT_POLICY_INSTRUCTIONS}\npolicyVersion=${AGENT_POLICY_VERSION}` },
+    { instructions: `${AGENT_POLICY_INSTRUCTIONS}\npolicyVersion=${AGENT_POLICY_VERSION}${localSession
+      ? `\nHost-authorized stdio Main Agent: project=${localProject!.id}, workerId=${localSession.workerId}, role=approver. Authentication is injected by the host; all work-order, independent audit and human-only gates remain required. Authorization expires at ${localSession.expiresAt}. Restart the stdio connection to renew.` : ""}` },
   );
+  if (localSession) server.onclose = () => closeLocalAgentSession(store, localSession.credentialId);
   const rawRegisterTool = server.registerTool.bind(server) as (...args: any[]) => any;
   (server as any).registerTool = (name: string, config: any, handler: (input: Record<string, unknown>, ...rest: unknown[]) => unknown) => {
     const risk = classifyMcpTool(name);
@@ -251,7 +270,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
       role: typeof input.role === "string" ? input.role : "",
     });
 
-    return rawRegisterTool(name, securedConfig, (input: Record<string, unknown>, ...rest: unknown[]) => {
+    const securedHandler = (input: Record<string, unknown>, ...rest: unknown[]) => {
       const risk = classifyMcpTool(name);
       const agentRequest = !options.trustedInternal;
       if (agentRequest && risk === "high") {
@@ -284,8 +303,78 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
       }
       if (agentRequest && risk === "controlled" && !onboarding && !internallySecured) {
         const scopeGuarded = SCOPE_GUARDED_CONTROLLED_MCP.has(name);
+        let revisedNode: { diagramId: string; nodeId: string; changeId: string; changedFields: string[] } | null = null;
+        let initialNodes: { diagramId: string; existingIds: Set<string> } | null = null;
         try {
           const { lease, project } = assertAgentLeaseContext(input);
+          if (lease.action_code === "revise_node_requirement"
+            && !["start_agent_task", "heartbeat_agent_task", "complete_agent_task", "fail_agent_task", "release_agent_task", "mutate_diagram"].includes(name)) {
+            throw new AgentSecurityError(403, "ACTION_MISMATCH", "需求修订工单只能更新当前节点需求字段");
+          }
+          if (lease.action_code === "add_function_node"
+            && !["start_agent_task", "heartbeat_agent_task", "complete_agent_task", "fail_agent_task", "release_agent_task", "mutate_diagram"].includes(name)) {
+            throw new AgentSecurityError(403, "ACTION_MISMATCH", "节点拆分工单只能在主画布新增功能节点");
+          }
+          if (["mutate_diagram", "update_diagram", "undo_diagram", "redo_diagram"].includes(name)) {
+            const diagramId = typeof input.diagramId === "string" ? input.diagramId : "";
+            const diagram = store.getDiagram(diagramId);
+            if (diagram?.projectId !== project.id) throw new AgentSecurityError(403, "DIAGRAM_SCOPE_INVALID", "画布不属于当前项目");
+            const operations = Array.isArray(input.operations) ? input.operations as Array<Record<string, unknown>> : [];
+            if (lease.action_code === "add_function_node") {
+              const queued = listClaimableAgentTasks(store, project.id).find((task) => task.taskKey === lease.task_key);
+              let scopes: string[] = [];
+              try { scopes = JSON.parse(lease.work_scopes_json || "[]") as string[]; } catch { scopes = []; }
+              if (name !== "mutate_diagram" || lease.status !== "running" || lease.role !== "designer"
+                || lease.queue !== "design" || diagram.type !== "main"
+                || !queued || queued.id !== lease.task_id || queued.actionCode !== "add_function_node"
+                || queued.taskRevision !== lease.task_revision || queued.diagramId !== diagramId
+                || !scopes.includes(`diagram:${diagramId}`) || input.expectedUpdatedAt !== diagram.updatedAt
+                || operations.length === 0 || operations.some((operation) => operation.op !== "add_node"
+                  || !["module", "feature"].includes(String((operation.node as Record<string, unknown> | undefined)?.kind)))) {
+                throw new AgentSecurityError(403, "FUNCTION_NODE_SCOPE_REQUIRED", "节点拆分只允许运行中的 Designer 在主画布新增模块或功能节点");
+              }
+              initialNodes = { diagramId, existingIds: new Set(diagram.nodes.map((node) => node.id)) };
+            }
+            const revised = lease.action_code === "revise_node_requirement";
+            if (revised) {
+              const queued = listClaimableAgentTasks(store, project.id).find((task) => task.taskKey === lease.task_key);
+              const nodeId = queued?.nodeId ?? "";
+              const node = diagram.nodes.find((item) => item.id === nodeId);
+              const changeId = node ? pendingRequirementRevision(store, diagram, node) : null;
+              let scopes: string[] = [];
+              try { scopes = JSON.parse(lease.work_scopes_json || "[]") as string[]; } catch { scopes = []; }
+              const operation = operations[0];
+              const patch = operation?.patch as Record<string, unknown> | undefined;
+              const changedFields = patch ? Object.keys(patch).filter((field) => field !== "requirementStatus"
+                && patch[field] !== (node as unknown as Record<string, unknown>)?.[field]) : [];
+              if (name !== "mutate_diagram" || lease.status !== "running" || lease.role !== "designer" || lease.queue !== "design"
+                || !queued || queued.id !== lease.task_id || queued.diagramId !== diagramId
+                || queued.actionCode !== lease.action_code || queued.taskRevision !== lease.task_revision
+                || !node || !isRequirementDeliveryNode(diagram, node)
+                || !changeId || lease.task_revision !== `revise_node_requirement:${changeId}`
+                || !scopes.includes(`node:${diagramId}:${nodeId}`) || operations.length !== 1
+                || input.expectedUpdatedAt !== diagram.updatedAt
+                || operation?.op !== "update_node" || operation.nodeId !== nodeId || !patch
+                || Object.keys(patch).some((field) => ![...requirementFields, "requirementStatus"].includes(field))
+                || changedFields.length === 0 || (patch.requirementStatus !== undefined && patch.requirementStatus !== "待评审")) {
+                throw new AgentSecurityError(403, "NODE_REQUIREMENT_SCOPE_REQUIRED", "需求修订只允许运行中的 Designer 修改本工单节点的需求与流程字段");
+              }
+              revisedNode = { diagramId, nodeId, changeId, changedFields };
+            } else if (name === "mutate_diagram") {
+              if (operations.some((operation) => {
+                const node = diagram.nodes.find((item) => item.id === operation.nodeId);
+                return node && hasRequirementChangeMarker(node)
+                  && (operation.op === "delete_node" || (operation.op === "update_node"
+                    && Object.keys((operation.patch as Record<string, unknown>) ?? {}).some((field) => protectedRequirementFields.some((protectedField) => protectedField === field))));
+              })) throw new AgentSecurityError(403, "NODE_REQUIREMENT_REVISION_REQUIRED", "待修订节点的需求字段只能由专属 Designer 工单修改");
+            } else if (name === "update_diagram"
+              && changesProtectedRequirement(diagram, Array.isArray(input.nodes) ? input.nodes as DiagramNode[] : diagram.nodes,
+                typeof input.type === "string" ? input.type : diagram.type)) {
+              throw new AgentSecurityError(403, "NODE_REQUIREMENT_REVISION_REQUIRED", "完整画布更新不能绕过待修订节点的专属工单");
+            } else if (["undo_diagram", "redo_diagram"].includes(name) && diagram.nodes.some(hasRequirementChangeMarker)) {
+              throw new AgentSecurityError(403, "NODE_REQUIREMENT_REVISION_REQUIRED", "画布历史操作不能绕过待修订节点的专属工单");
+            }
+          }
           if (scopeGuarded) {
             assertGovernanceWriteScope(lease, project.id, input);
             if (input.confirm !== true) throw new AgentSecurityError(409, "CONFIRM_REQUIRED", "治理记录修正需要显式 confirm=true");
@@ -296,7 +385,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
           }
         } catch (cause) {
           if (!(cause instanceof AgentSecurityError)) throw cause;
-          if (scopeGuarded) {
+          if (scopeGuarded || ["mutate_diagram", "update_diagram", "undo_diagram", "redo_diagram"].includes(name)) {
             recordScopedAgentWrite(store, {
               action: name, result: "denied", riskClass: "controlled", errorCode: cause.code,
               ...scopedWriteAuditFields(input), details: { tool: name, scope: "work-scope-guarded" },
@@ -304,8 +393,73 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
           }
           return { ...toolText(`${cause.code}: ${cause.message}`), isError: true };
         }
+        if (revisedNode) {
+          const response = handler(input, ...rest) as { isError?: boolean };
+          if (!response.isError) recordScopedAgentWrite(store, {
+            action: name, result: "success", riskClass: "controlled", ...scopedWriteAuditFields(input),
+            details: { ...revisedNode, scope: "requirement-revision" },
+          });
+          return response;
+        }
+        if (initialNodes) {
+          const response = handler(input, ...rest) as { isError?: boolean };
+          if (!response.isError) {
+            const after = store.getDiagram(initialNodes.diagramId);
+            recordScopedAgentWrite(store, {
+              action: name, result: "success", riskClass: "controlled", ...scopedWriteAuditFields(input),
+              details: { diagramId: initialNodes.diagramId,
+                addedNodeIds: after?.nodes.filter((node) => !initialNodes!.existingIds.has(node.id)).map((node) => node.id) ?? [],
+                scope: "function-node-bootstrap" },
+            });
+          }
+          return response;
+        }
       }
       return handler(input, ...rest);
+    };
+    return rawRegisterTool(name, securedConfig, (input: Record<string, unknown>, ...rest: unknown[]) => {
+      if (!localSession) return securedHandler(input, ...rest);
+      return withLocalAgentConnection(localSession.connectionId, () => {
+        try {
+          resolveAuthPrincipal(store, localSession.authSessionToken);
+          if (["begin_agent_auth", "complete_agent_auth", "ack_agent_policy", "issue_agent_write_nonce", "claim_dispatched_child_task"].includes(name)) {
+            throw new AgentSecurityError(403, "LOCAL_ROLE_RESTRICTED", "Host authorizes Main Agent only; authentication material is not exported");
+          }
+          const project = typeof input.projectRef === "string" ? byRef(store, input.projectRef)
+            : typeof input.planId === "string" ? store.getProject(store.getPlan(input.planId)?.projectId ?? "") : undefined;
+          if (project && project.id !== localProject!.id) throw new AgentSecurityError(403, "PERMISSION_DENIED", "Host authorization does not include this project");
+          const childDispatch = ["dispatch_child_task", "reassign_child_task"].includes(name);
+          if ((input.mainAgentId !== undefined && input.mainAgentId !== localSession.agentId)
+            || (!childDispatch && ((input.agentId !== undefined && input.agentId !== localSession.agentId)
+              || (input.workerId !== undefined && input.workerId !== localSession.workerId)
+              || (input.role !== undefined && input.role !== "approver")))) {
+            throw new AgentSecurityError(403, "PRINCIPAL_SPOOF_REJECTED", "Declared identity differs from host authorization");
+          }
+          if (typeof input.workOrderId === "string") {
+            const lease = store.db.prepare("SELECT project_id,agent_id,worker_id,role FROM agent_task_leases WHERE id=?")
+              .get(input.workOrderId) as Record<string, string> | undefined;
+            if (!lease || lease.project_id !== localProject!.id || lease.agent_id !== localSession.agentId
+              || lease.worker_id !== localSession.workerId || lease.role !== "approver") {
+              throw new AgentSecurityError(403, "PRINCIPAL_SPOOF_REJECTED", "Work order does not belong to the host-authorized Main Agent");
+            }
+          }
+          const args = { ...input, ...(!childDispatch ? { agentId: localSession.agentId, workerId: localSession.workerId, role: "approver" } : {}),
+            authSessionToken: localSession.authSessionToken };
+          if (typeof input.workOrderId === "string") {
+            const bodyDigest = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+            const planAction = name === "transition_plan_delivery" && typeof input.planId === "string";
+            Object.assign(args, { policyAckToken: localPolicy!.policyAckToken, connectionId: localSession.connectionId,
+              bodyDigest, nonceId: issueOneTimeNonce(store, { policyAckToken: localPolicy!.policyAckToken,
+                workOrderId: input.workOrderId, action: planAction ? `plan.${input.action}` : `mcp.${name}`,
+                target: planAction ? `plan:${input.planId}` : `mcp:${name}`, bodyDigest }).nonceId });
+          }
+          return securedHandler(args, ...rest);
+        } catch (cause) {
+          if (!(cause instanceof AgentSecurityError)) throw cause;
+          if (["AUTH_REQUIRED", "TOKEN_REVOKED", "TOKEN_EXPIRED"].includes(cause.code)) closeLocalAgentSession(store, localSession.credentialId);
+          return { ...toolText(`${cause.code}: ${cause.message}`), isError: true };
+        }
+      });
     });
   };
 
@@ -817,7 +971,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
   leaseTool("heartbeat_agent_task", "续租 Agent 任务", "Agent 执行期间定期续租；租约丢失后必须停止写入。", {
     leaseSeconds: z.number().int().min(15).max(1800).default(1800),
   }, (input, context) => heartbeatAgentTask(store, input as never, context));
-  leaseTool("complete_agent_task", "完成 Agent 任务", "仅在对应工作流动作已经完成后关闭租约；计划流转通常会自动完成租约。", {
+  leaseTool("complete_agent_task", "完成 Agent 任务", "关闭已完成的任务租约；approve_node_document 会在精确工单修订下原子批准当前文档并固定节点引用，计划流转通常会自动完成其它租约。", {
     resultDigest: z.string().max(4000).optional(),
     documentRevisionId: z.string().max(300).optional(), implementationRevision: z.string().max(300).optional(),
     evidenceId: z.string().max(300).optional(), testCommand: z.string().max(2000).optional(),
@@ -1208,6 +1362,11 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     const project = byRef(store, args.projectRef);
     if (!project) return toolText(`未找到项目: ${args.projectRef}`);
     if (Boolean(args.targetType) !== Boolean(args.targetId)) return toolText("targetType 与 targetId 必须同时提供");
+    if (args.status === "已批准" && args.targetType === "project" && args.targetId === project.id
+      && args.relationType === "defines"
+      && isInitialProjectBriefApproval(store, project.id, { id: "", category: args.category ?? "其他" })) {
+      return { ...toolText("PROJECT_BRIEF_APPROVAL_REQUIRED: 首个项目简报必须经独立设计审计和 Main Agent 工单批准"), isError: true };
+    }
     if (args.targetType && args.targetId) {
       const targetError = validateDocumentReferenceTarget(store, project.id, args.targetType, args.targetId);
       if (targetError) return toolText(targetError);
@@ -1336,7 +1495,21 @@ if (isDirectRun) {
     const dataDir = process.env.PCS_DATA_DIR ?? dirname(dbPath);
     const store = createStore(dbPath);
     syncManagedProjectStorage(store, dataDir);
-    serveStdio(() => createMcpServer({ store, dbPath, dataDir }));
+    // These scope values are deployment configuration, not MCP request arguments.
+    const projectRef = process.env.PCS_LOCAL_MCP_PROJECT?.trim();
+    const workerId = process.env.PCS_LOCAL_MCP_WORKER?.trim();
+    if (Boolean(projectRef) !== Boolean(workerId)) throw new Error("Set both PCS_LOCAL_MCP_PROJECT and PCS_LOCAL_MCP_WORKER, or neither");
+    const handle = serveStdio(() => createMcpServer({ store, dbPath, dataDir,
+      ...(projectRef && workerId ? { localAuthorization: { projectRef, workerId } } : {}) }));
+    let closing = false;
+    const shutdown = () => {
+      if (closing) return;
+      closing = true;
+      void handle.close().finally(() => store.close());
+    };
+    process.stdin.once("end", shutdown);
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
     console.error("[pcs-mcp] stdio 服务已启动（等待 MCP 客户端连接）");
   } catch (error) {
     console.error("[pcs-mcp] 启动失败:", error);

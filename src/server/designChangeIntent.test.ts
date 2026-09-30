@@ -16,6 +16,8 @@ import {
 } from "./designChange.js";
 import { submitDesignChangeIntent } from "./designChangeIntent.js";
 import { openEvidenceRepairState, updateEvidenceRepairState } from "./evidenceRepair.js";
+import { transitionPlanLifecycle } from "./planLifecycle.js";
+import { buildProjectWorkflow } from "./workflow.js";
 import {
   acknowledgeAgentPolicy,
   beginAgentAuth,
@@ -117,7 +119,35 @@ function copyAcceptedPlan(fx: ReturnType<typeof fixture>, nodeId: string, title:
   return fx.store.insertPlan({ ...template, diagramNodeId: nodeId, title, dependencyIds: [] });
 }
 
+function copyReworkPlan(fx: ReturnType<typeof fixture>, acceptedPlanId: string, nodeId: string) {
+  const { id: _id, createdAt: _createdAt, updatedAt: _updatedAt, ...template } = fx.plan;
+  return fx.store.insertPlan({ ...template, diagramNodeId: nodeId, title: "现有返工", lifecycleStatus: "rework",
+    reworkOfPlanId: acceptedPlanId, status: "未开始", progress: 0, implementationRevision: "",
+    auditStatus: "failed", approvedAt: "", completedAt: "" });
+}
+
 describe("design change intent bootstrap", () => {
+  it("retires an earlier rework plan when its successor is accepted", () => {
+    const fx = fixture();
+    const previous = copyReworkPlan(fx, fx.plan.id, fx.nodeId);
+    const { id: _id, createdAt: _createdAt, updatedAt: _updatedAt, ...template } = fx.plan;
+    const successor = fx.store.insertPlan({ ...template, title: "后续返工", reworkOfPlanId: previous.id,
+      lifecycleStatus: "pending_manager", implementationRevision: "successor-revision",
+      managerDecision: "pending", auditStatus: "passed" });
+    fx.store.insertEvidence({ projectId: fx.project.id, nodeId: fx.nodeId, planItemId: successor.id,
+      documentRevisionId: fx.document.currentRevisionId, sourceType: "manual", sourcePath: "successor-audit.json",
+      command: "npm test", resultStatus: "pass", summary: "后续返工审计通过",
+      details: { auditScope: "implementation", implementationRevision: successor.implementationRevision },
+      commitSha: successor.implementationRevision, digest: "successor-audit", collectedAt: nowIso(),
+      actorRole: "auditor", agentId: "auditor-id" });
+    transitionPlanLifecycle(fx.store, successor.id, { action: "approve_acceptance", actor: "Main Agent" });
+    expect(fx.store.getPlan(previous.id)?.lifecycleStatus).toBe("superseded");
+    expect(buildAgentOrchestration(fx.store, fx.project.id)!.queues.design.some((task) => task.planItemId === previous.id)).toBe(false);
+    const workflow = buildProjectWorkflow(fx.store, fx.project.id)!;
+    expect(workflow.layerGate.plans.some((plan) => plan.planId === previous.id)).toBe(false);
+    expect(workflow.nodes.find((node) => node.nodeId === fx.nodeId)?.nextAction?.entityId).not.toBe(previous.id);
+    expect(() => transitionPlanLifecycle(fx.store, previous.id, { action: "submit_plan", actor: "designer-id" })).toThrow("不能执行");
+  });
   it("rejects intent execution without the dedicated approval context through REST and trusted MCP", async () => {
     const fx = fixture();
     const intent = submit(fx);
@@ -177,6 +207,49 @@ describe("design change intent bootstrap", () => {
       lifecycleStatus: "rework", implementationRevision: "", approvedAt: "", reworkOfPlanId: fx.plan.id,
     });
     expect(fx.store.getEvidence(fx.evidence.id)).toMatchObject({ status: "revoked" });
+  });
+
+  it("includes an existing same-node rework and does not clone its accepted baseline again", () => {
+    const fx = fixture();
+    const rework = copyReworkPlan(fx, fx.plan.id, fx.nodeId);
+    const intent = submit(fx);
+    const { taskPackage, agent } = claim(fx);
+    expect(taskPackage.task.designChangeIntent.impactedPlanIds).toEqual([fx.plan.id, rework.id].sort());
+    const result = requestDesignChange(fx.store, {
+      ...formalInput(fx, intent.intentId), impactedPlanIds: [fx.plan.id, rework.id],
+    }, { source: "mcp", agent });
+    expect(result.reworkPlanIds).toEqual([rework.id]);
+    expect(fx.store.getPlan(fx.plan.id)).toMatchObject({ lifecycleStatus: "accepted", implementationRevision: "nogit-history" });
+    expect(fx.store.getPlan(rework.id)).toMatchObject({ lifecycleStatus: "rework", implementationRevision: "" });
+    expect(fx.store.listPlans(fx.project.id).filter((plan) => plan.reworkOfPlanId === fx.plan.id)).toHaveLength(1);
+  });
+
+  it("stales an old intent and dispatches both nodes when a dependent node gains active rework", () => {
+    const fx = fixture();
+    const old = submit(fx, "before-dependent-rework");
+    const { agent } = claim(fx);
+    const dependentNodeId = "dependent-rework-node";
+    const latest = fx.store.getDiagram(fx.diagram.id)!;
+    fx.store.updateDiagram(latest.id, { nodes: [...latest.nodes, {
+      id: dependentNodeId, kind: "feature", label: "依赖功能", description: "", owner: "team", acceptanceCriteria: "通过",
+      requirementStatus: "已批准", designStatus: "已批准", developmentStatus: "已完成", acceptanceStatus: "已通过",
+      deliveryUpdatedAt: nowIso(), x: 920, y: 180,
+    }] });
+    const dependent = copyAcceptedPlan(fx, dependentNodeId, "依赖计划");
+    fx.store.updatePlan(dependent.id, { dependencyIds: [fx.plan.id] });
+    const rework = copyReworkPlan(fx, dependent.id, dependentNodeId);
+    const fresh = submit(fx, "after-dependent-rework");
+    expect(fresh.intentId).not.toBe(old.intentId);
+    expect(fx.store.db.prepare("SELECT status FROM design_change_intents WHERE id=?").get(old.intentId))
+      .toEqual({ status: "stale" });
+    expect(fx.store.db.prepare("SELECT status FROM agent_task_leases WHERE id=?").get(agent.workOrderId))
+      .toEqual({ status: "released" });
+    const approvals = buildAgentOrchestration(fx.store, fx.project.id)!.queues.approval
+      .filter((task) => task.correlationId === `design-change-intent:${fresh.intentId}`);
+    expect(approvals).toHaveLength(2);
+    expect(new Set(approvals.map((task) => task.nodeId))).toEqual(new Set([fx.nodeId, dependentNodeId]));
+    expect(approvals.map((task) => task.designChangeIntent!.impactedPlanIds).every((ids) =>
+      ids.join("\u001f") === [fx.plan.id, dependent.id, rework.id].sort().join("\u001f"))).toBe(true);
   });
 
   it("requires enrolled proof at MCP entry, rejects a mismatched digest, and permits authenticated REST replay", async () => {
