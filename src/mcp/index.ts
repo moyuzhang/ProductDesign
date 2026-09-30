@@ -747,9 +747,9 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
   });
   server.registerTool("dispatch_child_task", {
     title: "Main Agent 派发子任务",
-    description: "Main Agent 按当前阶段派发精确 Designer、Builder 或 Auditor 任务；响应不包含子 Agent leaseToken。",
+    description: "Main Agent 按当前阶段派发精确 Designer、Builder 或 Auditor 任务；响应不包含子 Agent leaseToken。可选 idempotencyKey 按操作/项目/父租约隔离，重试仅返回仍有效的当前派发。",
     inputSchema: {
-      ...coordinationParentSchema, taskId: z.string().trim().min(1).max(1000), taskKey: z.string().trim().min(1).max(2000).optional(),
+      ...coordinationParentSchema, idempotencyKey: z.string().trim().min(1).max(300).optional(), taskId: z.string().trim().min(1).max(1000), taskKey: z.string().trim().min(1).max(2000).optional(),
       role: z.enum(["designer", "builder", "auditor"]), agentId: z.string().trim().max(200).optional(),
       workerId: z.string().trim().max(300).optional(), poolId: z.string().trim().max(500).optional(),
     },
@@ -783,8 +783,8 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     catch (cause) { if (cause instanceof CoordinationLeaseError) return { ...toolText(structuredError(cause)), isError: true }; throw cause; }
   });
   parentAction("reclaim_child_task", "Main Agent 回收子任务", "Main Agent 回收子任务并使旧子租约失效。", { dispatchId: z.string().trim().min(1).max(300), reason: z.string().trim().max(4000).optional() }, (input) => reclaimChildTask(store, input));
-  parentAction("reassign_child_task", "Main Agent 重派子任务", "Main Agent 回收旧子租约后，按新的精确身份重派任务。", {
-    dispatchId: z.string().trim().min(1).max(300), role: z.enum(["designer", "builder", "auditor"]), taskId: z.string().trim().max(1000).optional(),
+  parentAction("reassign_child_task", "Main Agent 重派子任务", "Main Agent 回收旧子租约后，按新的精确身份重派任务。可选 idempotencyKey 可安全重试同一次改派，失效替代派发不可重放。", {
+    idempotencyKey: z.string().trim().min(1).max(300).optional(), dispatchId: z.string().trim().min(1).max(300), role: z.enum(["designer", "builder", "auditor"]), taskId: z.string().trim().max(1000).optional(),
     agentId: z.string().trim().min(1).max(200), workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), reason: z.string().trim().max(4000).optional(),
   }, (input) => reassignChildTask(store, input));
   parentAction("pause_coordination_lease", "暂停父协调租约", "暂停父租约并级联回收所有活动子租约。", {}, (input) => pauseCoordinationLease(store, input));

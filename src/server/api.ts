@@ -1225,7 +1225,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       if (operation === "release") return releaseCoordinationLease(store, { ...base, reason: parse(z.object({ reason: z.string().trim().max(4000).optional() }), request.body).reason });
       if (operation === "advance") return advanceCoordinationStage(store, { ...base, stage: parse(z.object({ stage: z.enum(AGENT_COORDINATION_STAGES) }), request.body).stage });
       if (operation === "dispatch") {
-        const body = parse(z.object({ taskId: z.string().trim().min(1).max(1000), taskKey: z.string().trim().max(2000).optional(), role: z.enum(["designer", "builder", "auditor"]), agentId: z.string().trim().max(200).optional(), workerId: z.string().trim().max(300).optional(), poolId: z.string().trim().max(500).optional() }), request.body);
+        const body = parse(z.object({ idempotencyKey: z.string().trim().min(1).max(300).optional(), taskId: z.string().trim().min(1).max(1000), taskKey: z.string().trim().max(2000).optional(), role: z.enum(["designer", "builder", "auditor"]), agentId: z.string().trim().max(200).optional(), workerId: z.string().trim().max(300).optional(), poolId: z.string().trim().max(500).optional() }), request.body);
         return dispatchChildTask(store, { ...base, ...body });
       }
       if (operation === "reclaim") {
@@ -1233,7 +1233,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         return reclaimChildTask(store, { ...base, ...body });
       }
       if (operation === "reassign") {
-        const body = parse(z.object({ dispatchId: z.string().trim().min(1).max(300), role: z.enum(["designer", "builder", "auditor"]), agentId: z.string().trim().min(1).max(200), workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), reason: z.string().trim().max(4000).optional() }), request.body);
+        const body = parse(z.object({ idempotencyKey: z.string().trim().min(1).max(300).optional(), dispatchId: z.string().trim().min(1).max(300), role: z.enum(["designer", "builder", "auditor"]), agentId: z.string().trim().min(1).max(200), workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), reason: z.string().trim().max(4000).optional() }), request.body);
         return reassignChildTask(store, { ...base, ...body, taskId: "" });
       }
       return reply.code(404).send({ message: "未知的协调租约操作", code: "COORDINATION_OPERATION_NOT_FOUND" });

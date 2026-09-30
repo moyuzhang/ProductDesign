@@ -1,4 +1,4 @@
-# 外部 Harness 工作区绑定（第一阶段）
+# 外部 Harness 工作区绑定与可靠派发
 
 ## 边界
 
@@ -23,11 +23,22 @@ ProductDesign 先通过现有 `POST /api/projects` / `create_product_design_proj
 - 直接领取与派发子任务领取均原子提交工单、工作区预留和完整任务包；序列化失败回滚。重放返回原始固定绑定，并重新验证认证；会话刷新不改变业务幂等摘要。认证 token 不写入租约、审计或幂等响应。
 - 现有项目配置与 MCP 安全策略继续生效，外部仓库设置不是审批授权。
 
+## 派发与改派的重试协议
+
+`dispatch_child_task` / `reassign_child_task` 和 REST `POST /api/projects/:id/coordination-leases/:coordinationLeaseId/dispatch` / `reassign` 接受可选 `idempotencyKey`（去除首尾空白后 1–300 字符）。外部 Harness 应对一次派发意图固定使用同一键；省略时保留旧行为，重复派发仍报冲突。
+
+- 键按操作、项目和父协调租约隔离。相同键和相同规范化意图返回同一个**当前仍有效**的 dispatch，而不是历史 JSON；不新增子任务、不增加父派发修订。同一作用域中换任务、身份、池或改派理由等意图返回 `IDEMPOTENCY_CONFLICT`。可选身份/池的省略和空值等价；显式填写值与省略默认值视为不同意图。改派目标由原派发确定，忽略的 `taskId` / `taskKey` 不参与改派摘要。
+- 每次请求先验证原有父 bearer token、精确 Main Agent 身份、凭据 audience 和仍有效的认证绑定，再查询回执。意图摘要不包含认证或租约 token，回执只保存摘要与派发 ID。重试键不是授权。
+- 父租约暂停、释放、过期或认证撤销时不能重放。已结束、回收、再次改派、修订或分配失效的原派发/替代派发也不能重放。已领取/运行的子任务不会因自身占用容量而被当作新领取拒绝，但仍校验真实子租约状态、有效期和精确绑定；派发状态滞后不能恢复失效子租约。
+- 改派回执在原派发的活动状态检查之前读取，所以首次成功后原派发已回收不妨碍重试。内部创建替代派发不另写 dispatch 回执。回执与派发、回收、锁和父修订变更在同一个 SQLite immediate 事务内提交或回滚。
+
+外部 Harness 自行启动和监督子进程；服务不 spawn 子 Agent，也不新增角色。已有任务包继续提供上下文和工作目录，`launch.executionOwner=external-harness`、`manualStartRequired=true` 的含义不变。
+
 ## 第一阶段限制
 
 `submit_evidence_repair` 在外部模式明确返回 `EXTERNAL_REPAIR_VERIFIER_REQUIRED`。当前修复协议依赖受控仓库 HEAD 与固定修订比较；尚未实现可信外部验证器，不能用 Runner 自报 SHA 代替这个门禁。服务端 Git 证据采集也不适用于无服务端源码的项目；外部执行者须按既有证据协议提交结果并接受独立审计。
 
-本阶段不新增自动派发/改派幂等协议、不远程检查路径、不提供 UI 源码绑定表单、不负责外部 Runner 安装或凭据配置。外部路径和基线输入应来自 Harness 自己核实的隔离工作区。
+不远程检查路径、不提供 UI 源码绑定表单、不负责外部 Runner 安装或凭据配置。外部路径和基线输入应来自 Harness 自己核实的隔离工作区。
 
 ## 验证与维护范围
 
@@ -35,4 +46,6 @@ ProductDesign 先通过现有 `POST /api/projects` / `create_product_design_proj
 
 本次为用户明确批准的独立仓库维护，运行时项目工作流预检不可用；未连接/修改真实项目、未借用工单、未创建虚假批准。数据库状态与测试认证均仅存在于一次性合成测试夹具中。
 
-验证命令：`npm run verify`（完整 Vitest + Web/Server 类型检查 + Vite/Server 构建），最终结果 85 个测试文件、700 通过、1 跳过。新增三组回归共 48 项通过。新测试文件另经严格 TypeScript 检查。构建仅有既有大资源块提示；未执行部署或真实外部 Runner 端到端连接。
+第一阶段验证命令：`npm run verify`（完整 Vitest + Web/Server 类型检查 + Vite/Server 构建），结果 85 个测试文件、700 通过、1 跳过。新增三组回归共 48 项通过。新测试文件另经严格 TypeScript 检查。构建仅有既有大资源块提示；未执行部署或真实外部 Runner 端到端连接。
+
+可靠派发阶段新增 65 项回归：54 项协调租约用例与 11 项 REST/MCP/并发用例。最终 `npm run verify` 通过：86 个测试文件、765 通过、1 跳过；两份改动测试文件另经严格 TypeScript 检查。并发覆盖使用同一临时 SQLite 数据库的两个独立 Node 进程和启动屏障，验证 dispatch/reassign 的相同请求与冲突请求。没有部署或真实外部 Harness 端到端连接；构建仍只有既有大资源块提示。
