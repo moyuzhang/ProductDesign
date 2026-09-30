@@ -1,3 +1,5 @@
+import { listDesignChangeRecoveries } from "./designChangeCorrection.js";
+import { pendingRequirementRevision } from "./nodeRequirementRevision.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +16,7 @@ import {
   dismissDesignChangeIntentBodyDigest,
   requestDesignChange,
 } from "./designChange.js";
-import { submitDesignChangeIntent } from "./designChangeIntent.js";
+import { assertDesignChangeIntentCurrent, submitDesignChangeIntent } from "./designChangeIntent.js";
 import { openEvidenceRepairState, updateEvidenceRepairState } from "./evidenceRepair.js";
 import { transitionPlanLifecycle } from "./planLifecycle.js";
 import { buildProjectWorkflow } from "./workflow.js";
@@ -127,6 +129,92 @@ function copyReworkPlan(fx: ReturnType<typeof fixture>, acceptedPlanId: string, 
 }
 
 describe("design change intent bootstrap", () => {
+  function correctionFixture() {
+    const fx = fixture();
+    const original = requestDesignChange(fx.store, { ...formalInput(fx, ""), intentId: undefined, requirementImpact: false, idempotencyKey: "initial-no-requirements" }, { source: "web" });
+    const input = { projectId: fx.project.id, diagramId: fx.diagram.id, nodeId: fx.nodeId, rootPlanId: original.reworkPlanIds[0],
+      correctsChangeId: original.changeId, reason: "新增需求", changeSummary: "调整已验收功能",
+      expectedUpdatedAt: fx.store.getDiagram(fx.diagram.id)!.updatedAt, idempotencyKey: "correction-intent" };
+    return { fx, original, input };
+  }
+
+  it("appends an independently approved correction without rewriting history and generates one requirements revision", () => {
+    const { fx, original, input } = correctionFixture();
+    const originalDecision = fx.store.getGovernance(original.changeId);
+    const approvedHistory = fx.store.getDocumentRevision(fx.document.currentRevisionId);
+    const oldNode = fx.store.getDiagram(fx.diagram.id)!.nodes.find((node) => node.id === fx.nodeId)!;
+    expect(oldNode.requirementStatus).toBe("已批准");
+    expect(pendingRequirementRevision(fx.store, fx.store.getDiagram(fx.diagram.id)!, oldNode)).toBeNull();
+    expect(listDesignChangeRecoveries(fx.store, fx.project.id)).toEqual([expect.objectContaining({ correctsChangeId: original.changeId, rootPlanId: input.rootPlanId, requiresIndependentApproval: true })]);
+    const intent = submitDesignChangeIntent(fx.store, input);
+    expect(submitDesignChangeIntent(fx.store, input)).toEqual(intent);
+    expect(fx.store.getGovernance(original.changeId)).toEqual(originalDecision);
+    const { taskPackage, agent } = claim(fx);
+    expect(taskPackage.task.designChangeIntent.correctsChangeId).toBe(original.changeId);
+    const appliedInput = { ...formalInput(fx, intent.intentId), impactedPlanIds: taskPackage.task.designChangeIntent.impactedPlanIds, impactedDocumentIds: taskPackage.task.designChangeIntent.impactedDocumentIds, idempotencyKey: "apply-correction" };
+    expect(() => requestDesignChange(fx.store, appliedInput, { source: "web" })).toThrow("完整独立审批");
+    expect(() => requestDesignChange(fx.store, { ...appliedInput, requirementImpact: false }, { source: "mcp", agent })).toThrow("确认存在需求影响");
+    const result = requestDesignChange(fx.store, appliedInput, { source: "mcp", agent });
+    expect(result.correctsChangeId).toBe(original.changeId);
+    expect(requestDesignChange(fx.store, appliedInput, { source: "mcp", agent })).toEqual(result);
+    expect(fx.store.getGovernance(original.changeId)).toEqual(originalDecision);
+    expect(fx.store.getDocumentRevision(fx.document.currentRevisionId)).toEqual(approvedHistory);
+    expect(fx.store.getPlan(fx.plan.id)?.lifecycleStatus).toBe("accepted");
+    const diagram = fx.store.getDiagram(fx.diagram.id)!;
+    expect(pendingRequirementRevision(fx.store, diagram, diagram.nodes.find((node) => node.id === fx.nodeId)!)).toBe(result.changeId);
+    expect(buildAgentOrchestration(fx.store, fx.project.id)!.queues.design.filter((task) => task.actionCode === "revise_node_requirement")).toHaveLength(1);
+    expect(listDesignChangeRecoveries(fx.store, fx.project.id)).toHaveLength(0);
+    expect(() => submitDesignChangeIntent(fx.store, { ...input, idempotencyKey: "late-duplicate", expectedUpdatedAt: diagram.updatedAt })).toThrow("只能复核当前");
+  });
+
+  it("cannot reuse the original change approval lease for a correction", () => {
+    const fx = fixture();
+    const originalIntent = submit(fx); const old = claim(fx);
+    const original = requestDesignChange(fx.store, { ...formalInput(fx, originalIntent.intentId), requirementImpact: false }, { source: "mcp", agent: old.agent });
+    const correction = submitDesignChangeIntent(fx.store, { projectId: fx.project.id, diagramId: fx.diagram.id, nodeId: fx.nodeId,
+      rootPlanId: original.reworkPlanIds[0], correctsChangeId: original.changeId, reason: "新增需求", changeSummary: "调整已验收功能",
+      expectedUpdatedAt: fx.store.getDiagram(fx.diagram.id)!.updatedAt, idempotencyKey: "correct-old-approved-change" });
+    const input = { ...formalInput(fx, correction.intentId), impactedPlanIds: original.reworkPlanIds, idempotencyKey: "must-not-reuse-old-lease" };
+    expect(() => requestDesignChange(fx.store, input, { source: "mcp", agent: old.agent })).toThrow();
+    expect(fx.store.getDiagram(fx.diagram.id)!.nodes.find((node) => node.id === fx.nodeId)?.requirementStatus).toBe("已批准");
+    expect(fx.store.listGovernance(fx.project.id).filter((item) => item.title.startsWith("设计变更"))).toHaveLength(1);
+  });
+
+  it("exposes authoritative correction candidates and stable REST rejection codes", async () => {
+    const { fx, input, original } = correctionFixture();
+    const app = buildApp({ dbPath: join(fx.dir, "test.db"), dataDir: fx.dir });
+    try {
+      const candidates = await app.inject({ method: "GET", url: `/api/projects/${fx.project.id}/design-change-recoveries` });
+      expect(candidates.statusCode).toBe(200);
+      expect(candidates.json()).toEqual([expect.objectContaining({ correctsChangeId: original.changeId, requiresIndependentApproval: true })]);
+      const { projectId: _, ...body } = input;
+      const wrong = await app.inject({ method: "POST", url: `/api/projects/${fx.project.id}/design-change-intents`, payload: { ...body, correctsChangeId: "00000000-0000-0000-0000-000000000000" } });
+      expect(wrong.statusCode).toBe(409); expect(wrong.json().code).toBe("DESIGN_CHANGE_CORRECTION_NOT_CURRENT");
+      const response = await app.inject({ method: "POST", url: `/api/projects/${fx.project.id}/design-change-intents`, payload: body });
+      expect(response.statusCode).toBe(202); expect(response.json()).toMatchObject({ status: "pending", authorizesImplementation: false });
+    } finally { await app.close(); }
+  });
+
+  it("keeps the ordinary accepted gate and rejects conflicting, stale or cross-project corrections", () => {
+    const { fx, original, input } = correctionFixture();
+    expect(() => submitDesignChangeIntent(fx.store, { ...input, correctsChangeId: undefined })).toThrow("accepted 根计划");
+    const other = fixture();
+    expect(() => submitDesignChangeIntent(fx.store, { ...input, projectId: other.project.id })).toThrow();
+    expect(() => submitDesignChangeIntent(fx.store, { ...input, correctsChangeId: "00000000-0000-0000-0000-000000000000" })).toThrow("只能复核当前");
+    expect(() => submitDesignChangeIntent(fx.store, { ...input, expectedUpdatedAt: "stale" })).toThrow("画布已变化");
+    const intent = submitDesignChangeIntent(fx.store, input);
+    expect(() => submitDesignChangeIntent(fx.store, { ...input, idempotencyKey: "competing" })).toThrow("pending 变更意图");
+    fx.store.updateGovernance(original.changeId, { rationale: "source decision changed after snapshot" });
+    expect(() => assertDesignChangeIntentCurrent(fx.store, intent.intentId, fx.project.id)).toThrow("冻结指纹已漂移");
+  });
+
+  it("rejects completed correction targets and never promotes an unapproved proposal", () => {
+    const { fx, input } = correctionFixture();
+    fx.store.updatePlan(input.rootPlanId, { lifecycleStatus: "accepted" });
+    expect(listDesignChangeRecoveries(fx.store, fx.project.id)).toEqual([]);
+    expect(() => submitDesignChangeIntent(fx.store, input)).toThrow("只能复核当前");
+  });
+
   it("retires an earlier rework plan when its successor is accepted", () => {
     const fx = fixture();
     const previous = copyReworkPlan(fx, fx.plan.id, fx.nodeId);

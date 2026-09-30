@@ -1,3 +1,4 @@
+import { DesignChangeCorrectionError } from "../server/designChangeCorrection.js";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import {
@@ -771,10 +772,10 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
   });
 
   server.registerTool("submit_design_change_intent", {
-    description: "为 accepted 根计划提交非授权设计变更意图。requestedBy 仅作 unverified_submission 审计声明；本工具只生成 pending 独立审批工单，不修改计划、文档、节点、证据或租约。",
+    description: "为 accepted 根计划提交非授权设计变更意图；更正尚未完成变更的需求影响分类时必须提供 correctsChangeId 并绑定其当前返工计划，随后需要全新独立审批。requestedBy 仅作 unverified_submission 审计声明；本工具只生成 pending 独立审批工单，不修改计划、文档、节点、证据或租约。",
     inputSchema: {
       projectRef: z.string().min(1), diagramId: z.string().min(1), nodeId: z.string().min(1),
-      rootPlanId: z.string().min(1), reason: z.string().min(1), changeSummary: z.string().min(1),
+      rootPlanId: z.string().min(1), correctsChangeId: z.string().uuid().optional(), reason: z.string().min(1), changeSummary: z.string().min(1),
       expectedUpdatedAt: z.string().min(1), idempotencyKey: z.string().min(1), requestedBy: z.string().max(300).optional(),
     },
   }, (input) => {
@@ -784,7 +785,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
       const { projectRef: _projectRef, ...intent } = input;
       return result(submitDesignChangeIntent(store, { ...intent, projectId: project.id }));
     } catch (cause) {
-      if (cause instanceof DesignChangeIntentError) return error(structuredError(cause));
+      if (cause instanceof DesignChangeIntentError || cause instanceof DesignChangeCorrectionError) return error(structuredError(cause));
       return error(cause instanceof Error ? cause.message : "提交设计变更意图失败");
     }
   });
@@ -831,7 +832,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
         securityAction: "mcp.dismiss_design_change_intent", securityTarget: "mcp:dismiss_design_change_intent",
       }));
     } catch (cause) {
-      if (cause instanceof DesignChangeError || cause instanceof AgentSecurityError) return error(structuredError(cause));
+      if (cause instanceof DesignChangeError || cause instanceof AgentSecurityError || cause instanceof DesignChangeIntentError || cause instanceof DesignChangeCorrectionError) return error(structuredError(cause));
       return error(cause instanceof Error ? cause.message : "驳回设计变更意图失败");
     }
   });

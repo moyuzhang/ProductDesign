@@ -239,7 +239,19 @@ export interface DesignChangeRequest {
 
 export type DesignChangeIntentStatus = "pending" | "applied" | "dismissed" | "stale";
 
+export interface DesignChangeRecovery {
+  correctsChangeId: string;
+  diagramId: string;
+  nodeId: string;
+  rootPlanId: string;
+  nodeLabel: string;
+  expectedUpdatedAt: string;
+  reason: string;
+  requiresIndependentApproval: true;
+}
+
 export interface DesignChangeIntentInput {
+  correctsChangeId?: string;
   projectId: string;
   diagramId: string;
   nodeId: string;
@@ -252,6 +264,7 @@ export interface DesignChangeIntentInput {
 }
 
 export interface DesignChangeIntentTaskContext {
+  correctsChangeId?: string;
   intentId: string;
   rootPlanId: string;
   impactedPlanIds: string[];
@@ -273,6 +286,7 @@ export interface DesignChangeIntentResult {
 }
 
 export interface DesignChangeResult {
+  correctsChangeId?: string;
   changeId: string;
   projectId: string;
   diagramId: string;
@@ -335,7 +349,19 @@ export type LlmProtocol = (typeof LLM_PROTOCOLS)[number];
 export const LLM_REASONING_EFFORTS = ["none", "low", "high", "max"] as const;
 export type LlmReasoningEffort = (typeof LLM_REASONING_EFFORTS)[number];
 
+export interface CodexModel { id: string; model: string; displayName: string; isDefault: boolean }
+export interface CodexAccountStatus {
+  status: "signed-out" | "signed-in";
+  email?: string;
+  planType?: string;
+  login: { loginId: string; status: "pending" | "succeeded" | "failed" | "cancelled" | "expired"; message?: string; expiresAt: string } | null;
+}
+export type CodexLoginStart = ({ type: "chatgpt"; loginId: string; authUrl: string }
+  | { type: "chatgptDeviceCode"; loginId: string; verificationUrl: string; userCode: string }) & { expiresAt: string };
+
 export interface LlmProfile {
+  /** Missing on legacy clients means API key authentication. */
+  authMode?: "api-key" | "chatgpt";
   id: string;
   name: string;
   provider: string;
@@ -1072,6 +1098,7 @@ export interface PlanDeliveryLayerGate {
 }
 
 export interface ProjectWorkflow {
+  designChangeRecoveries?: DesignChangeRecovery[];
   policyVersion: string;
   projectId: string;
   phase: ProjectWorkflowPhase;

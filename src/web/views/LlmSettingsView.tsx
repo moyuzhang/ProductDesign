@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
 import {
   Bot,
   Check,
@@ -25,6 +25,7 @@ import {
   type LlmReasoningEffort,
 } from "../../shared/types";
 import { api } from "../api";
+import { ChatGptAccountPanel, type AccountModel } from "./ChatGptAccountPanel";
 import { Badge, ErrorBanner, Field, Modal, Spinner, formatDateTime } from "../ui";
 
 const PROTOCOL_LABELS: Record<LlmProtocol, string> = {
@@ -66,6 +67,7 @@ export const LLM_PROVIDER_PRESETS: LlmProviderPreset[] = [
 const KNOWN_PRESETS = LLM_PROVIDER_PRESETS.filter((preset) => preset.id !== "custom_gateway");
 
 export interface ProfileFormState {
+  authMode?: "api-key" | "chatgpt";
   name: string;
   provider: string;
   protocol: LlmProtocol;
@@ -81,6 +83,7 @@ export interface ProfileFormState {
 
 function formFromPreset(preset: LlmProviderPreset): ProfileFormState {
   return {
+    authMode: "api-key",
     name: `${preset.label} 默认配置`,
     provider: preset.id,
     protocol: preset.protocol,
@@ -99,6 +102,7 @@ const EMPTY_FORM = formFromPreset(KNOWN_PRESETS[0]);
 
 export function formFromProfile(profile: LlmProfile): ProfileFormState {
   return {
+    authMode: profile.authMode ?? "api-key",
     name: profile.name,
     provider: profile.provider,
     protocol: profile.protocol,
@@ -123,17 +127,18 @@ export function profilePayloadFromForm(form: ProfileFormState): Omit<ProfileForm
   if (defaultModel && !models.includes(defaultModel)) models.unshift(defaultModel);
   const apiKey = form.apiKey.trim();
   return {
+    authMode: form.authMode ?? "api-key",
     name: form.name.trim(),
-    provider: form.provider.trim(),
-    protocol: form.protocol,
-    baseUrl: form.baseUrl.trim(),
-    apiKeyEnv: form.apiKeyEnv.trim(),
+    provider: form.authMode === "chatgpt" ? "openai" : form.provider.trim(),
+    protocol: form.authMode === "chatgpt" ? "openai-responses" : form.protocol,
+    baseUrl: form.authMode === "chatgpt" ? "https://api.openai.com/v1" : form.baseUrl.trim(),
+    apiKeyEnv: form.authMode === "chatgpt" ? "OPENAI_API_KEY" : form.apiKeyEnv.trim(),
     models,
     defaultModel,
     enabled: form.enabled,
     reasoningEffort: form.reasoningEffort,
     timeoutMs: form.timeoutMs,
-    ...(apiKey ? { apiKey } : {}),
+    ...(apiKey && form.authMode !== "chatgpt" ? { apiKey } : {}),
   };
 }
 
@@ -157,12 +162,14 @@ interface EditTarget {
 }
 
 function credentialLabel(profile: LlmProfile): string {
+  if (profile.authMode === "chatgpt") return "ChatGPT 账户 · 登录状态见账户面板";
   if (profile.credentialSource === "stored") return `密钥已配置 · ${profile.credentialMasked}`;
   if (profile.credentialSource === "environment") return `环境变量 ${profile.apiKeyEnv} 已就绪`;
   return "未配置密钥";
 }
 
 export function LlmSettingsView(): ReactElement {
+  const [accountModels, setAccountModels] = useState<AccountModel[]>([]);
   const [profiles, setProfiles] = useState<LlmProfile[] | null>(null);
   const [editing, setEditing] = useState<EditTarget | null>(null);
   const [initialForm, setInitialForm] = useState<ProfileFormState>(EMPTY_FORM);
@@ -181,15 +188,16 @@ export function LlmSettingsView(): ReactElement {
   const cards = useMemo(() => {
     const items = profiles ?? [];
     return KNOWN_PRESETS.map((preset) => {
-      const profile = items.find((item) => item.provider === preset.id || item.provider.toLocaleLowerCase() === preset.label.toLocaleLowerCase());
+      const profile = items.find((item) => item.authMode !== "chatgpt" && (item.provider === preset.id || item.provider.toLocaleLowerCase() === preset.label.toLocaleLowerCase()));
       return { preset, profile };
     });
   }, [profiles]);
 
   const extras = useMemo(() => {
     const items = profiles ?? [];
-    return items.filter((item) => !KNOWN_PRESETS.some((preset) => preset.id === item.provider || preset.label.toLocaleLowerCase() === item.provider.toLocaleLowerCase()));
-  }, [profiles]);
+    const shown = new Set(cards.map((card) => card.profile?.id));
+    return items.filter((item) => !shown.has(item.id));
+  }, [profiles, cards]);
 
   const openEdit = (preset: LlmProviderPreset, profile?: LlmProfile) => {
     setInitialForm(profile ? formFromProfile(profile) : formFromPreset(preset));
@@ -202,6 +210,7 @@ export function LlmSettingsView(): ReactElement {
     const payload = profilePayloadFromForm(form);
     if (!payload.defaultModel) { setError("请填写默认模型"); return false; }
     if (payload.models.length === 0) { setError("至少填写一个模型"); return false; }
+    if (payload.authMode === "chatgpt" && !accountModels.some((item) => item.model === payload.defaultModel)) { setError("请先登录并刷新账户模型，再选择当前可用模型"); return false; }
     if (!editing) return false;
     setSaving(true);
     setError("");
@@ -216,7 +225,7 @@ export function LlmSettingsView(): ReactElement {
           : [...items, saved];
       });
       setEditing(null);
-      setNotice("配置已保存。可在卡片上执行连接测试。");
+      setNotice(payload.authMode === "chatgpt" ? "ChatGPT 配置已保存。实际可用性受账户权限与额度限制。" : "配置已保存。可在卡片上执行连接测试。");
       return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "保存失败");
@@ -273,7 +282,7 @@ export function LlmSettingsView(): ReactElement {
         <div>
           <div className="llm-eyebrow">MODEL CONTROL / DSH FLOW</div>
           <h1>模型</h1>
-          <div className="sub">填入各提供方的 API 密钥即可使用其模型。</div>
+          <div className="sub">选择 API Key 或 ChatGPT 账户登录。订阅登录走 Codex 支持的账户通道，模型与额度以账户实际权限为准。</div>
         </div>
         <div className="header-actions">
           <button className="btn btn-ghost" onClick={() => reload().catch(() => undefined)}><RefreshCw />刷新</button>
@@ -283,6 +292,8 @@ export function LlmSettingsView(): ReactElement {
 
       {error ? <ErrorBanner message={error} /> : null}
       {notice ? <div className="llm-notice-bar">{notice}</div> : null}
+
+      <ChatGptAccountPanel onModelsChange={setAccountModels} onAccountChange={() => reload().catch(() => undefined)} />
 
       <section className="llm-card-list" aria-label="模型提供方">
         {cards.map(({ preset, profile }) => {
@@ -361,6 +372,7 @@ export function LlmSettingsView(): ReactElement {
       {editing ? (
         <LlmEditModal
           initial={initialForm}
+          accountModels={accountModels}
           title={editing.id === "new" ? `添加配置 · ${editing.preset.label}` : "编辑配置"}
           credentialConfigured={editing.credentialConfigured}
           saving={saving}
@@ -372,7 +384,8 @@ export function LlmSettingsView(): ReactElement {
   );
 }
 
-function LlmEditModal(props: {
+export function LlmEditModal(props: {
+  accountModels: AccountModel[];
   initial: ProfileFormState;
   title: string;
   credentialConfigured: boolean;
@@ -382,6 +395,14 @@ function LlmEditModal(props: {
 }): ReactElement {
   const [form, setForm] = useState(props.initial);
   const selectedPreset = presetFor(form.provider);
+  const chatgpt = form.authMode === "chatgpt";
+  const apiDraft = useRef(props.initial.authMode === "chatgpt" ? formFromPreset(KNOWN_PRESETS[1]) : props.initial);
+  const submitting = useRef(false);
+  const setAuthMode = (authMode: "api-key" | "chatgpt") => {
+    if (authMode === "chatgpt" && !chatgpt) apiDraft.current = form;
+    const defaultModel = props.accountModels.find((item) => item.isDefault)?.model ?? props.accountModels[0]?.model ?? "";
+    setForm((current) => authMode === "chatgpt" ? { ...current, authMode, provider: "openai", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1", apiKey: "", apiKeyEnv: "", modelsText: props.accountModels.map((item) => item.model).join("\n"), defaultModel, name: "ChatGPT 账户配置" } : { ...apiDraft.current, authMode });
+  };
   const supportsDeepSeekThinking = form.protocol === "openai-chat"
     && (selectedPreset?.id === "deepseek" || form.baseUrl.toLocaleLowerCase().includes("deepseek.com"));
 
@@ -401,13 +422,22 @@ function LlmEditModal(props: {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    const ok = await props.onSave(form);
-    if (!ok && props.initial.name) setForm({ ...form, name: props.initial.name });
+    if (props.saving || submitting.current) return;
+    submitting.current = true;
+    try { await props.onSave(chatgpt ? { ...form, modelsText: props.accountModels.map((item) => item.model).join("\n") } : form); }
+    finally { submitting.current = false; }
   };
 
   return (
     <Modal title={props.title} onClose={props.onClose} width={580}>
       <form className="llm-inline-form llm-edit-form" onSubmit={submit}>
+        <fieldset className="llm-auth-choice">
+          <legend>认证方式</legend>
+          <label><input type="radio" name="auth-mode" checked={!chatgpt} onChange={() => setAuthMode("api-key")} /> API Key</label>
+          <label><input type="radio" name="auth-mode" checked={chatgpt} onChange={() => setAuthMode("chatgpt")} /> ChatGPT 登录</label>
+        </fieldset>
+        {chatgpt ? <p className="llm-cred-hint">在账户面板中完成官方登录，然后刷新可用模型。这里不收集密码、访问令牌或 API Key；保存配置不会开始授权。</p> : <>
+
         <div className="llm-form-section-head">
           <span>01</span>
           <div><strong>选择供应商</strong><small>选择后自动填充推荐参数</small></div>
@@ -448,15 +478,20 @@ function LlmEditModal(props: {
           ? <div className="llm-cred-hint"><ShieldCheck />已配置密钥，留空则保持不变；密钥加密存储，接口与审计永不返回明文。</div>
           : <div className="llm-secret-note"><ShieldCheck /><span>密钥加密存储，接口与审计永不返回明文。</span></div>}
 
+        </>}
         <div className="llm-form-section-head compact">
           <span>03</span>
           <div><strong>基础配置</strong><small>完成运行所需的最少信息</small></div>
         </div>
         <div className="form-grid llm-inline-grid">
           <Field label="配置名称"><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="如：DeepSeek 默认配置" /></Field>
-          <Field label="默认模型"><input required value={form.defaultModel} onChange={(event) => setForm({ ...form, defaultModel: event.target.value })} placeholder="如：deepseek-v4-flash" /></Field>
+          <Field label="默认模型">{chatgpt ? <select required value={form.defaultModel} onChange={(event) => setForm({ ...form, defaultModel: event.target.value })}>
+            <option value="">请先登录并刷新模型</option>
+            {form.defaultModel && !props.accountModels.some((item) => item.model === form.defaultModel) ? <option value={form.defaultModel} disabled>{form.defaultModel}（当前未验证）</option> : null}
+            {props.accountModels.map((item) => <option key={item.id} value={item.model}>{item.displayName || item.model}</option>)}
+          </select> : <input required value={form.defaultModel} onChange={(event) => setForm({ ...form, defaultModel: event.target.value })} placeholder="如：deepseek-v4-flash" />}</Field>
           <Field label="运行状态"><select value={form.enabled ? "enabled" : "disabled"} onChange={(event) => setForm({ ...form, enabled: event.target.value === "enabled" })}><option value="enabled">启用</option><option value="disabled">停用</option></select></Field>
-          <Field label="DeepSeek 思考等级">
+          {!chatgpt ? <Field label="DeepSeek 思考等级">
             <select
               value={form.reasoningEffort}
               disabled={!supportsDeepSeekThinking}
@@ -465,10 +500,11 @@ function LlmEditModal(props: {
               {LLM_REASONING_EFFORTS.map((effort) => <option key={effort} value={effort}>{REASONING_EFFORT_LABELS[effort]}</option>)}
             </select>
           </Field>
-          <Field label="环境变量名（可选回退）"><input value={form.apiKeyEnv} onChange={(event) => setForm({ ...form, apiKeyEnv: event.target.value.toUpperCase() })} placeholder="DEEPSEEK_API_KEY" /></Field>
+          : null}
+          {!chatgpt ? <Field label="环境变量名（可选回退）"><input value={form.apiKeyEnv} onChange={(event) => setForm({ ...form, apiKeyEnv: event.target.value.toUpperCase() })} placeholder="DEEPSEEK_API_KEY" /></Field> : null}
         </div>
 
-        <details className="llm-advanced-fields">
+        {!chatgpt ? <details className="llm-advanced-fields">
           <summary><span><ServerCog />高级参数</span><small>协议、服务地址、超时与候选模型</small><ChevronDown /></summary>
           <div className="form-grid llm-advanced-grid">
             <Field label="模型协议">
@@ -480,11 +516,11 @@ function LlmEditModal(props: {
             <Field label="Base URL" wide><input type="url" required value={form.baseUrl} onChange={(event) => setForm({ ...form, baseUrl: event.target.value })} placeholder="https://api.example.com/v1" /></Field>
             <Field label="模型列表（每行一个）" wide><textarea required rows={5} value={form.modelsText} onChange={(event) => setForm({ ...form, modelsText: event.target.value })} placeholder={"deepseek-v4-flash"} /></Field>
           </div>
-        </details>
+        </details> : <p className="cell-sub">候选模型来自当前 Codex 账户通道；列出模型不保证当前订阅或剩余额度允许执行。</p>}
 
         <div className="llm-edit-actions">
           <button type="button" className="btn" onClick={props.onClose}>取消</button>
-          <button type="submit" className="btn btn-primary" disabled={props.saving}><Save />{props.saving ? "保存中…" : "保存配置"}</button>
+          <button type="submit" className="btn btn-primary" disabled={props.saving || (chatgpt && !props.accountModels.some((item) => item.model === form.defaultModel))}><Save />{props.saving ? "保存中…" : "保存配置"}</button>
         </div>
       </form>
     </Modal>

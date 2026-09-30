@@ -1,4 +1,10 @@
 import type {
+  CodexAccountStatus,
+  CodexLoginStart,
+  CodexModel,
+  DesignChangeIntentInput,
+  DesignChangeIntentResult,
+  DesignChangeRecovery,
   AgentApproval,
   AgentApprovalDecision,
   AgentApprovalStatus,
@@ -70,10 +76,10 @@ export interface DashboardData {
   generatedAt: string;
 }
 
-async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
+async function request<T>(method: string, url: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
   const response = await fetch(url, {
     method,
-    headers: body !== undefined ? { "content-type": "application/json" } : undefined,
+    headers: { "x-productdesign-local-auth": "1", ...(body !== undefined ? { "content-type": "application/json" } : {}), ...headers },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (!response.ok) {
@@ -224,6 +230,12 @@ export const api = {
   dashboard: () => request<DashboardData>("GET", "/api/dashboard"),
   storageRetention: () => request<StorageRetentionSummary>("GET", "/api/storage-retention"),
 
+  getCodexAccount: () => request<CodexAccountStatus>("GET", "/api/codex/account", undefined, { "x-productdesign-local-auth": "1" }),
+  listCodexModels: () => request<{ models: CodexModel[] }>("GET", "/api/codex/models", undefined, { "x-productdesign-local-auth": "1" }),
+  startCodexLogin: (type: "chatgpt" | "chatgptDeviceCode") => request<CodexLoginStart>("POST", "/api/codex/login", { type }, { "x-productdesign-local-auth": "1" }),
+  cancelCodexLogin: (loginId: string) => request<{ status: string }>("POST", "/api/codex/login/cancel", { loginId }, { "x-productdesign-local-auth": "1" }),
+  logoutCodex: () => request<{ status: string }>("POST", "/api/codex/logout", {}, { "x-productdesign-local-auth": "1" }),
+
   listLlmProfiles: () => request<LlmProfile[]>("GET", "/api/llm-profiles"),
   createLlmProfile: (body: Record<string, unknown>) => request<LlmProfile>("POST", "/api/llm-profiles", body),
   updateLlmProfile: (id: string, patch: Record<string, unknown>) => request<LlmProfile>("PATCH", `/api/llm-profiles/${id}`, patch),
@@ -258,6 +270,8 @@ export const api = {
   getProject: (id: string) => request<Project>("GET", `/api/projects/${id}`),
   getProjectWorkspace: (id: string) => request<ProjectWorkspace>("GET", `/api/projects/${id}/workspace`),
   getProjectWorkflow: (id: string) => request<ProjectWorkflow>("GET", `/api/projects/${id}/workflow`),
+  listDesignChangeRecoveries: (id: string) => request<DesignChangeRecovery[]>("GET", `/api/projects/${id}/design-change-recoveries`),
+  submitDesignChangeIntent: (id: string, body: Omit<DesignChangeIntentInput, "projectId"> & { correctsChangeId?: string }) => request<DesignChangeIntentResult>("POST", `/api/projects/${id}/design-change-intents`, body),
   requestDesignChange: (id: string, body: Omit<DesignChangeRequest, "projectId">) =>
     request<DesignChangeResult>("POST", `/api/projects/${id}/design-changes`, body),
   getAgentOrchestration: (id: string, includePrompts = true) =>

@@ -12,17 +12,12 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent, type ReactElement } from "react";
-import type { AgentApproval, AgentControlMode, AgentMessage, AgentSession, AgentWorkspaceSnapshot, LlmProfile } from "../../shared/types";
+import type { AgentApproval, AgentMessage, AgentSession, AgentWorkspaceSnapshot, LlmProfile } from "../../shared/types";
 import { api } from "../api";
+import { DESIGN_SUBSCRIPTION_BLOCKED_MESSAGE, OPEN_DESIGN_ASSISTANT, designRequestText, type DesignAssistantRequest } from "./designAssistant";
 import { formatTime } from "../ui";
 import { stableProjectAccent, useWorkspaceContext } from "./workspace";
 import { useAgentUiBridge } from "./agentUiBridge";
-
-const CONTROL_MODE_LABELS: Record<AgentControlMode, string> = {
-  restricted: "受限模式",
-  ask: "操作时询问",
-  "project-autonomous": "项目自主",
-};
 
 type AgentLauncherSide = "left" | "right";
 interface AgentLauncherPlacement { side: AgentLauncherSide; y: number }
@@ -102,6 +97,8 @@ export function AgentDock(): ReactElement {
   const selectedProject = projects.find((item) => item.id === projectId);
   const routeProject = projects.find((item) => item.id === workspace);
   const selectedProfile = profiles.find((item) => item.id === profileId);
+  const sessionProfile = profiles.find((item) => item.id === activeSession?.profileId);
+  const subscriptionBlocked = selectedProfile?.protocol === "openai-responses" || sessionProfile?.protocol === "openai-responses" || selectedProfile?.authMode === "chatgpt" || sessionProfile?.authMode === "chatgpt";
   const usableProfiles = profiles.filter((item) => item.enabled);
 
   const loadWorkspace = useCallback(async (targetProjectId: string, keepSession = true) => {
@@ -285,6 +282,24 @@ export function AgentDock(): ReactElement {
     setError("");
   };
 
+  useEffect(() => {
+    const openDesign = (event: Event) => {
+      const request = (event as CustomEvent<DesignAssistantRequest>).detail;
+      if (!request?.projectId) return;
+      setOpen(true); setMinimized(false);
+      if (activeSession?.status === "running" && activeSession.projectId !== request.projectId) {
+        setError("另一项目的会话仍在运行，请先结束后再打开此项目的设计助手"); return;
+      }
+      if (projectId !== request.projectId) {
+        setProjectId(request.projectId); setSnapshot(null); setActiveSessionId(""); setMessages([]);
+      }
+      if (!input.trim()) setInput(designRequestText(request.goal));
+      else setError("已保留你尚未发送的内容；请确认后再发送设计请求");
+    };
+    window.addEventListener(OPEN_DESIGN_ASSISTANT, openDesign);
+    return () => window.removeEventListener(OPEN_DESIGN_ASSISTANT, openDesign);
+  }, [activeSession, input, projectId]);
+
   const changeProfile = async (nextProfileId: string) => {
     const nextProfile = profiles.find((item) => item.id === nextProfileId);
     if (!nextProfile) return;
@@ -304,15 +319,6 @@ export function AgentDock(): ReactElement {
     try {
       const next = await api.updateAgentSession(activeSession.id, { model: nextModel });
       setSnapshot((current) => current ? { ...current, sessions: current.sessions.map((item) => item.id === next.id ? next : item) } : current);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-  };
-
-  const changeControlMode = async (controlMode: AgentControlMode) => {
-    if (!activeSession) return;
-    try {
-      const next = await api.updateAgentSession(activeSession.id, { controlMode });
-      setSnapshot((current) => current ? { ...current, sessions: current.sessions.map((item) => item.id === next.id ? next : item) } : current);
-      setError("");
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
   };
 
@@ -360,6 +366,7 @@ export function AgentDock(): ReactElement {
   const sendMessage = async () => {
     const content = input.trim();
     if (!activeSession || !content || activeSession.status === "running") return;
+    if (subscriptionBlocked) { setError(DESIGN_SUBSCRIPTION_BLOCKED_MESSAGE); return; }
     setError("");
     try {
       if (pageContext.projectId && pageContext.projectId !== activeSession.projectId) {
@@ -377,11 +384,12 @@ export function AgentDock(): ReactElement {
   };
 
   const statusLabel = useMemo(() => {
+    if (subscriptionBlocked) return "设计执行未开放";
     if (!activeSession) return "未创建会话";
     if (activeSession.status === "running") return "运行中";
     if (activeSession.status === "failed") return "运行失败";
     return "已就绪";
-  }, [activeSession]);
+  }, [activeSession, subscriptionBlocked]);
 
   const floatingSize = launcherSize(viewport.width);
   const floatingGap = launcherGap(viewport.width);
@@ -422,7 +430,7 @@ export function AgentDock(): ReactElement {
           <div className="agent-dock-header" onPointerDown={beginDrag}>
             <div className="agent-dock-identity">
               <span className="agent-dock-mark"><Bot size={18} /></span>
-              <div><strong>项目 Agent</strong><span>{selectedProject?.name ?? "选择一个项目"}</span></div>
+              <div><strong>产品设计助手</strong><span>{selectedProject?.name ?? "选择一个项目"}</span></div>
             </div>
             <div className="agent-dock-actions">
               <button onClick={() => setMinimized((value) => !value)} aria-label={minimized ? "展开" : "最小化"}><Minimize2 size={16} /></button>
@@ -470,17 +478,7 @@ export function AgentDock(): ReactElement {
                   <select value={model} onChange={(event) => void changeModel(event.target.value)} disabled={!selectedProfile || activeSession?.status === "running"}>
                     {(selectedProfile?.models ?? []).map((item) => <option key={item} value={item}>{item}</option>)}
                   </select>
-                  <select
-                    aria-label="Agent 控制模式"
-                    value={activeSession?.controlMode ?? "restricted"}
-                    onChange={(event) => void changeControlMode(event.target.value as AgentControlMode)}
-                    disabled={!activeSession || activeSession.status === "running"}
-                    title="控制 Agent 对项目目录内命令和文件修改的授权方式"
-                  >
-                    {(Object.entries(CONTROL_MODE_LABELS) as Array<[AgentControlMode, string]>).map(([value, label]) => (
-                      <option key={value} value={value}>{label}</option>
-                    ))}
-                  </select>
+                  <span className="cell-sub">仅产品设计</span>
                 </div>
                 <span className={`agent-run-status ${activeSession?.status ?? "idle"}`}><i />{statusLabel}</span>
               </div>
@@ -490,15 +488,14 @@ export function AgentDock(): ReactElement {
               )}
               {error && <div className="agent-error">{error}</div>}
 
-              {activeSession?.controlMode === "project-autonomous" && (
-                <div className="agent-control-note"><Shield size={14} />项目自主仅覆盖受管项目目录；跨目录、系统权限和业务高风险动作仍会被拦截。</div>
-              )}
+              {subscriptionBlocked ? <div className="agent-error">{DESIGN_SUBSCRIPTION_BLOCKED_MESSAGE}</div> : <div className="agent-control-note">API Key 设计请求由对应 API 提供方独立计费，不使用 ChatGPT 订阅额度。</div>}
+              <div className="agent-control-note"><Shield size={14} />仅生成和修改项目设计资料，不执行命令、不写目标项目源码。设计结论交给你确认。</div>
 
               <div className="agent-message-list">
                 {!activeSession && (
                   <div className="agent-empty">
                     <Bot size={32} />
-                    <strong>创建这个项目的第一条 Agent 会话</strong>
+                    <strong>开始这个项目的设计会话</strong>
                     <p>会话会固定绑定项目与模型配置，不会因页面切换静默改绑。</p>
                     {usableProfiles.length === 0 ? (
                       <button onClick={() => { window.location.hash = "#/llm"; }}><ExternalLink size={15} />先配置 LLM</button>
@@ -513,9 +510,9 @@ export function AgentDock(): ReactElement {
                     <div className="agent-approval-actions">
                       <button
                         className="approve"
-                        onClick={() => void decideApproval(approval, "approve_once")}
-                        disabled={decidingApprovalId === approval.id}
-                      >允许一次</button>
+                        disabled
+                        title="设计助手不允许命令执行或源码修改"
+                      >设计模式不可授权</button>
                       <button onClick={() => void decideApproval(approval, "deny")} disabled={decidingApprovalId === approval.id}>拒绝</button>
                     </div>
                   </article>
@@ -544,10 +541,10 @@ export function AgentDock(): ReactElement {
                     onKeyDown={(event) => {
                       if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); }
                     }}
-                    placeholder="向项目 Agent 说明目标，Enter 发送，Shift+Enter 换行"
+                    placeholder="描述设计目标或修改意见，Enter 发送，Shift+Enter 换行"
                     disabled={!activeSession || activeSession.status === "running"}
                   />
-                  <button onClick={() => void sendMessage()} disabled={!activeSession || !input.trim() || activeSession.status === "running"} aria-label="发送"><Send size={18} /></button>
+                  <button onClick={() => void sendMessage()} disabled={!activeSession || !input.trim() || activeSession.status === "running" || subscriptionBlocked} aria-label="发送"><Send size={18} /></button>
                 </div>
               </div>
             </>

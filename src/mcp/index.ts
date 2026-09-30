@@ -148,7 +148,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     { instructions: `${AGENT_POLICY_INSTRUCTIONS}\npolicyVersion=${AGENT_POLICY_VERSION}${localSession
       ? `\nHost-authorized stdio Main Agent: project=${localProject!.id}, workerId=${localSession.workerId}, role=approver. Authentication is injected by the host; all work-order, independent audit and human-only gates remain required. Authorization expires at ${localSession.expiresAt}. Restart the stdio connection to renew.` : ""}` },
   );
-  if (localSession) server.onclose = () => closeLocalAgentSession(store, localSession.credentialId);
+  if (localSession) server.server.onclose = () => closeLocalAgentSession(store, localSession.credentialId);
   const rawRegisterTool = server.registerTool.bind(server) as (...args: any[]) => any;
   (server as any).registerTool = (name: string, config: any, handler: (input: Record<string, unknown>, ...rest: unknown[]) => unknown) => {
     const risk = classifyMcpTool(name);

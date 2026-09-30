@@ -26,6 +26,8 @@ import { PROJECT_WORKFLOW_POLICY } from "../../shared/workflowPolicy";
 import { displayAssignment, normalizeRoleAssignments, roleAssignmentErrors } from "../../shared/planRoles";
 import { PLAN_DELIVERY_STEPS, PLAN_LIFECYCLE_LABELS, planLifecycleStep } from "../../shared/planDelivery";
 import { api } from "../api";
+import { DesignChangeRecoveryPanel } from "./DesignChangeRecoveryPanel";
+import { openDesignAssistant } from "./designAssistant";
 import { navigate } from "../App";
 import { DatabaseWorkbenchView } from "./DatabaseWorkbenchView";
 import { setWorkspaceSelection } from "./workspace";
@@ -51,8 +53,8 @@ import {
 } from "../ui";
 
 const TAB_LABELS = [
+  ["workflow", "设计工作台"],
   ["nodes", "画布节点"],
-  ["workflow", "推进流程"],
   ["plans", "计划"],
   ["documents", "文档"],
   ["database", "数据库设计"],
@@ -94,8 +96,8 @@ const MANAGER_DECISION_LABELS: Record<PlanItem["managerDecision"], string> = {
 };
 const EXECUTABLE_PLAN_KINDS = new Set<string>(PROJECT_WORKFLOW_POLICY.executablePlanKinds);
 
-function tabFrom(value?: string): TabKey {
-  return TAB_LABELS.some(([key]) => key === value) ? value as TabKey : "nodes";
+export function tabFrom(value?: string): TabKey {
+  return TAB_LABELS.some(([key]) => key === value) ? value as TabKey : "workflow";
 }
 
 export function ProjectDetailView(props: { projectId: string; initialTab?: string }): ReactElement {
@@ -176,6 +178,8 @@ export function ProjectDetailView(props: { projectId: string; initialTab?: strin
         </span>
       </div>
 
+      <details className="project-context-details" open={tab !== "workflow" || editing}>
+      <summary>项目目标与资料</summary>
       <section className="project-orientation" aria-label="项目管理摘要">
         <article className={purpose.needsBrief ? "needs-brief" : undefined}>
           <span>项目用途</span>
@@ -183,10 +187,10 @@ export function ProjectDetailView(props: { projectId: string; initialTab?: strin
           <p>{purpose.needsBrief ? "自动导入只登记项目，不会生成正式简报。请先补充并批准项目级需求文档。" : "该说明来自当前项目资料，用于确认项目范围与交付方向。"}</p>
         </article>
         <article>
-          <span>管理员下一步</span>
+          <span>外部开发推进提示</span>
           <h2>{nextAdministratorAction}</h2>
-          <p>在“推进流程”中查看当前门禁与责任人，完成后再推进下一阶段。</p>
-          <button className="btn btn-primary btn-sm" onClick={() => { setTab("workflow"); navigate(`#/projects/${id}?tab=workflow`); }}>查看推进流程 <ArrowRight size={13} /></button>
+          <p>外部开发须按工单与交付门禁推进；内置助手从设计工作台开始。</p>
+          <button className="btn btn-primary btn-sm" onClick={() => { setTab("workflow"); navigate(`#/projects/${id}?tab=workflow`); }}>返回设计工作台 <ArrowRight size={13} /></button>
         </article>
       </section>
 
@@ -202,7 +206,7 @@ export function ProjectDetailView(props: { projectId: string; initialTab?: strin
 
       {workspace?.mainDiagram ? (
         <div className="toolbar">
-          <button className="btn btn-primary" onClick={() => { setWorkspaceSelection(id); navigate(`#/canvas/${workspace.mainDiagram!.id}`); }}>打开系统主画布</button>
+          <button className="btn" onClick={() => { setWorkspaceSelection(id); navigate(`#/canvas/${workspace.mainDiagram!.id}`); }}>打开系统主画布</button>
           <span className="cell-sub">项目状态由画布节点、开发计划、文档与验收证据自动汇总</span>
         </div>
       ) : null}
@@ -227,23 +231,37 @@ export function ProjectDetailView(props: { projectId: string; initialTab?: strin
           </dl>
         </div>
       )}
+      </details>
       </>}
 
       <div className={`tabs ${databaseFocus ? "project-focus-tabs" : ""}`}>
-        {TAB_LABELS.map(([key, label]) => (
-          <button key={key} className={`tab ${tab === key ? "active" : ""}`} onClick={() => {
-            setTab(key);
-            navigate(`#/projects/${id}?tab=${key}`);
-          }}>
-            {label}
-          </button>
+        {TAB_LABELS.filter(([key]) => !["nodes", "database", "governance", "plans", "evidence"].includes(key)).map(([key, label]) => (
+          <button key={key} className={`tab ${tab === key ? "active" : ""}`} onClick={() => navigate(`#/projects/${id}?tab=${key}`)}>{label}</button>
         ))}
+        <details className="project-tools" open={["nodes", "database", "governance", "plans", "evidence"].includes(tab)}>
+          <summary>外部开发与辅助工具</summary>
+          {TAB_LABELS.filter(([key]) => ["nodes", "database", "governance", "plans", "evidence"].includes(key)).map(([key, label]) => (
+            <button key={key} className={`tab ${tab === key ? "active" : ""}`} onClick={() => navigate(`#/projects/${id}?tab=${key}`)}>{label}</button>
+          ))}
+        </details>
       </div>
 
       {tab === "nodes" ? (
         <WorkspaceNodesTab projectId={id} mainDiagramId={workspace?.mainDiagram?.id} onError={setError} />
       ) : tab === "workflow" ? (
-        <WorkflowTab projectId={id} onError={setError} />
+        <>
+          <section className="workflow-panel" aria-label="自动设计工作台">
+            <DeliveryFlow />
+            <div className="workflow-next-action">
+              <div><span>当前项目目标</span><h2>{project.summary.trim() || "先说明你想解决什么问题"}</h2><p>设计助手会澄清需求、生成方案并检查一致性。你审阅后确认或提出修改；不会开发目标项目代码。</p></div>
+              <button className="btn btn-primary" onClick={() => openDesignAssistant({ projectId: id, goal: project.summary })}>打开设计助手 <ArrowRight size={14} /></button>
+            </div>
+            <div className="toolbar"><a className="btn" href={`#/projects/${id}?tab=documents`}>审阅设计文档</a><button className="btn" onClick={() => setEditing(true)}>补充项目目标</button></div>
+            <p className="cell-sub">打开助手只准备设计请求。选择模型并发送后才开始；生成的设计需在文档中审阅，当前未自动标记任何阶段完成。</p>
+          </section>
+          <DesignChangeRecoveryPanel projectId={id} />
+          <details><summary>外部开发交付（由连接的 harness 执行）</summary><p className="cell-sub">外部 harness 领取开发任务，并按任务提交进展、问题、变更和验证工单。以下开发门禁保持有效；内置设计助手不执行这些代码任务。</p><WorkflowTab projectId={id} onError={setError} /></details>
+        </>
       ) : tab === "plans" ? (
         <PlansTab projectId={id} plans={plans} total={planTotal} offset={planOffset} onPage={setPlanOffset} onChanged={reloadAll} onError={setError} />
       ) : tab === "documents" ? (
@@ -269,19 +287,37 @@ export function ProjectDetailView(props: { projectId: string; initialTab?: strin
   );
 }
 
-function WorkflowTab(props: { projectId: string; onError: (message: string) => void }): ReactElement {
+
+const DELIVERY_FLOW = [
+  ["输入目标", "明确想解决的问题"],
+  ["澄清需求", "确认用户、约束与边界"],
+  ["生成设计", "形成可审阅的设计文档"],
+  ["审查一致性", "检查遗漏、冲突与异常路径"],
+  ["用户确认", "由你确认或提出修改"],
+] as const;
+
+export function DeliveryFlow(): ReactElement {
+  return <ol className="delivery-flow" aria-label="自动设计流程">
+    {DELIVERY_FLOW.map(([title, description], index) => <li key={title}>
+      <span>{index + 1}</span><div><strong>{title}</strong><small>{description}</small></div>
+    </li>)}
+  </ol>;
+}
+
+export function WorkflowTab(props: { projectId: string; onError: (message: string) => void; readOnly?: boolean }): ReactElement {
   const [workflow, setWorkflow] = useState<ProjectWorkflow | null>(null);
   const [busy, setBusy] = useState(false);
+  const [loadError, setLoadError] = useState("");
   const load = useCallback(() => {
     setBusy(true);
     api.getProjectWorkflow(props.projectId)
-      .then(setWorkflow)
-      .catch((error) => props.onError(error.message))
+      .then((value) => { setWorkflow(value); setLoadError(""); })
+      .catch((error) => setLoadError(error.message))
       .finally(() => setBusy(false));
   }, [props.projectId, props.onError]);
 
   useEffect(() => { load(); }, [load]);
-  if (!workflow) return <Spinner />;
+  if (!workflow) return loadError ? <div><ErrorBanner message={loadError} /><button className="btn" disabled={busy} onClick={load}>重试加载流程</button></div> : <Spinner />;
 
   const phases = Object.entries(PROJECT_WORKFLOW_POLICY.phaseLabels);
   const currentIndex = phases.findIndex(([phase]) => phase === workflow.phase);
@@ -297,6 +333,8 @@ function WorkflowTab(props: { projectId: string; onError: (message: string) => v
   const metricProgress = (value: number) => totalNodes === 0 ? 0 : Math.round((value / totalNodes) * 100);
   return (
     <div className="workflow-panel">
+      {loadError ? <ErrorBanner message={loadError} /> : null}
+      {props.readOnly ? <p className="cell-sub">以下是已有开发交付数据，不代表设计助手会执行开发，也不代表当前设计已经完成。</p> : null}
       <section className={`workflow-hero status-${workflow.status}`}>
         <div>
           <span className="workflow-eyebrow">PROJECT DELIVERY PROTOCOL · v{workflow.policyVersion}</span>
@@ -318,6 +356,21 @@ function WorkflowTab(props: { projectId: string; onError: (message: string) => v
         </section>
       )}
 
+      {workflow.nextAction ? (
+        <section className="workflow-next-action">
+          <div><span>项目关键路径</span><h3>{workflow.nextAction.title}</h3><p>{workflow.nextAction.description}</p></div>
+          {!props.readOnly ? <button className="btn btn-primary" onClick={() => navigate(workflow.nextAction!.href)}>立即处理 <ArrowRight size={14} /></button> : null}
+        </section>
+      ) : workflow.status === "completed" ? (
+        <section className="workflow-next-action complete"><div><span>项目闭环</span><h3>所有交付节点均已验收</h3><p>开发计划、文档和证据已经满足协议门禁。</p></div></section>
+      ) : <EmptyState text="当前没有可执行的下一步。请刷新流程并检查缺失门禁；这不代表已完成。" />}
+
+      {!props.readOnly ? <div className="toolbar" aria-label="交付工作入口">
+        <a className="btn" href={`#/projects/${props.projectId}?tab=plans`}>确认方案与任务</a>
+        <a className="btn" href="#/orchestration">查看执行队列</a>
+        <a className="btn" href={`#/projects/${props.projectId}?tab=evidence`}>查看改动与测试证据</a>
+      </div> : null}
+      <details><summary>查看详细门禁阶段</summary>
       <div className="workflow-steps" aria-label="项目设计推进阶段">
         {phases.map(([phase, label], index) => (
           <div className={`workflow-step ${index < currentIndex || workflow.status === "completed" ? "done" : index === currentIndex ? "current" : "pending"}`} key={phase}>
@@ -327,14 +380,7 @@ function WorkflowTab(props: { projectId: string; onError: (message: string) => v
         ))}
       </div>
 
-      {workflow.nextAction ? (
-        <section className="workflow-next-action">
-          <div><span>项目关键路径</span><h3>{workflow.nextAction.title}</h3><p>{workflow.nextAction.description}</p></div>
-          <button className="btn btn-primary" onClick={() => navigate(workflow.nextAction!.href)}>立即处理 <ArrowRight size={14} /></button>
-        </section>
-      ) : (
-        <section className="workflow-next-action complete"><div><span>项目闭环</span><h3>所有交付节点均已验收</h3><p>开发计划、文档和证据已经满足协议门禁。</p></div></section>
-      )}
+      </details>
 
       <section className="workflow-gate-section">
         <div className="workflow-section-heading">
@@ -367,7 +413,7 @@ function WorkflowTab(props: { projectId: string; onError: (message: string) => v
         ) : (
           <div className="workflow-issue-list">
             {issueNodes.map((node) => (
-              <button className="workflow-issue-row" key={`${node.diagramId}:${node.nodeId}`} onClick={() => navigate(node.nextAction?.href ?? `#/canvas/${node.diagramId}/node/${node.nodeId}`)}>
+              <button disabled={props.readOnly} className="workflow-issue-row" key={`${node.diagramId}:${node.nodeId}`} onClick={() => navigate(node.nextAction?.href ?? `#/canvas/${node.diagramId}/node/${node.nodeId}`)}>
                 <span className={`workflow-issue-mark ${node.developmentStatus === "已阻塞" ? "blocked" : ""}`} />
                 <span className="workflow-issue-copy">
                   <strong>{node.nodeLabel}</strong>

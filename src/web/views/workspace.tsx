@@ -101,6 +101,7 @@ export function projectSwitchTarget(hash: string, projectId: string, mainDiagram
 }
 
 export function WorkspaceProvider(props: { hash: string; children: ReactNode }): ReactElement {
+  const routeProjectId = explicitProjectIdFromHash(props.hash);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [preferred, setPreferred] = useState(readStoredId);
@@ -115,7 +116,7 @@ export function WorkspaceProvider(props: { hash: string; children: ReactNode }):
       .catch(() => { if (active) setProjects([]); })
       .finally(() => { if (active) setProjectsLoading(false); });
     return () => { active = false; };
-  }, []);
+  }, [routeProjectId]);
 
   const remember = useCallback((id: string) => {
     if (!id) return;

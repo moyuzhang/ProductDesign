@@ -46,3 +46,11 @@ describe("LLM profile form", () => {
     });
   });
 });
+
+it("never submits an API secret or custom gateway in ChatGPT auth mode", () => {
+  const form: ProfileFormState = { authMode: "chatgpt", name: "Account", provider: "custom_gateway", protocol: "openai-chat", baseUrl: "https://gateway.invalid", apiKeyEnv: "CUSTOM_KEY", apiKey: "must-not-be-sent", modelsText: "account-model", defaultModel: "account-model", enabled: true, reasoningEffort: "none", timeoutMs: 60000 };
+  const payload = profilePayloadFromForm(form);
+  expect(payload).toMatchObject({ authMode: "chatgpt", provider: "openai", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" });
+  expect(payload).not.toHaveProperty("apiKey");
+  expect(profilePayloadFromForm({ ...form, authMode: "api-key" })).toHaveProperty("apiKey", "must-not-be-sent");
+});

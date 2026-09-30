@@ -1,6 +1,10 @@
+import { DesignChangeCorrectionError, listDesignChangeRecoveries } from "./designChangeCorrection.js";
+import type { CodexAccount } from "./codexAccount.js";
+import { assertLocalCodexRequest } from "./codexLocalAccess.js";
+import type { EventStreams } from "./eventStreams.js";
 import { claimTaskPackage } from "./claimTaskPackage.js";
 import { z } from "zod";
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { mkdirSync, statSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
@@ -190,6 +194,7 @@ const nodeKindSchema = z.enum(NODE_KINDS);
 const planKindSchema = z.enum(PLAN_KINDS);
 const llmProfileFields = {
   name: z.string().trim().min(1).max(120),
+  authMode: z.enum(["api-key", "chatgpt"]).default("api-key"),
   provider: z.string().trim().min(1).max(120),
   protocol: z.enum(LLM_PROTOCOLS),
   baseUrl: z.string().trim().url().max(1000),
@@ -354,6 +359,8 @@ export interface ApiOptions {
   dataDir: string;
   harness: CodexHarness;
   agentUiEvents: AgentUiEventBus;
+  eventStreams: EventStreams;
+  codexAccount: CodexAccount;
   trustedInternal?: boolean;
 }
 
@@ -604,7 +611,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const heartbeat = setInterval(() => {
       if (!reply.raw.destroyed) reply.raw.write(": keep-alive\n\n");
     }, 15_000);
-    request.raw.once("close", () => {
+    options.eventStreams.track(reply.raw, () => {
       clearInterval(heartbeat);
       unsubscribe();
     });
@@ -614,10 +621,40 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
 
   // ---------- LLM profiles ----------
 
+  // Personal workstation only. Never expose subscription login or use via remote APIs.
+  const assertChatGptProfile = async (request: FastifyRequest, profile: { authMode?: string; protocol: string; provider: string; models: string[]; apiKey?: string }) => {
+    if (profile.authMode !== "chatgpt") return;
+    assertLocalCodexRequest(request);
+    if (profile.protocol !== "openai-responses" || profile.provider !== "openai" || profile.apiKey) throw httpError(400, "ChatGPT 登录必须使用 OpenAI Responses，且不能提交 API Key");
+    const { models } = await options.codexAccount.models();
+    if (profile.models.some((model) => !models.some((item) => item.model === model))) throw httpError(400, "所选模型不在当前 ChatGPT 账户的可用模型列表中");
+  };
+  const assertNoSubscriptionRun = () => {
+    if (harness.hasActiveChatGptRuns()) throw httpError(409, "请等待或停止 ChatGPT 会话后再更改登录状态");
+  };
+  app.addHook("preValidation", async (request, reply) => {
+    if (!request.url.split("?")[0].startsWith("/api/codex/")) return;
+    assertLocalCodexRequest(request);
+    reply.header("cache-control", "no-store");
+  });
+  app.get("/api/codex/account", async () => options.codexAccount.status());
+  app.get("/api/codex/models", async () => options.codexAccount.models());
+  app.post("/api/codex/login", async (request) => {
+    assertNoSubscriptionRun();
+    const { type } = parse(z.object({ type: z.enum(["chatgpt", "chatgptDeviceCode"]) }).strict(), request.body);
+    return options.codexAccount.start(type);
+  });
+  app.post("/api/codex/login/cancel", async (request) => {
+    const { loginId } = parse(z.object({ loginId: z.string().min(1).max(200) }).strict(), request.body);
+    return options.codexAccount.cancel(loginId);
+  });
+  app.post("/api/codex/logout", async () => { assertNoSubscriptionRun(); return options.codexAccount.logout(); });
+
   app.get("/api/llm-profiles", async () => store.listLlmProfiles());
 
   app.post("/api/llm-profiles", async (request, reply) => {
     const body = parse(z.object(llmProfileFields), request.body);
+    await assertChatGptProfile(request, body);
     if (!body.models.includes(body.defaultModel)) return reply.code(400).send({ message: "默认模型必须包含在模型列表中" });
     if (store.listLlmProfiles().some((item) => item.name.toLocaleLowerCase() === body.name.toLocaleLowerCase())) {
       return reply.code(409).send({ message: "已存在同名 LLM 配置" });
@@ -636,6 +673,9 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     if (!before) return reply.code(404).send({ message: "LLM 配置不存在" });
     const patch = parsePatch(z.object(llmProfileFields).partial(), request.body);
     const next = { ...before, ...patch, models: patch.models ? [...new Set(patch.models)] : before.models };
+    if (before.authMode === "chatgpt") assertLocalCodexRequest(request);
+    if ((patch.authMode ?? before.authMode) !== before.authMode) throw httpError(409, "请创建独立配置来切换认证方式，避免现有会话丢失上下文");
+    await assertChatGptProfile(request, next);
     if (!next.models.includes(next.defaultModel)) return reply.code(400).send({ message: "默认模型必须包含在模型列表中" });
     if (store.listLlmProfiles().some((item) => item.id !== id && item.name.toLocaleLowerCase() === next.name.toLocaleLowerCase())) {
       return reply.code(409).send({ message: "已存在同名 LLM 配置" });
@@ -664,7 +704,18 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id } = request.params as { id: string };
     const profile = store.getLlmProfile(id);
     if (!profile) return reply.code(404).send({ message: "LLM 配置不存在" });
-    const checked = await checkLlmProfile(profile, store.resolveLlmKey(profile));
+    let checked;
+    if (profile.authMode === "chatgpt") {
+      assertLocalCodexRequest(request);
+      const startedAt = Date.now();
+      try {
+        const { models } = await options.codexAccount.models();
+        const ok = models.some((item) => item.model === profile.defaultModel);
+        checked = { ok, status: ok ? "connected" : "request_failed", message: ok ? "ChatGPT 登录有效，目录包含所选模型（未验证实际推理权限或额度）" : "所选模型不可用，请刷新模型列表", latencyMs: Date.now() - startedAt, checkedAt: nowIso() };
+      } catch {
+        checked = { ok: false, status: "missing_credential", message: "ChatGPT 登录或模型检查失败，请检查 Codex 登录状态", latencyMs: Date.now() - startedAt, checkedAt: nowIso() };
+      }
+    } else checked = await checkLlmProfile(profile, store.resolveLlmKey(profile));
     audit(store, request.body as ActorHint, {
       projectId: null, entityType: "llmProfile", entityId: id,
       action: "test_connection", before: null, after: { ok: checked.ok, status: checked.status, latencyMs: checked.latencyMs },
@@ -706,6 +757,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     if (!store.getProject(body.projectId)) throw httpError(400, "项目不存在");
     const profile = store.getLlmProfile(body.profileId);
     if (!profile) throw httpError(400, "LLM 配置不存在");
+    if (profile.authMode === "chatgpt") assertLocalCodexRequest(request);
     if (!profile.models.includes(body.model)) throw httpError(400, "所选模型不在该 LLM 配置的模型列表中");
     const session = store.insertAgentSession(body);
     const workspace = store.getAgentWorkspace(body.projectId)!;
@@ -735,6 +787,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       const profile = store.getLlmProfile(profileId);
       if (!profile) throw httpError(400, "LLM 配置不存在");
       model = patch.model ?? (patch.profileId ? profile.defaultModel : before.model);
+      if (profile.authMode === "chatgpt") assertLocalCodexRequest(request);
       if (!profile.models.includes(model)) throw httpError(400, "所选模型不在该 LLM 配置的模型列表中");
     }
     const changedRuntime = profileId !== before.profileId || model !== before.model;
@@ -826,6 +879,10 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     }
     if (pageContext) assertAgentPageContextScope(store, session.projectId, pageContext);
     const profile = store.getLlmProfile(session.profileId);
+    if (profile?.authMode === "chatgpt") {
+      assertLocalCodexRequest(request);
+      if ((await options.codexAccount.status()).status !== "signed-in") throw httpError(409, "请先完成 ChatGPT 登录");
+    }
     const profileProblem = agentProfileProblem(profile);
     if (profileProblem) throw httpError(409, profileProblem);
     const userMessage = store.insertAgentMessage({
@@ -939,7 +996,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         securityTarget: "rest:/api/projects/:id/design-changes",
       });
     } catch (cause) {
-      if (cause instanceof DesignChangeError || cause instanceof AgentSecurityError) {
+      if (cause instanceof DesignChangeError || cause instanceof AgentSecurityError || cause instanceof DesignChangeIntentError || cause instanceof DesignChangeCorrectionError) {
         return reply.code(cause.statusCode).send({ message: cause.message, code: cause.code });
       }
       throw cause;
@@ -1019,6 +1076,12 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     return listAgentTaskLeases(store, id);
   });
 
+  app.get("/api/projects/:id/design-change-recoveries", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在" });
+    return listDesignChangeRecoveries(store, id);
+  });
+
   app.post("/api/projects/:id/design-change-intents", async (request, reply) => {
     const { id } = request.params as { id: string };
     try {
@@ -1026,6 +1089,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         diagramId: z.string().trim().min(1).max(300),
         nodeId: z.string().trim().min(1).max(300),
         rootPlanId: z.string().trim().min(1).max(300),
+        correctsChangeId: z.string().uuid().optional(),
         reason: z.string().trim().min(1).max(4000),
         changeSummary: z.string().trim().min(1).max(8000),
         expectedUpdatedAt: z.string().trim().min(1).max(100),
@@ -1034,7 +1098,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       }).strict(), request.body);
       return reply.code(202).send(submitDesignChangeIntent(store, { ...body, projectId: id }));
     } catch (cause) {
-      if (cause instanceof DesignChangeIntentError) {
+      if (cause instanceof DesignChangeIntentError || cause instanceof DesignChangeCorrectionError) {
         return reply.code(cause.statusCode).send({ message: cause.message, code: cause.code, details: cause.details });
       }
       throw cause;

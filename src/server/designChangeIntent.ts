@@ -1,3 +1,4 @@
+import { assertDesignChangeCorrection } from "./designChangeCorrection.js";
 import { createHash } from "node:crypto";
 import type {
   DesignChangeIntentInput,
@@ -13,6 +14,7 @@ import { isActiveDeliveryPlan } from "./planPolicy.js";
 import { isWorkflowDeliveryNode } from "./workflow.js";
 
 interface IntentSnapshot {
+  correctionSource?: { changeId: string; sourceHash: string };
   projectId: string;
   diagramId: string;
   nodeId: string;
@@ -142,11 +144,12 @@ function rowById(store: Store, intentId: string): IntentRow | undefined {
   return store.db.prepare("SELECT * FROM design_change_intents WHERE id=?").get(intentId) as IntentRow | undefined;
 }
 
-export function buildDesignChangeIntentSnapshot(store: Store, projectId: string, rootPlanId: string): IntentSnapshot {
+export function buildDesignChangeIntentSnapshot(store: Store, projectId: string, rootPlanId: string, correctsChangeId?: string): IntentSnapshot {
   const root = store.getPlan(rootPlanId);
   if (!root || root.projectId !== projectId || !isActiveDeliveryPlan(root) || !root.diagramId || !root.diagramNodeId) {
     throw new DesignChangeIntentError(409, "ROOT_PLAN_SCOPE_MISMATCH", "根计划不存在、跨项目或未绑定交付节点");
   }
+  const correctionSource = correctsChangeId ? assertDesignChangeCorrection(store, projectId, root, correctsChangeId) : undefined;
   const projectPlans = store.listPlans(projectId).filter(isActiveDeliveryPlan);
   const closureIds = designChangeImpactedPlanIds(projectPlans, [root.id]);
   const closure = closureIds.map((id) => projectPlans.find((plan) => plan.id === id)).filter((plan): plan is PlanItem => Boolean(plan));
@@ -184,6 +187,7 @@ export function buildDesignChangeIntentSnapshot(store: Store, projectId: string,
     };
   });
   return {
+    ...(correctionSource ? { correctionSource } : {}),
     projectId,
     diagramId: root.diagramId,
     nodeId: root.diagramNodeId,
@@ -234,7 +238,7 @@ function staleDriftedPendingIntents(store: Store, projectId: string, rootPlanId:
   for (const row of rows) {
     if (row.root_plan_id !== rootPlanId) continue;
     let currentHash = "invalid";
-    try { currentHash = designChangeIntentSnapshotHash(buildDesignChangeIntentSnapshot(store, projectId, row.root_plan_id)); } catch { /* stale */ }
+    try { currentHash = designChangeIntentSnapshotHash(buildDesignChangeIntentSnapshot(store, projectId, row.root_plan_id, (JSON.parse(row.payload_json) as DesignChangeIntentInput).correctsChangeId)); } catch { /* stale */ }
     if (currentHash === row.snapshot_hash) continue;
     store.db.prepare("UPDATE design_change_intents SET status='stale', updated_at=? WHERE id=? AND status='pending'").run(now, row.id);
     invalidateIntentLeases(store, projectId, row.id, `design_change_intent_stale:${row.id}`, now);
@@ -288,6 +292,7 @@ export function submitDesignChangeIntent(store: Store, raw: DesignChangeIntentIn
     expectedUpdatedAt: required(raw.expectedUpdatedAt, "expectedUpdatedAt"),
     idempotencyKey: required(raw.idempotencyKey, "idempotencyKey"),
     requestedBy: raw.requestedBy?.trim() || undefined,
+    ...(raw.correctsChangeId ? { correctsChangeId: required(raw.correctsChangeId, "correctsChangeId") } : {}),
   };
   const requestHash = hash(input);
   return store.db.transaction(() => {
@@ -303,13 +308,14 @@ export function submitDesignChangeIntent(store: Store, raw: DesignChangeIntentIn
     if (!project) throw new DesignChangeIntentError(404, "PROJECT_NOT_FOUND", "项目不存在");
     if (!diagram || diagram.projectId !== project.id) throw new DesignChangeIntentError(409, "DIAGRAM_PROJECT_MISMATCH", "画布不存在或不属于项目");
     if (!root || root.projectId !== project.id || root.diagramId !== diagram.id || root.diagramNodeId !== input.nodeId
-      || root.lifecycleStatus !== "accepted" || !isActiveDeliveryPlan(root)) {
+      || (!input.correctsChangeId && root.lifecycleStatus !== "accepted") || !isActiveDeliveryPlan(root)) {
       throw new DesignChangeIntentError(409, "ROOT_PLAN_NOT_ACCEPTED", "变更意图必须绑定当前项目、节点下的 accepted 根计划");
     }
+    if (input.correctsChangeId) assertDesignChangeCorrection(store, project.id, root, input.correctsChangeId);
     if (diagram.updatedAt !== input.expectedUpdatedAt) throw new DesignChangeIntentError(409, "DIAGRAM_REVISION_CONFLICT", "画布已变化，请刷新后重新申请");
     const now = nowIso();
     staleDriftedPendingIntents(store, project.id, root.id, now);
-    const snapshot = buildDesignChangeIntentSnapshot(store, project.id, root.id);
+    const snapshot = buildDesignChangeIntentSnapshot(store, project.id, root.id, input.correctsChangeId);
     const snapshotHash = designChangeIntentSnapshotHash(snapshot);
     assertNoConflictingGovernancePath(store, snapshot);
     const pending = store.db.prepare("SELECT * FROM design_change_intents WHERE project_id=? AND status='pending'")
@@ -358,7 +364,7 @@ export function listPendingDesignChangeIntents(store: Store, projectId: string):
   return rows.flatMap((row) => {
     const snapshot = JSON.parse(row.snapshot_json) as IntentSnapshot;
     let currentHash = "";
-    try { currentHash = designChangeIntentSnapshotHash(buildDesignChangeIntentSnapshot(store, projectId, row.root_plan_id)); } catch { return []; }
+    try { currentHash = designChangeIntentSnapshotHash(buildDesignChangeIntentSnapshot(store, projectId, row.root_plan_id, (JSON.parse(row.payload_json) as DesignChangeIntentInput).correctsChangeId)); } catch { return []; }
     if (currentHash !== row.snapshot_hash) return [];
     const payload = JSON.parse(row.payload_json) as DesignChangeIntentInput;
     return [{
@@ -369,6 +375,7 @@ export function listPendingDesignChangeIntents(store: Store, projectId: string):
       snapshotHash: row.snapshot_hash,
       reason: payload.reason,
       changeSummary: payload.changeSummary,
+      ...(payload.correctsChangeId ? { correctsChangeId: payload.correctsChangeId } : {}),
     }];
   });
 }
@@ -413,6 +420,7 @@ export function getDesignChangeIntent(store: Store, intentId: string): {
       snapshotHash: row.snapshot_hash,
       reason: payload.reason,
       changeSummary: payload.changeSummary,
+      ...(payload.correctsChangeId ? { correctsChangeId: payload.correctsChangeId } : {}),
     },
   };
 }
@@ -420,7 +428,7 @@ export function getDesignChangeIntent(store: Store, intentId: string): {
 export function assertDesignChangeIntentCurrent(store: Store, intentId: string, projectId: string): DesignChangeIntentTaskContext {
   const intent = getDesignChangeIntent(store, intentId);
   if (!intent || intent.status !== "pending") throw new DesignChangeIntentError(409, "DESIGN_CHANGE_INTENT_NOT_PENDING", "变更意图不存在或已结束");
-  const current = buildDesignChangeIntentSnapshot(store, projectId, intent.context.rootPlanId);
+  const current = buildDesignChangeIntentSnapshot(store, projectId, intent.context.rootPlanId, intent.context.correctsChangeId);
   if (designChangeIntentSnapshotHash(current) !== intent.context.snapshotHash) {
     throw new DesignChangeIntentError(409, "DESIGN_CHANGE_INTENT_STALE", "冻结指纹已漂移；请重新提交变更意图");
   }

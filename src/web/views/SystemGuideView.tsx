@@ -45,14 +45,18 @@ export function SystemGuideView(): ReactElement {
   useEffect(() => {
     if (window.location.hash.includes("section=agent-mcp")) {
       const frame = window.requestAnimationFrame(() => {
-        document.getElementById("agent-mcp")?.scrollIntoView({ block: "start" });
+        const section = document.getElementById("agent-mcp");
+        section?.closest("details")?.setAttribute("open", "");
+        section?.scrollIntoView({ block: "start" });
       });
       return () => window.cancelAnimationFrame(frame);
     }
   });
   const revealAgentMcp = () => {
     window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-      document.getElementById("agent-mcp")?.scrollIntoView({ block: "start" });
+      const section = document.getElementById("agent-mcp");
+      section?.closest("details")?.setAttribute("open", "");
+      section?.scrollIntoView({ block: "start" });
     }));
   };
   return (
@@ -60,23 +64,30 @@ export function SystemGuideView(): ReactElement {
       <header className="system-guide-hero">
         <div>
           <span className="system-guide-eyebrow">SYSTEM GUIDE · ADMINISTRATOR ENTRY</span>
-          <h1>先看懂系统，再推进交付</h1>
+          <h1>从目标开始，完成可审阅的产品设计</h1>
           <p>
-            ProductDesign 是本地优先的产品设计与交付控制台。它把项目简报、系统画布、功能定义、开发计划、测试证据和最终验收连接成一条可审计的治理链。
+            输入目标 → 澄清需求 → 生成设计 → 审查一致性 → 用户确认。项目默认打开设计工作台，助手通过应用内设计工具维护需求与方案，不开发目标项目代码。
           </p>
           <div className="system-guide-actions">
             <a className="btn btn-primary" href="#/projects">进入项目管理 <ArrowRight size={14} /></a>
-            <a className="btn" href="#/design">查看设计中枢</a>
+            <a className="btn" href="#/llm">配置页面内 Agent</a>
             <a className="btn" href="#/guide?section=agent-mcp" onClick={revealAgentMcp}>查看 Agent MCP 接入</a>
           </div>
         </div>
         <div className="system-guide-purpose" aria-label="系统用途">
           <BookOpenCheck />
           <strong>系统解决什么问题</strong>
-          <span>让“为什么做、做什么、谁负责、如何验证、谁批准”在同一个项目上下文中可追溯。</span>
+          <span>把目标、需求、设计理由、版本和评审意见放在同一个项目中，由你审阅确认。</span>
         </div>
       </header>
 
+      <section className="system-guide-section">
+        <h2>如何开始自动设计</h2>
+        <p>创建项目并写下目标，在设计工作台打开设计助手，选择模型配置并发送请求。助手先澄清需求，再通过设计文档、节点和其他设计工具形成方案；你在文档中审阅、提出修改并确认。</p>
+        <p>需要 ChatGPT 订阅时，到模型设置选择 ChatGPT 登录，并由你在 OpenAI 官方页面完成授权。模型列表来自账户通道，实际使用仍受账户权限与额度限制。目前仅开放账户登录与模型目录；Codex 设计执行在强制禁用代码执行和源码写入得到验证前保持关闭，不自动切换 API Key。主动选择 API Key 时使用独立 API 计费。</p>
+        <p>设计助手不运行命令、不修改目标项目源码、不启动开发或代码测试任务。外部 harness 负责开发任务，必须提交进展、问题、变更与验证工单；开发进度不冒充本次设计进度。</p>
+      </section>
+      <details className="system-guide-legacy"><summary>外部 harness 开发交付与工单（独立于内置设计助手）</summary>
       <section className="system-guide-section">
         <div className="system-guide-section-title">
           <span>01</span>
@@ -93,7 +104,7 @@ export function SystemGuideView(): ReactElement {
       <section className="system-guide-section">
         <div className="system-guide-section-title">
           <span>02</span>
-          <div><h2>标准治理流程</h2><p>画布功能节点是交付状态的唯一来源，流程图和自由白板只表达设计。</p></div>
+          <div><h2>标准治理流程</h2><p>下面是现有后端校验的详细阶段。设计辅助工具按需打开；原型和数据库设计不是每个任务都要填写的表单。需要数据库的节点仍须完成关联门禁。</p></div>
         </div>
         <ol className="system-guide-flow">
           {GOVERNANCE_STEPS.map((step, index) => <li key={step}><span>{String(index + 1).padStart(2, "0")}</span><strong>{step}</strong></li>)}
@@ -103,7 +114,7 @@ export function SystemGuideView(): ReactElement {
       <section className="system-guide-section system-guide-admin-section">
         <div className="system-guide-section-title">
           <span>03</span>
-          <div><h2>管理员日常怎么用</h2><p>日常交付由主 Agent 自动推进；这里只处理被明确标记为 human-only 的高风险例外。</p></div>
+          <div><h2>管理员日常怎么用</h2><p>从项目的推进流程开始，确认方案与验收标准，再查看实际任务、改动和测试；高风险执行仍须人工授权。</p></div>
         </div>
         <div className="system-guide-checklist">
           <div><CheckCircle2 /><span><strong>确认项目用途</strong>：自动导入只登记项目；“待补充”表示仍需正式项目简报。</span></div>
@@ -118,7 +129,7 @@ export function SystemGuideView(): ReactElement {
           <span>04</span>
           <div>
             <h2>Agent MCP 接入、双线路编排与工作流程</h2>
-            <p>外部主 Agent 负责编排执行 Agent；ProductDesign 提供任务、租约、门禁、资源锁和证据契约，但不在页面内启动 Agent。</p>
+            <p>页面内 Agent Dock 在配置可用模型后提供设计会话，由服务端 Codex Harness 运行并限制为设计工具。以下外部 MCP 开发交付协议仍有效，供连接的外部 harness 使用；它不是页面内设计助手的可执行权限。</p>
           </div>
         </div>
 
@@ -202,17 +213,18 @@ export function SystemGuideView(): ReactElement {
 
         <div className="system-guide-status-row" aria-label="Agent 编排能力状态">
           <span><CheckCircle2 />已实现：双线路任务包、设计/实现审计、返工、修订失效、租约与自审隔离</span>
-          <span><CheckCircle2 />待实现：无</span>
+          <span><Bot />运行条件：先配置可用模型与目标目录，实际状态以会话、任务和测试证据为准</span>
           <span><Users />人工门禁：仅 human-only 高风险执行授权</span>
         </div>
       </section>
 
+      </details>
       <section className="system-guide-boundary">
         <ShieldCheck />
         <div>
           <span>KEY BOUNDARIES</span>
           <h2>关键边界</h2>
-          <p>项目简报之前不编码；功能节点之前不先建目标数据模型；没有批准的需求、设计、节点文档、负责人、验收标准和计划不得开发；没有完整计划、通过证据和最新文档不得验收。</p>
+          <p>助手仅生成和修改项目设计资料，不执行命令或写目标项目源码。保留版本与评审依据；生成不等于确认，最终设计结论由用户决定。</p>
         </div>
       </section>
     </div>

@@ -16,6 +16,7 @@ export function buildBusinessSnapshot(store: Store) {
     documentRevisions: Object.fromEntries(projects.map((project) => [project.id, store.listDesignDocs(project.id).flatMap((doc) => store.listDocumentRevisions(doc.id))])),
     documentReferences: Object.fromEntries(projects.map((project) => [project.id, store.listDocumentReferences({ projectId: project.id })])),
     diagrams: Object.fromEntries(projects.map((project) => [project.id, store.listDiagrams(project.id)])),
+    diagramRevisions: Object.fromEntries(projects.map((project) => [project.id, store.listDiagrams(project.id).flatMap((diagram) => store.listDiagramRevisions(diagram.id))])),
     databaseModels: Object.fromEntries(projects.map((project) => [project.id, store.listDatabaseModels(project.id)])),
     nodeDatabaseBindings: Object.fromEntries(projects.map((project) => [project.id, store.listNodeDatabaseBindings({ projectId: project.id })])),
   };
@@ -32,6 +33,7 @@ export function createBackupFile(store: Store, dataDir: string, label: string, r
     + Object.values(snapshot.documentRevisions).reduce((count, list) => count + list.length, 0)
     + Object.values(snapshot.documentReferences).reduce((count, list) => count + list.length, 0)
     + Object.values(snapshot.diagrams).reduce((count, list) => count + list.length, 0)
+    + Object.values(snapshot.diagramRevisions).reduce((count, list) => count + list.length, 0)
     + Object.values(snapshot.databaseModels).reduce((count, list) => count + list.length, 0)
     + Object.values(snapshot.nodeDatabaseBindings).reduce((count, list) => count + list.length, 0);
   const backup: Backup = { id: newId(), label, reason, itemCount, createdAt: nowIso() };

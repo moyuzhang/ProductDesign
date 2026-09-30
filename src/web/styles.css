@@ -3413,3 +3413,25 @@ input[type="range"] { accent-color: var(--accent); border: none; background: tra
 @media (prefers-reduced-motion: reduce) {
   .layer-row, .template-row { transition: none !important; }
 }
+
+/* Task-first delivery navigation: supporting tools remain available on demand. */
+.sidebar-tools summary, .project-tools summary, .project-context-details > summary, .workflow-panel details > summary {
+  cursor: pointer; padding: 10px 12px; color: var(--text-dim); font-size: 13px;
+}
+.project-context-details { margin-bottom: 16px; }
+.project-tools { margin-left: auto; }
+.delivery-flow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; padding: 0; margin: 0 0 16px; list-style: none; }
+.delivery-flow li { display: flex; align-items: flex-start; gap: 8px; border: 1px solid var(--border-soft); border-radius: 10px; padding: 12px; }
+.delivery-flow li[aria-current="step"] { border-color: var(--accent); background: var(--accent-soft); }
+.delivery-flow li > span { color: var(--accent); font-weight: 600; }
+.delivery-flow strong { display: block; font-size: 13px; }
+.delivery-flow small { display: block; color: var(--text-dim); line-height: 1.5; margin-top: 5px; }
+@media (max-width: 900px) { .delivery-flow { grid-template-columns: 1fr; } }
+
+.chatgpt-account-panel { margin: 18px 0; }
+.chatgpt-account-panel > p { color: var(--text-dim); line-height: 1.6; }
+.chatgpt-login-pending { padding: 16px; border: 1px solid var(--border-soft); border-radius: 10px; margin: 12px 0; }
+.chatgpt-login-pending code { font-size: 18px; letter-spacing: 2px; }
+.llm-auth-choice { display: flex; flex-wrap: wrap; gap: 16px; border: 1px solid var(--border-soft); border-radius: 8px; padding: 12px; }
+.llm-auth-choice label { display: flex; align-items: center; gap: 6px; }
+.llm-auth-choice input { width: auto; }

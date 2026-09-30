@@ -14,6 +14,7 @@ export function llmEndpoint(profile: LlmProfile): string {
 export function llmProfileSummary(profile: LlmProfile): Record<string, unknown> {
   return {
     name: profile.name,
+    authMode: profile.authMode ?? "api-key",
     provider: profile.provider,
     protocol: profile.protocol,
     baseUrl: profile.baseUrl,

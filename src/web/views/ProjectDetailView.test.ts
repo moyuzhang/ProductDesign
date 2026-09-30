@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { PlanItem } from "../../shared/types";
-import { PlanDetailModal } from "./ProjectDetailView";
+import { DeliveryFlow, tabFrom, PlanDetailModal } from "./ProjectDetailView";
 
 function plan(overrides: Partial<PlanItem> = {}): PlanItem {
   const base: PlanItem = {
@@ -96,5 +96,19 @@ describe("PlanDetailModal 的施工交付门控", () => {
     expect(html).toContain("计划基线");
     expect(html).toContain("进入实施流程");
     expect(html).not.toContain("仅用于计划层级");
+  });
+});
+
+describe("task-first project navigation", () => {
+  it("defaults missing and obsolete tabs to workflow while preserving explicit tools", () => {
+    expect(tabFrom()).toBe("workflow");
+    expect(tabFrom("design")).toBe("workflow");
+    for (const tab of ["nodes", "database", "governance", "plans", "documents", "evidence"]) expect(tabFrom(tab)).toBe(tab);
+  });
+  it("shows a five-step orientation without manufacturing completion", () => {
+    const html = renderToStaticMarkup(createElement(DeliveryFlow));
+    for (const label of ["输入目标", "澄清需求", "生成设计", "审查一致性", "用户确认"]) expect(html).toContain(label);
+    expect(html).not.toContain('aria-current="step"');
+    expect(html).not.toContain("已完成");
   });
 });

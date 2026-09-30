@@ -254,7 +254,7 @@ interface NodeDatabaseBindingRow {
 }
 
 interface LlmProfileRow {
-  id: string; name: string; provider: string; protocol: string; base_url: string;
+  id: string; name: string; provider: string; protocol: string; base_url: string; auth_mode: string;
   api_key_env: string; models: string; default_model: string; enabled: number;
   reasoning_effort: string; timeout_ms: number; created_at: string; updated_at: string;
 }
@@ -404,6 +404,7 @@ function mapLlmProfile(r: LlmProfileRow, credentials: LlmCredentialVault): LlmPr
     id: r.id,
     name: r.name,
     provider: r.provider,
+    authMode: r.auth_mode === "chatgpt" ? "chatgpt" : "api-key",
     protocol: r.protocol as LlmProfile["protocol"],
     baseUrl: r.base_url,
     apiKeyEnv: r.api_key_env,
@@ -851,6 +852,7 @@ export class Store {
     try { this.db.exec("ALTER TABLE agent_sessions ADD COLUMN control_mode TEXT NOT NULL DEFAULT 'restricted'"); } catch { /* column exists */ }
     try { this.db.exec("ALTER TABLE diagrams ADD COLUMN layers TEXT"); } catch { /* column exists */ }
     try { this.db.exec("ALTER TABLE diagrams ADD COLUMN components TEXT"); } catch { /* column exists */ }
+    try { this.db.exec("ALTER TABLE llm_profiles ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'api-key'"); } catch { /* column exists */ }
     let addedReasoningEffort = false;
     try {
       this.db.exec("ALTER TABLE llm_profiles ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'none'");
@@ -2036,6 +2038,14 @@ export class Store {
     return this.db.prepare("DELETE FROM node_database_bindings WHERE id = ?").run(id).changes > 0;
   }
 
+  // Keep insertion order: undo/redo use rowid, not timestamps (which may tie).
+  listDiagramRevisions(diagramId: string): Array<{ id: string; diagramId: string; beforeJson: string; afterJson: string; actor: string; undone: number; createdAt: string }> {
+    return this.db.prepare(
+      `SELECT id, diagram_id AS diagramId, before_json AS beforeJson, after_json AS afterJson,
+        actor, undone, created_at AS createdAt FROM diagram_revisions WHERE diagram_id = ? ORDER BY rowid ASC`,
+    ).all(diagramId) as Array<{ id: string; diagramId: string; beforeJson: string; afterJson: string; actor: string; undone: number; createdAt: string }>;
+  }
+
   recordDiagramRevision(diagramId: string, before: Diagram, after: Diagram, actor: string): string {
     const id = newId();
     const transaction = this.db.transaction(() => {
@@ -2297,6 +2307,7 @@ export class Store {
       id: input.id ?? newId(),
       name: input.name,
       provider: input.provider,
+      auth_mode: input.authMode ?? "api-key",
       protocol: input.protocol,
       base_url: input.baseUrl,
       api_key_env: input.apiKeyEnv,
@@ -2310,8 +2321,8 @@ export class Store {
       updated_at: ts,
     };
     this.db.prepare(
-      `INSERT INTO llm_profiles (id, name, provider, protocol, base_url, api_key_env, models, default_model, enabled, reasoning_effort, timeout_ms, created_at, updated_at)
-       VALUES (@id, @name, @provider, @protocol, @base_url, @api_key_env, @models, @default_model, @enabled, @reasoning_effort, @timeout_ms, @created_at, @updated_at)`
+      `INSERT INTO llm_profiles (id, name, provider, auth_mode, protocol, base_url, api_key_env, models, default_model, enabled, reasoning_effort, timeout_ms, created_at, updated_at)
+       VALUES (@id, @name, @provider, @auth_mode, @protocol, @base_url, @api_key_env, @models, @default_model, @enabled, @reasoning_effort, @timeout_ms, @created_at, @updated_at)`
     ).run(row);
     this.applyApiKey(row.id, input.apiKey);
     return this.getLlmProfile(row.id)!;
@@ -2323,7 +2334,7 @@ export class Store {
     this.applyApiKey(id, patch.apiKey);
     const next = { ...current, ...patch, id: current.id, createdAt: current.createdAt, updatedAt: nowIso() };
     this.db.prepare(
-      `UPDATE llm_profiles SET name=@name, provider=@provider, protocol=@protocol, base_url=@baseUrl,
+      `UPDATE llm_profiles SET name=@name, provider=@provider, auth_mode=@authMode, protocol=@protocol, base_url=@baseUrl,
        api_key_env=@apiKeyEnv, models=@modelsJson, default_model=@defaultModel, enabled=@enabledInt,
        reasoning_effort=@reasoningEffort, timeout_ms=@timeoutMs, updated_at=@updatedAt WHERE id=@id`
     ).run({ ...next, modelsJson: JSON.stringify(next.models), enabledInt: next.enabled ? 1 : 0 });
@@ -2609,7 +2620,7 @@ export class Store {
     ).run(backup);
   }
 
-  restoreBusinessSnapshot(snapshot: unknown): { projects: number; workNodes: number; plans: number; evidence: number; governance: number; designDocs: number; documentRevisions: number; documentReferences: number; diagrams: number; databaseModels: number; nodeDatabaseBindings: number } {
+  restoreBusinessSnapshot(snapshot: unknown): { projects: number; workNodes: number; plans: number; evidence: number; governance: number; designDocs: number; documentRevisions: number; documentReferences: number; diagrams: number; diagramRevisions: number; databaseModels: number; nodeDatabaseBindings: number } {
     if (!snapshot || typeof snapshot !== "object") throw new Error("备份内容不是有效对象");
     const data = snapshot as Record<string, unknown>;
     if (!Array.isArray(data.projects) || !Array.isArray(data.governance)) throw new Error("备份缺少 projects 或 governance 数据");
@@ -2629,6 +2640,23 @@ export class Store {
     const documentRevisions = data.documentRevisions ? grouped("documentRevisions") as DocumentRevision[] : [];
     const documentReferences = data.documentReferences ? grouped("documentReferences") as DocumentReference[] : [];
     const diagrams = grouped("diagrams") as Diagram[];
+    const diagramRevisions = data.diagramRevisions !== undefined
+      ? grouped("diagramRevisions") as ReturnType<Store["listDiagramRevisions"]> : [];
+    const diagramIds = new Set(diagrams.map((diagram) => diagram.id));
+    for (const revision of diagramRevisions) {
+      if (!revision || typeof revision.id !== "string" || !diagramIds.has(revision.diagramId)
+        || typeof revision.actor !== "string" || typeof revision.createdAt !== "string"
+        || ![0, 1].includes(revision.undone)
+        || typeof revision.beforeJson !== "string" || typeof revision.afterJson !== "string") {
+        throw new Error("备份中的 diagramRevisions 格式无效");
+      }
+      for (const json of [revision.beforeJson, revision.afterJson]) {
+        const diagram = JSON.parse(json) as Diagram;
+        if (!diagram || diagram.id !== revision.diagramId || !Array.isArray(diagram.nodes) || !Array.isArray(diagram.edges)) {
+          throw new Error("备份中的画布历史内容无效");
+        }
+      }
+    }
     const restoredEvidence = [...evidence];
     const restoredEvidenceIds = new Set(restoredEvidence.map((item) => item.id));
     for (const item of legacyEvidenceFromDiagrams(diagrams)) {
@@ -2661,6 +2689,11 @@ export class Store {
       for (const revision of documentRevisions) this.insertDocumentRevision(revision);
       for (const reference of documentReferences) this.insertDocumentReference(reference);
       for (const diagram of diagrams) this.insertDiagram(diagram);
+      const insertDiagramRevision = this.db.prepare(
+        `INSERT INTO diagram_revisions (id, diagram_id, before_json, after_json, actor, undone, created_at)
+         VALUES (@id, @diagramId, @beforeJson, @afterJson, @actor, @undone, @createdAt)`,
+      );
+      for (const revision of diagramRevisions) insertDiagramRevision.run(revision);
       for (const model of databaseModels) this.insertDatabaseModel(model);
       for (const binding of nodeDatabaseBindings) this.insertNodeDatabaseBinding(binding);
       for (const project of projects) this.ensureProjectMainDiagram(project);
@@ -2676,6 +2709,7 @@ export class Store {
       documentRevisions: documentRevisions.length || designDocs.length,
       documentReferences: documentReferences.length + designDocs.filter((doc) => Boolean((doc as DesignDoc & { nodeId?: string }).nodeId)).length,
       diagrams: diagrams.length,
+      diagramRevisions: diagramRevisions.length,
       databaseModels: databaseModels.length,
       nodeDatabaseBindings: nodeDatabaseBindings.length,
     };

@@ -36,14 +36,14 @@ describe("Agent approval protocol", () => {
     await execute(session, tool, {}, { callTool });
     expect(callTool.mock.calls.map(([name]) => name)).toEqual(["get_project_workspace"]);
     callTool.mockClear();
-    await execute(session, { name: "transition_plan_delivery", inputSchema: { properties: { projectRef: {} } } }, {}, { callTool });
-    expect(callTool.mock.calls.map(([name]) => name)).toEqual(["transition_plan_delivery", "get_project_workflow"]);
+    await expect(execute(session, { name: "transition_plan_delivery", inputSchema: { properties: { projectRef: {} } } }, {}, { callTool })).rejects.toThrow("设计会话不允许");
+    expect(callTool).not.toHaveBeenCalled();
   });
 
   it("maps session control modes to the bounded Codex policy", () => {
     expect(approvalPolicyForMode("restricted")).toBe("on-request");
     expect(approvalPolicyForMode("ask")).toBe("on-request");
-    expect(approvalPolicyForMode("project-autonomous")).toBe("never");
+    expect(approvalPolicyForMode("project-autonomous")).toBe("on-request");
   });
 
   it("answers modern and legacy approval requests with their native decision values", () => {

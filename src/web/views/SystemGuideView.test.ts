@@ -9,7 +9,7 @@ describe("SystemGuideView", () => {
   it("gives administrators a complete first-level orientation", () => {
     const html = renderToStaticMarkup(createElement(SystemGuideView));
 
-    expect(html).toContain("先看懂系统，再推进交付");
+    expect(html).toContain("从目标开始，完成可审阅的产品设计");
     expect(html).toContain("角色与职责边界");
     expect(html).toContain("标准治理流程");
     expect(html).toContain("管理员日常怎么用");
@@ -49,7 +49,9 @@ describe("SystemGuideView", () => {
     }
     expect(mcpSource).toContain('registerTool("transition_plan_delivery"');
     expect(mcpSource).toContain("action: z.enum(PLAN_TRANSITION_ACTIONS)");
-    expect(html).toContain("待实现：无");
+    expect(html).not.toContain("待实现：无");
+    expect(html).not.toContain("不在页面内启动 Agent");
+    expect(html).toContain("Codex Harness");
     expect(html).toContain("managerApproval");
     expect(html).toContain("始终交给人类");
   });
