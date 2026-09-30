@@ -1,3 +1,4 @@
+import { RETRY_APPROVAL_ACTION, agentTaskRetryApprovalTasks } from "./agentTaskRetry.js";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -621,6 +622,8 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
     }
   }
 
+  queues.approval.push(...agentTaskRetryApprovalTasks(store, projectId, EXECUTABLE_QUEUES.flatMap((queue) => queues[queue])));
+
   const priorityRank = { P0: 0, P1: 1, P2: 2, P3: 3 } as const;
   // 设计缺口会阻断已有施工，自动领取时优先于仍可按 taskId 精确领取的文档审批。
   const approvalActionRank = (item: AgentOrchestrationTask) => item.actionCode === "request_design_change"
@@ -727,7 +730,9 @@ export function buildAgentTaskPackage(
   }
   const role = ROLE_BY_QUEUE[queue];
   const configuredBlueprint = orchestration.recommendedAgents.find((item) => item.key === role);
-  const roleBlueprint = configuredBlueprint && task.actionCode === "add_function_node"
+  const roleBlueprint = configuredBlueprint && task.actionCode === RETRY_APPROVAL_ACTION
+    ? { ...configuredBlueprint, allowedMcpTools: canonicalAgentTools(["get_project_workflow", "get_agent_orchestration", "list_agent_task_leases", "get_agent_task_capacity", "start_agent_task", "heartbeat_agent_task", "complete_agent_task", "fail_agent_task", "release_agent_task"]) }
+    : configuredBlueprint && task.actionCode === "add_function_node"
     ? { ...configuredBlueprint, allowedMcpTools: canonicalAgentTools([
       "get_project_workflow", "get_project_workspace", "get_diagram", "get_design_doc", "validate_diagram",
       "start_agent_task", "heartbeat_agent_task", "mutate_diagram", "complete_agent_task", "fail_agent_task", "release_agent_task",
@@ -939,7 +944,9 @@ export function buildAgentTaskPackage(
       `租约到期：${selector.lease.leaseExpiresAt}；工作期间每 ${selector.lease.heartbeatSeconds} 秒调用 heartbeat_agent_task 续租。`,
       "开始任何目标项目修改前调用 start_agent_task；Builder 并发时必须提交独立 workspacePath、workspaceBranch 和 baselineRevision。所有计划流转必须携带 leaseToken 和唯一 idempotencyKey。",
       "若收到 LEASE_LOST、TASK_ALREADY_CLAIMED 或租约过期，立即停止写入，不得继续抢占任务。",
-      task.actionCode === "add_function_node"
+      task.actionCode === RETRY_APPROVAL_ACTION
+        ? "核查失败工单、原因及修复措施；使用 complete_agent_task(resultDigest=独立审核结论) 仅批准一次额外尝试。必须携带完整 workOrderId、taskKey、taskRevision、workerId、role 与幂等键；不得改全局上限。"
+      : task.actionCode === "add_function_node"
         ? "在当前主画布一次原子新增首批模块或功能节点，然后以 complete_agent_task(resultDigest=拆分结论) 完工。"
       : isProjectBriefTask(task.actionCode)
         ? "项目简报任务以 complete_agent_task 提交固定文档修订、独立审计证据或 Main Agent 结论；不得调用计划流转替代。"

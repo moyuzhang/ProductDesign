@@ -1684,3 +1684,27 @@ export interface DatabaseDeployResult {
   executedStatements: number;
   executedAt: string;
 }
+
+/** Exact exhausted lease eligible for a separately approved one-attempt recovery. */
+export interface AgentTaskRetryCandidate {
+  taskId: string;
+  taskKey: string;
+  taskRevision: string;
+  failedWorkOrderId: string;
+  attempt: number;
+  maxAttempts: number;
+  title: string;
+  actionCode: string;
+  role: AgentBlueprintKey;
+  diagramId: string | null;
+  nodeId: string | null;
+  lastError: string;
+  pendingRequestId?: string;
+}
+export interface AgentTaskRetryRequestResult {
+  requestId: string;
+  status: "pending" | "approved";
+  approvalTaskId: string;
+  additionalAttempts: 1;
+  authorizesRetry: boolean;
+}

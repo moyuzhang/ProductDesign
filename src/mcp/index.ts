@@ -1,3 +1,4 @@
+import { agentTaskRetryApprovalDigest } from "../server/agentTaskRetry.js";
 import { claimTaskPackage } from "../server/claimTaskPackage.js";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
@@ -186,6 +187,10 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
       const now = new Date().toISOString();
       const lease = store.db.prepare("SELECT * FROM agent_task_leases WHERE id=? AND lease_token=?")
         .get(input.workOrderId, input.leaseToken) as Record<string, string> | undefined;
+      if (lease?.action_code === "approve_agent_task_retry"
+        && !["start_agent_task", "heartbeat_agent_task", "complete_agent_task", "fail_agent_task", "release_agent_task"].includes(name)) {
+        throw new AgentSecurityError(409, "ACTION_MISMATCH", "重试审批工单仅可审核并批准该次重试");
+      }
       if (lease?.approval_group_id && !["start_agent_task", "heartbeat_agent_task", "release_agent_task", "fail_agent_task", "complete_agent_task"].includes(name)) {
         throw new AgentSecurityError(409, "ACTION_MISMATCH", "范围审批组只能用于对应设计变更和租约管理");
       }
@@ -446,7 +451,11 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
           const args = { ...input, ...(!childDispatch ? { agentId: localSession.agentId, workerId: localSession.workerId, role: "approver" } : {}),
             authSessionToken: localSession.authSessionToken };
           if (typeof input.workOrderId === "string") {
-            const bodyDigest = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+            const retryApproval = name === "complete_agent_task" && Boolean(store.db.prepare(
+              "SELECT 1 FROM agent_task_leases WHERE id=? AND action_code='approve_agent_task_retry'"
+            ).get(input.workOrderId));
+            const bodyDigest = retryApproval ? agentTaskRetryApprovalDigest(input as never)
+              : createHash("sha256").update(JSON.stringify(input)).digest("hex");
             const planAction = name === "transition_plan_delivery" && typeof input.planId === "string";
             Object.assign(args, { policyAckToken: localPolicy!.policyAckToken, connectionId: localSession.connectionId,
               bodyDigest, nonceId: issueOneTimeNonce(store, { policyAckToken: localPolicy!.policyAckToken,
@@ -971,7 +980,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
   leaseTool("heartbeat_agent_task", "续租 Agent 任务", "Agent 执行期间定期续租；租约丢失后必须停止写入。", {
     leaseSeconds: z.number().int().min(15).max(1800).default(1800),
   }, (input, context) => heartbeatAgentTask(store, input as never, context));
-  leaseTool("complete_agent_task", "完成 Agent 任务", "关闭已完成的任务租约；approve_node_document 会在精确工单修订下原子批准当前文档并固定节点引用，计划流转通常会自动完成其它租约。", {
+  leaseTool("complete_agent_task", "完成 Agent 任务", "关闭已完成的任务租约；approve_node_document 原子批准当前文档；approve_agent_task_retry 只批准一次精确失败尝试恢复，需完整工单上下文、独立审核 resultDigest。已登记恢复审批身份需 authSessionToken、policyAckToken、nonceId；nonce bodyDigest=SHA256(JSON.stringify({workOrderId,resultDigest:resultDigest.trim(),idempotencyKey}))。计划流转通常自动完成其它租约。", {
     resultDigest: z.string().max(4000).optional(),
     documentRevisionId: z.string().max(300).optional(), implementationRevision: z.string().max(300).optional(),
     evidenceId: z.string().max(300).optional(), testCommand: z.string().max(2000).optional(),

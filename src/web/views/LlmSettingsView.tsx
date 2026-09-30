@@ -1,3 +1,4 @@
+import { CodexRuntimeSettings } from "./CodexRuntimePanel";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
 import {
   Bot,
@@ -293,6 +294,7 @@ export function LlmSettingsView(): ReactElement {
       {error ? <ErrorBanner message={error} /> : null}
       {notice ? <div className="llm-notice-bar">{notice}</div> : null}
 
+      <CodexRuntimeSettings />
       <ChatGptAccountPanel onModelsChange={setAccountModels} onAccountChange={() => reload().catch(() => undefined)} />
 
       <section className="llm-card-list" aria-label="模型提供方">

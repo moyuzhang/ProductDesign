@@ -1,3 +1,4 @@
+import { RETRY_APPROVAL_ACTION, agentTaskRetryApprovalDigest, approveAgentTaskRetry, consumeAgentTaskRetry, hasAgentTaskRetryAllowance } from "./agentTaskRetry.js";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -323,7 +324,8 @@ function withoutToken(lease: AgentTaskLease): Omit<AgentTaskLease, "leaseToken">
   return safe;
 }
 
-function revisionForTask(store: Store, task: AgentOrchestrationTask): string {
+export function revisionForTask(store: Store, task: AgentOrchestrationTask): string {
+  if (task.actionCode === RETRY_APPROVAL_ACTION) return `retry:${task.correlationId}`;
   if (task.actionCode === "add_function_node") {
     return `add_function_node:${task.documentRevisionIds[0]}:${task.diagramId}`;
   }
@@ -960,7 +962,7 @@ function claimableTasksForOrchestration(
     const conflictingLock = workScopes
       .flatMap((scope) => locksByScope.get(scope) ?? [])
       .find((lock) => lock.task_key !== taskKey);
-    const attemptsExhausted = Boolean(row && row.attempt >= capacity.maxAttempts && ["failed", "expired"].includes(row.status));
+    const attemptsExhausted = Boolean(row && row.attempt >= capacity.maxAttempts && ["failed", "expired"].includes(row.status) && !hasAgentTaskRetryAllowance(store, row));
     const backingOff = Boolean(row?.retry_available_at && row.retry_available_at > now && ["failed", "expired"].includes(row.status));
     const projectFull = totalActive >= capacity.maxActive;
     const roleFull = (roleActive.get(role) ?? 0) >= roleCapacity(capacity, role);
@@ -1552,6 +1554,7 @@ function claimSingleAgentTask(
       throw new AgentTaskLeaseError(409, "RESOURCE_SCOPE_LOCKED", `资源范围已由 Worker ${locked.worker_id} 锁定至 ${locked.expires_at}`);
     }
     const project = store.getProject(input.projectId);
+    const previousAttempt = store.db.prepare("SELECT * FROM agent_task_leases WHERE project_id=? AND task_key=?").get(input.projectId, task.taskKey) as LeaseRow | undefined;
     const workOrderId = randomUUID();
     const recommended = recommendedWorkspace(project?.repositoryPath ?? "", input.projectId, workerId, task.taskKey);
     // A terminal reservation is immutable history. A legal reclaim gets a distinct reservation identity,
@@ -1619,6 +1622,7 @@ function claimSingleAgentTask(
       throw new AgentTaskLeaseError(409, "TASK_ALREADY_CLAIMED", `任务已由 ${existing.agent_id} 领取，租约到期时间 ${existing.lease_expires_at}`);
     }
     if (["approve_node_requirement", "approve_node_document"].includes(row.action_code)) assertIndependentApprover(store, row);
+    consumeAgentTaskRetry(store, previousAttempt, workOrderId);
     const lease = mapLease(row);
     for (const scope of workScopes) {
       store.db.prepare(`
@@ -2372,6 +2376,23 @@ function controlSingleLease(
     }
     let projectBriefDigest: string | null = null;
     if (operation === "complete") {
+      if (currentRow.action_code === RETRY_APPROVAL_ACTION) {
+        if (isAgentSecurityEnforced(store, currentRow.agent_id)) {
+          try {
+            if (!input.authSessionToken) throw new AgentTaskLeaseError(401, "AUTH_REQUIRED", "重试审批需要认证会话");
+            const principal = resolveAuthPrincipal(store, input.authSessionToken);
+            if (principal.agentId !== currentRow.agent_id || principal.workerId !== currentRow.worker_id)
+              throw new AgentTaskLeaseError(403, "PRINCIPAL_SPOOF_REJECTED", "认证会话与重试审批身份不一致");
+            assertAgentWorkOrderContext(store, { ...input, role: "approver", projectId: currentRow.project_id,
+              connectionId: principal.connectionId, action: context.securityAction ?? "mcp.complete_agent_task",
+              target: context.securityTarget ?? "mcp:complete_agent_task", bodyDigest: agentTaskRetryApprovalDigest(input) });
+          } catch (cause) {
+            if (cause instanceof AgentSecurityError) throw new AgentTaskLeaseError(cause.statusCode, cause.code, cause.message);
+            throw cause;
+          }
+        }
+        approveAgentTaskRetry(store, mapLease(currentRow), input as CompleteInput);
+      }
       if (currentRow.action_code === "add_function_node") {
         const completion = input as CompleteInput;
         const scopes = mapLease(currentRow).workScopes;

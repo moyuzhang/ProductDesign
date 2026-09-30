@@ -1,3 +1,7 @@
+import type { CodexDesignRuntime } from "./codexDesignRuntime.js";
+import { designContractSchema, requirementsBaselineSchema } from "../shared/designContract.js";
+import { DesignContractError, validateProjectDesignContract } from "./designContractValidation.js";
+import { registerAgentTaskRetryApi } from "./agentTaskRetryApi.js";
 import { DesignChangeCorrectionError, listDesignChangeRecoveries } from "./designChangeCorrection.js";
 import type { CodexAccount } from "./codexAccount.js";
 import { assertLocalCodexRequest } from "./codexLocalAccess.js";
@@ -361,6 +365,7 @@ export interface ApiOptions {
   agentUiEvents: AgentUiEventBus;
   eventStreams: EventStreams;
   codexAccount: CodexAccount;
+  codexRuntime: CodexDesignRuntime;
   trustedInternal?: boolean;
 }
 
@@ -491,6 +496,7 @@ function validateNodeDatabaseBindingTarget(
 
 export function registerApi(app: FastifyInstance, options: ApiOptions): void {
   const { store, dataDir, harness, agentUiEvents } = options;
+  registerAgentTaskRetryApi(app, store);
 
   const sendSecurityError = (reply: FastifyReply, cause: unknown) => {
     if (cause instanceof AgentSecurityError) return reply.code(cause.statusCode).send({ code: cause.code, message: cause.message });
@@ -637,6 +643,8 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     assertLocalCodexRequest(request);
     reply.header("cache-control", "no-store");
   });
+  app.get("/api/codex/runtime", async () => options.codexRuntime.status());
+  app.post("/api/codex/runtime/check", async () => options.codexRuntime.check());
   app.get("/api/codex/account", async () => options.codexAccount.status());
   app.get("/api/codex/models", async () => options.codexAccount.models());
   app.post("/api/codex/login", async (request) => {
@@ -885,6 +893,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     }
     const profileProblem = agentProfileProblem(profile);
     if (profileProblem) throw httpError(409, profileProblem);
+    if (profile?.protocol === "openai-responses") await harness.ensureDesignRuntime();
     const userMessage = store.insertAgentMessage({
       sessionId: id, projectId: session.projectId, role: "user", content: body.content,
       status: "completed", pageContext,
@@ -1074,6 +1083,16 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id } = request.params as { id: string };
     if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在" });
     return listAgentTaskLeases(store, id);
+  });
+
+  app.get("/api/projects/:id/design-contract-validation", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在" });
+    const query = parse(z.object({ planId: z.string().min(1).optional() }).strict(), request.query);
+    if (query.planId && store.getPlan(query.planId)?.projectId !== id) return reply.code(404).send({ message: "计划不存在或不属于当前项目" });
+    return { ...validateProjectDesignContract(store, id, query.planId), artifactSchemas: {
+      baseline: z.toJSONSchema(requirementsBaselineSchema), contract: z.toJSONSchema(designContractSchema),
+    } };
   });
 
   app.get("/api/projects/:id/design-change-recoveries", async (request, reply) => {
@@ -1708,6 +1727,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         return next;
       }).immediate();
     } catch (cause) {
+      if (cause instanceof DesignContractError) return reply.code(cause.statusCode).send({ code: cause.code, message: cause.message, details: cause.details });
       recoverCoordinationLeaseAfterRejectedTransaction(store, before.projectId, cause);
       if (cause instanceof AgentTaskLeaseError || cause instanceof CoordinationLeaseError) return agentTaskPackageError(reply, cause);
       throw cause;

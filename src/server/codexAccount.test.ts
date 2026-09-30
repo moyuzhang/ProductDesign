@@ -113,7 +113,7 @@ describe("subscription API boundaries and persistence", () => {
     try {
       const created = await app.inject({ method: "POST", url: "/api/llm-profiles", headers: localHeaders, payload: profileBody });
       expect(created.statusCode).toBe(200); expect(created.json()).toMatchObject({ authMode: "chatgpt", credentialConfigured: false });
-      expect(agentProfileProblem(created.json())).toContain("Codex 设计执行暂不可用");
+      expect(agentProfileProblem(created.json())).toBeUndefined();
       for (const patch of [{ apiKey: "must-not-store" }, { protocol: "openai-chat" }, { models: ["invented"], defaultModel: "invented" }]) {
         expect((await app.inject({ method: "POST", url: "/api/llm-profiles", headers: localHeaders, payload: { ...profileBody, ...patch } })).statusCode).toBe(400);
       }

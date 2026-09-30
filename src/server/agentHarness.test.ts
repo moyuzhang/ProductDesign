@@ -17,6 +17,31 @@ afterEach(() => {
 });
 
 describe("Agent approval protocol", () => {
+  it("preserves committed draft success when the post-save validation transport fails", async () => {
+    const harness = new CodexHarness({} as Store, "");
+    const callTool = vi.fn(async (name: string) => {
+      if (name === "validate_design_contract") throw new Error("temporary readback failure");
+      return { content: [{ type: "text", text: "draft saved id=one" }] };
+    });
+    const execute = (harness as unknown as { executeProjectMcpTool: (...args: any[]) => Promise<string> }).executeProjectMcpTool.bind(harness);
+    const result = await execute({ id: "session-1", projectId: "project-1" } as AgentSession,
+      { name: "create_design_doc", inputSchema: { properties: { projectRef: {} } } }, { status: "草拟" }, { callTool });
+    expect(result).toContain("draft saved id=one"); expect(result).toContain("设计已保存"); expect(result).toContain("不要重复写入");
+    expect(callTool.mock.calls.filter(([name]) => name === "create_design_doc")).toHaveLength(1);
+  });
+
+  it("runs authoritative design validation after a successful draft write and attributes the agent", async () => {
+    const harness = new CodexHarness({} as Store, "");
+    const callTool = vi.fn(async (name: string, _args: unknown) => ({ content: [{ type: "text", text: name === "validate_design_contract" ? '{"status":"partial","issues":["missing criterion"]}' : "draft saved" }] }));
+    const execute = (harness as unknown as { executeProjectMcpTool: (...args: any[]) => Promise<string> }).executeProjectMcpTool.bind(harness);
+    const result = await execute({ id: "session-1", projectId: "project-1" } as AgentSession,
+      { name: "create_design_doc", inputSchema: { properties: { projectRef: {}, author: {} } } },
+      { status: "草拟", author: "claimed-human", projectRef: "other-project" }, { callTool });
+    expect(callTool.mock.calls.map(([name]) => name)).toEqual(["create_design_doc", "validate_design_contract"]);
+    expect(callTool.mock.calls[0][1]).toMatchObject({ projectRef: "project-1", author: "agent:session-1" });
+    expect(result).toContain("保存后的服务端设计检查"); expect(result).toContain("missing criterion");
+  });
+
   it("refreshes workflow only for terminal transitions or lease/revision errors", () => {
     expect(shouldRefreshAgentWorkflow("get_project_workspace", {}, "ok")).toBe(false);
     expect(shouldRefreshAgentWorkflow("create_evidence", {}, "ok")).toBe(false);

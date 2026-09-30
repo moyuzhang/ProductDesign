@@ -33,16 +33,20 @@ export function ProjectsView(): ReactElement {
   const [health, setHealth] = useState("");
   const [configOnly, setConfigOnly] = useState(() => new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("configured") === "no");
   const [createOpen, setCreateOpen] = useState(false);
+  const requestId = useRef(0);
+  const reloadLatest = useRef<() => void>(() => {});
 
   const reload = useCallback(() => {
+    const currentRequest = ++requestId.current;
     setLoading(true);
     api.pageProjects({ q: q || undefined, stage: stage || undefined, health: health || undefined, configured: configOnly ? "no" : "all", offset, limit })
-      .then((page) => { setProjects(page.items); setTotal(page.total); setError(""); })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
+      .then((page) => { if (currentRequest === requestId.current) { setProjects(page.items); setTotal(page.total); setError(""); } })
+      .catch((e) => { if (currentRequest === requestId.current) { setProjects([]); setTotal(0); setError(e.message); } })
+      .finally(() => { if (currentRequest === requestId.current) setLoading(false); });
   }, [q, stage, health, configOnly, offset]);
 
-  useEffect(() => { reload(); }, [reload]);
+  reloadLatest.current = reload;
+  useEffect(() => { reload(); return () => { requestId.current += 1; }; }, [reload]);
 
   return (
     <div>
@@ -88,6 +92,8 @@ export function ProjectsView(): ReactElement {
 
       {loading ? (
         <Spinner />
+      ) : error && projects.length === 0 ? (
+        <EmptyState text="项目列表暂不可用，请使用刷新重试。" />
       ) : projects.length === 0 && !q && !stage && !health && !configOnly ? (
         <EmptyState text="还没有项目。点击「新建项目」，项目文件将由服务统一托管。" />
       ) : projects.length === 0 ? (
@@ -131,7 +137,7 @@ export function ProjectsView(): ReactElement {
                     title="删除项目"
                     onClick={() => {
                       if (window.confirm(`确认删除项目「${p.name}」？其工作节点、计划、证据将一并删除。`)) {
-                        api.deleteProject(p.id).then(reload).catch((err) => setError(err.message));
+                        api.deleteProject(p.id).then(() => reloadLatest.current()).catch((err) => setError(err.message));
                       }
                     }}
                   >

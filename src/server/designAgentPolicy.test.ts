@@ -4,7 +4,7 @@ import { agentProfileProblem } from "./agentHarness.js";
 import type { LlmProfile } from "../shared/types.js";
 
 describe("design-only capabilities", () => {
-  it("fails Codex turns closed without silently changing providers", () => {
+  it("keeps profile selection separate from mandatory per-turn runtime preflight", () => {
     const profile = { enabled: true, credentialConfigured: true, protocol: "openai-responses" } as LlmProfile;
     expect(agentProfileProblem(profile)).toBe(codexDesignProblem());
     expect(agentProfileProblem({ ...profile, authMode: "chatgpt" })).toBe(codexDesignProblem());

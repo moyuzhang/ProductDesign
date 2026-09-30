@@ -1,3 +1,4 @@
+import { CodexDesignRuntime } from "./codexDesignRuntime.js";
 import { CodexAccount } from "./codexAccount.js";
 import { EventStreams } from "./eventStreams.js";
 import { existsSync } from "node:fs";
@@ -66,12 +67,13 @@ export function buildApp(options: BuildOptions = {}) {
   const agentUiEvents = new AgentUiEventBus();
   const eventStreams = new EventStreams();
   const codexAccount = new CodexAccount(dataDir);
+  const codexRuntime = new CodexDesignRuntime();
   let harness: CodexHarness;
-  harness = new CodexHarness(store, dataDir, () => createMcpServer({ store, dbPath, dataDir, harness, trustedInternal: true }), agentUiEvents);
+  harness = new CodexHarness(store, dataDir, () => createMcpServer({ store, dbPath, dataDir, harness, trustedInternal: true }), agentUiEvents, codexRuntime);
   syncManagedProjectStorage(store, dataDir);
   reconcilePlanDeliveryProjections(store);
   const app = Fastify({ logger: options.logger ?? false });
-  registerApi(app, { store, dataDir, harness, agentUiEvents, eventStreams, codexAccount, trustedInternal: options.trustedInternalApi });
+  registerApi(app, { store, dataDir, harness, agentUiEvents, eventStreams, codexAccount, codexRuntime, trustedInternal: options.trustedInternalApi });
 
   const mcpHandler = createMcpHandler(() => createMcpServer({ store, dbPath, dataDir, harness }));
   app.all("/mcp", async (request, reply) => {

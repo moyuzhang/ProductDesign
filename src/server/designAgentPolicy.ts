@@ -1,10 +1,8 @@
-/** Built-in Codex local tool enforcement is not yet verified for design-only sessions. */
-export function codexDesignProblem(): string | undefined {
-  return "Codex 设计执行暂不可用：当前运行时尚未验证能禁止代码执行和文件写入。ChatGPT 登录与模型目录可用；可另选 API 配置进行受控设计对话，不会自动切换或计费。";
-}
+/** Each Codex turn must pass runtime preflight plus effective-config and returned-sandbox verification. */
+export function codexDesignProblem(): string | undefined { return undefined; }
 
 export const DESIGN_AGENT_MCP_TOOLS = new Set([
-  "get_project", "get_project_workspace", "get_project_workflow", "get_next_project_action", "validate_project_workflow",
+  "validate_design_contract", "get_project", "get_project_workspace", "get_project_workflow", "get_next_project_action", "validate_project_workflow",
   "list_project_workspace_nodes", "get_project_snapshot", "list_plan_items", "get_plan_item",
   "list_design_docs", "get_design_doc", "create_design_doc", "list_document_references",
   "list_governance", "list_diagrams", "get_diagram", "validate_diagram", "open_diagram",

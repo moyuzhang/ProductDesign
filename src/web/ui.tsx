@@ -79,23 +79,60 @@ export function Modal(props: {
   footer?: ReactNode;
   width?: number;
 }): ReactElement {
+  const titleId = useId();
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(props.onClose);
+  closeRef.current = props.onClose;
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") props.onClose();
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const isTop = () => [...document.querySelectorAll("[data-modal-root]")].at(-1) === overlayRef.current;
+    const focusable = () => [...(dialogRef.current?.querySelectorAll<HTMLElement>("button, a[href], input, select, textarea, summary, [tabindex]") ?? [])].filter((element) => {
+      if (element.tabIndex < 0 || element.matches(":disabled") || element.closest("[hidden], [inert]")) return false;
+      for (let current: HTMLElement | null = element; current && current !== dialogRef.current; current = current.parentElement) {
+        if (getComputedStyle(current).display === "none" || getComputedStyle(current).visibility === "hidden") return false;
+      }
+      const details = element.closest("details:not([open])");
+      return !details || details.querySelector("summary") === element;
+    });
+    if (isTop()) {
+      const inputs = focusable();
+      (inputs.find((element) => element.matches("input, select, textarea, [autofocus]")) ?? inputs[0] ?? dialogRef.current)?.focus();
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (!isTop() || event.defaultPrevented) return;
+      if (event.key === "Escape") { event.preventDefault(); closeRef.current(); return; }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      const first = items[0]; const last = items.at(-1);
+      if (!first) { event.preventDefault(); dialogRef.current?.focus(); return; }
+      if (!dialogRef.current?.contains(document.activeElement)) { event.preventDefault(); (event.shiftKey ? last : first)?.focus(); }
+      else if (event.shiftKey && (document.activeElement === first || document.activeElement === dialogRef.current)) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [props]);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, []);
   return (
-    <div className="modal-overlay" onMouseDown={props.onClose}>
+    <div ref={overlayRef} data-modal-root className="modal-overlay" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && [...document.querySelectorAll("[data-modal-root]")].at(-1) === event.currentTarget) props.onClose();
+    }}>
       <div
+        ref={dialogRef}
         className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
         style={{ width: props.width ?? 640 }}
-        onMouseDown={(e) => e.stopPropagation()}
+        onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="modal-header">
-          <h3>{props.title}</h3>
-          <button className="btn btn-ghost btn-icon" onClick={props.onClose} aria-label="关闭">✕</button>
+          <h3 id={titleId}>{props.title}</h3>
+          <button type="button" className="btn btn-ghost btn-icon" onClick={props.onClose} aria-label="关闭">✕</button>
         </div>
         <div className="modal-body">{props.children}</div>
         {props.footer ? <div className="modal-footer">{props.footer}</div> : null}
@@ -105,11 +142,11 @@ export function Modal(props: {
 }
 
 export function ErrorBanner({ message }: { message: string }): ReactElement {
-  return <div className="error-banner">{message}</div>;
+  return <div className="error-banner" role="alert">{message}</div>;
 }
 
 export function Spinner(): ReactElement {
-  return <div className="spinner">加载中…</div>;
+  return <div className="spinner" role="status" aria-live="polite">加载中…</div>;
 }
 
 export function Pagination(props: {

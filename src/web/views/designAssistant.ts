@@ -6,5 +6,3 @@ export function designRequestText(goal: string): string {
 export function openDesignAssistant(request: DesignAssistantRequest): void {
   window.dispatchEvent(new CustomEvent<DesignAssistantRequest>(OPEN_DESIGN_ASSISTANT, { detail: request }));
 }
-
-export const DESIGN_SUBSCRIPTION_BLOCKED_MESSAGE = "ChatGPT 登录与模型目录已开放，但 Codex 设计执行暂未开放：尚未验证可强制禁用目标项目的代码执行与源码写入。不会自动回退到 API Key。";

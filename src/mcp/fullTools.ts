@@ -1,3 +1,5 @@
+import { designContractSchema, requirementsBaselineSchema } from "../shared/designContract.js";
+import { DesignContractError, validateProjectDesignContract } from "../server/designContractValidation.js";
 import { DesignChangeCorrectionError } from "../server/designChangeCorrection.js";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
@@ -238,6 +240,20 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
 
   // 图层、组件与模板工具（设计第 7 节）：与 REST 端点共用 src/server/whiteboard.ts 服务层。
   registerWhiteboardTools(server, { store, dataDir });
+
+  server.registerTool("validate_design_contract", {
+    title: "检查需求覆盖和设计一致性",
+    description: "只读检查明确引用的结构化需求基线和设计合同。服务端核对实际计划/节点/版本、逐条验收标准覆盖、接口方法路径和分阶段依赖环。unassessed 表示没有结构化基线，绝不表示通过；valid 仅表示已声明结构一致，不代替用户批准或真实测试。可返回 artifactSchemas 供通过 create_design_doc 创建草稿；基线和合同必须独立批准后才能进入正式交付。",
+    inputSchema: { projectRef: z.string().min(1), planId: z.string().min(1).optional(), includeSchemas: z.boolean().default(true) },
+  }, ({ projectRef, planId, includeSchemas }) => {
+    const project = projectByRef(store, projectRef);
+    if (!project) return error("项目不存在");
+    if (planId && store.getPlan(planId)?.projectId !== project.id) return error("计划不存在或不属于当前项目");
+    const report = validateProjectDesignContract(store, project.id, planId);
+    return result({ ...report, ...(includeSchemas ? { artifactSchemas: {
+      baseline: z.toJSONSchema(requirementsBaselineSchema), contract: z.toJSONSchema(designContractSchema),
+    } } : {}) });
+  });
 
   server.registerTool("service_health", {
     title: "服务健康检查",
@@ -765,6 +781,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
       }).immediate();
       return result(updated, "计划交付状态已流转");
     } catch (cause) {
+      if (cause instanceof DesignContractError) return error(JSON.stringify({ code: cause.code, message: cause.message, details: cause.details }));
       recoverCoordinationLeaseAfterRejectedTransaction(store, before.projectId, cause);
       if (cause instanceof AgentTaskLeaseError || cause instanceof AgentSecurityError || cause instanceof CoordinationLeaseError) return error(structuredError(cause));
       return error(cause instanceof Error ? cause.message : String(cause));

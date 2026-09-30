@@ -26,6 +26,7 @@ import { PROJECT_WORKFLOW_POLICY } from "../../shared/workflowPolicy";
 import { displayAssignment, normalizeRoleAssignments, roleAssignmentErrors } from "../../shared/planRoles";
 import { PLAN_DELIVERY_STEPS, PLAN_LIFECYCLE_LABELS, planLifecycleStep } from "../../shared/planDelivery";
 import { api } from "../api";
+import { DesignContractValidationPanel } from "./DesignContractValidationPanel";
 import { DesignChangeRecoveryPanel } from "./DesignChangeRecoveryPanel";
 import { openDesignAssistant } from "./designAssistant";
 import { navigate } from "../App";
@@ -259,6 +260,7 @@ export function ProjectDetailView(props: { projectId: string; initialTab?: strin
             <div className="toolbar"><a className="btn" href={`#/projects/${id}?tab=documents`}>审阅设计文档</a><button className="btn" onClick={() => setEditing(true)}>补充项目目标</button></div>
             <p className="cell-sub">打开助手只准备设计请求。选择模型并发送后才开始；生成的设计需在文档中审阅，当前未自动标记任何阶段完成。</p>
           </section>
+          <DesignContractValidationPanel projectId={id} />
           <DesignChangeRecoveryPanel projectId={id} />
           <details><summary>外部开发交付（由连接的 harness 执行）</summary><p className="cell-sub">外部 harness 领取开发任务，并按任务提交进展、问题、变更和验证工单。以下开发门禁保持有效；内置设计助手不执行这些代码任务。</p><WorkflowTab projectId={id} onError={setError} /></details>
         </>

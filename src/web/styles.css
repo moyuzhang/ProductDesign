@@ -3435,3 +3435,13 @@ input[type="range"] { accent-color: var(--accent); border: none; background: tra
 .llm-auth-choice { display: flex; flex-wrap: wrap; gap: 16px; border: 1px solid var(--border-soft); border-radius: 8px; padding: 12px; }
 .llm-auth-choice label { display: flex; align-items: center; gap: 6px; }
 .llm-auth-choice input { width: auto; }
+
+.design-contract-report, .agent-retry-panel { min-width: 0; margin-top: 18px; }
+.design-contract-report p, .agent-retry-panel p { overflow-wrap: anywhere; line-height: 1.6; }
+.design-contract-report h2, .agent-retry-panel h2 { margin: 0; }
+.design-contract-table { overflow-x: auto; }
+.design-contract-table table { min-width: 560px; }
+.design-contract-refs { display: flex; flex-wrap: wrap; gap: 8px; overflow-wrap: anywhere; }
+.design-contract-issues li { margin: 12px 0; }
+.design-contract-sources summary, .agent-retry-candidate summary { cursor: pointer; padding: 8px 0; }
+.agent-retry-candidate { margin-top: 12px; padding: 14px; border: 1px solid var(--border-soft); border-radius: 10px; }

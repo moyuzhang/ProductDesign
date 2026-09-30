@@ -84,7 +84,7 @@ export function SystemGuideView(): ReactElement {
       <section className="system-guide-section">
         <h2>如何开始自动设计</h2>
         <p>创建项目并写下目标，在设计工作台打开设计助手，选择模型配置并发送请求。助手先澄清需求，再通过设计文档、节点和其他设计工具形成方案；你在文档中审阅、提出修改并确认。</p>
-        <p>需要 ChatGPT 订阅时，到模型设置选择 ChatGPT 登录，并由你在 OpenAI 官方页面完成授权。模型列表来自账户通道，实际使用仍受账户权限与额度限制。目前仅开放账户登录与模型目录；Codex 设计执行在强制禁用代码执行和源码写入得到验证前保持关闭，不自动切换 API Key。主动选择 API Key 时使用独立 API 计费。</p>
+        <p>需要 ChatGPT 订阅时，到模型设置选择 ChatGPT 登录，并由你在 OpenAI 官方页面完成授权。模型列表来自账户通道，实际使用仍受账户权限与额度限制。Codex 设计执行需要先检查本机设计运行环境；只有后端确认隔离与只读限制可用后才能发送，检查失败会显示原因。环境就绪不代表已登录或拥有模型权限，不自动切换 API Key。主动选择 API Key 时使用独立 API 计费。</p>
         <p>设计助手不运行命令、不修改目标项目源码、不启动开发或代码测试任务。外部 harness 负责开发任务，必须提交进展、问题、变更与验证工单；开发进度不冒充本次设计进度。</p>
       </section>
       <details className="system-guide-legacy"><summary>外部 harness 开发交付与工单（独立于内置设计助手）</summary>

@@ -1,7 +1,10 @@
+import { buildDesignTurnContext } from "./designTurnContext.js";
+import { CodexDesignRuntime, DESIGN_CODEX_CONFIG, assertDesignEffectiveConfig, assertDesignThreadPolicy, designCodexArgs } from "./codexDesignRuntime.js";
+import { tmpdir } from "node:os";
 import { codexDesignProblem, DESIGN_AGENT_MCP_TOOLS, assertDesignTool } from "./designAgentPolicy.js";
 import { codexCommand, chatgptCodexHome, chatgptCodexEnv } from "./codexRuntime.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { McpServer } from "@modelcontextprotocol/server";
@@ -19,7 +22,6 @@ import type {
 import { nowIso, type Store } from "./db.js";
 import { LocalMcpClient, MUTATING_AGENT_MCP_TOOLS, mcpResultText, type AgentMcpResult, type AgentMcpTool } from "./localMcpClient.js";
 import { isDeepSeekProfile, llmEndpoint, openAiChatReasoningOptions } from "./llmProfiles.js";
-import { ensureManagedProjectDirectory } from "./projectFiles.js";
 import type { AgentEntityChangedValue } from "../shared/types.js";
 import type { AgentUiEventBus } from "./agentUiEvents.js";
 
@@ -162,7 +164,10 @@ export class CodexHarness {
     private readonly dataDir: string,
     private readonly mcpFactory?: () => McpServer,
     private readonly agentUiEvents?: AgentUiEventBus,
+    private readonly designRuntime: Pick<CodexDesignRuntime, "ensure"> = new CodexDesignRuntime(),
   ) {}
+
+  async ensureDesignRuntime(): Promise<void> { await this.designRuntime.ensure(); }
 
   hasActiveChatGptRuns(): boolean {
     return [...this.activeRuns.keys()].some((id) => {
@@ -234,19 +239,23 @@ export class CodexHarness {
     }, turnLimitMs);
 
     let codexMcp: LocalMcpClient | undefined;
+    let designWorkspace: string | undefined;
     try {
       if (profile.protocol !== "openai-responses") {
         return await this.runDirectTurn(session, profile, assistantMessageId, prompt, controller.signal);
       }
+      await this.designRuntime.ensure();
+      controller.signal.throwIfAborted();
       if (!this.mcpFactory) throw new Error("ProductDesign MCP 工具桥接尚未初始化");
 
       const mcp = codexMcp = await LocalMcpClient.connect(this.mcpFactory);
       const agentTools = (await mcp.listAgentTools()).filter((tool) => DESIGN_AGENT_MCP_TOOLS.has(tool.name));
-      const workflowContext = await this.loadWorkflowContext(session.projectId, mcp);
+      const workflowContext = await this.loadWorkflowContext(session.projectId, mcp, session.id);
       controller.signal.throwIfAborted();
       const toolByName = new Map(agentTools.map((tool) => [tool.name, tool]));
 
-    const cwd = ensureManagedProjectDirectory(this.dataDir, project);
+    const cwd = designWorkspace = mkdtempSync(join(tmpdir(), "productdesign-design-"));
+    writeFileSync(join(cwd, "DESIGN_SCOPE.txt"), "本临时目录仅用于产品设计上下文。目标项目源码不在此工作区。禁止执行命令、写源文件或自行批准。通过提供的项目范围设计工具读取权威资料、保存草稿并等待用户确认。", { mode: 0o600 });
     const command = codexCommand();
     const subscription = profile.authMode === "chatgpt";
     const codexHome = subscription ? chatgptCodexHome(this.dataDir) : join(this.dataDir, "codex-harness");
@@ -254,7 +263,7 @@ export class CodexHarness {
     const storedKey = subscription ? undefined : this.store.resolveLlmKey(profile);
     const childEnv: Record<string, string | undefined> = subscription ? chatgptCodexEnv(codexHome) : { ...process.env, CODEX_HOME: codexHome };
     if (storedKey) childEnv[profile.apiKeyEnv] = storedKey;
-    const args = [...command.prefix, "app-server", "--listen", "stdio://"];
+    const args = [...command.prefix, "app-server", "--strict-config", ...designCodexArgs(), "--listen", "stdio://"];
     const child = spawn(command.executable, args, {
       cwd: codexHome,
       env: childEnv,
@@ -413,6 +422,7 @@ export class CodexHarness {
         const catalog = await request("model/list", { limit: 100, includeHidden: false }) as { data?: Array<{ model?: string }> };
         if (!catalog.data?.some((item) => item.model === session.model)) throw new Error("当前 ChatGPT 账户未提供所选模型，请刷新模型列表后选择");
       }
+      assertDesignEffectiveConfig(await request("config/read", { cwd, includeLayers: false }));
       const pid = subscription ? "openai" : providerId(profile);
       const config = subscription ? { model_provider: "openai", model: session.model, forced_login_method: "chatgpt" } : {
         model_provider: pid,
@@ -430,9 +440,9 @@ export class CodexHarness {
         model: session.model,
         modelProvider: pid,
         cwd,
-        approvalPolicy: approvalPolicyForMode(session.controlMode),
-        sandbox: "workspace-write",
-        config,
+        approvalPolicy: "never",
+        sandbox: "read-only",
+        config: { ...config, ...DESIGN_CODEX_CONFIG },
         dynamicTools: agentTools.map((tool) => ({
           type: "function",
           name: tool.name,
@@ -454,6 +464,7 @@ export class CodexHarness {
       } else {
         threadResult = await request("thread/start", { ...threadParams, ephemeral: false }) as Record<string, unknown>;
       }
+      assertDesignThreadPolicy(threadResult);
       const thread = threadResult.thread as { id?: string } | undefined;
       const threadId = thread?.id;
       if (!threadId) throw new Error("Codex app-server 未返回 thread id");
@@ -461,6 +472,8 @@ export class CodexHarness {
 
       const turnResult = await request("turn/start", {
         threadId,
+        approvalPolicy: "never",
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
         input: [{ type: "text", text: prompt, text_elements: [] }],
       }) as Record<string, unknown>;
       const turn = turnResult.turn as { id?: string } | undefined;
@@ -511,8 +524,14 @@ export class CodexHarness {
       try {
         await codexMcp?.close();
       } finally {
-        activeRun.complete();
-        if (this.activeRuns.get(sessionId) === activeRun) this.activeRuns.delete(sessionId);
+        try {
+          if (designWorkspace) rmSync(designWorkspace, { recursive: true, force: true });
+        } catch {
+          console.warn("[pcs] 设计临时目录暂未清理；任务已停止，请稍后清理系统临时目录");
+        } finally {
+          activeRun.complete();
+          if (this.activeRuns.get(sessionId) === activeRun) this.activeRuns.delete(sessionId);
+        }
       }
     }
   }
@@ -605,7 +624,7 @@ export class CodexHarness {
       }
       if (latestUser >= 0) completed[latestUser] = { role: "user", content: prompt };
       const tools = (await mcp.listAgentTools()).filter((tool) => DESIGN_AGENT_MCP_TOOLS.has(tool.name));
-      const workflowContext = await this.loadWorkflowContext(session.projectId, mcp);
+      const workflowContext = await this.loadWorkflowContext(session.projectId, mcp, session.id);
       signal.throwIfAborted();
       const output = profile.protocol === "anthropic-messages"
         ? await this.runAnthropicToolLoop(session, profile, apiKey, completed, tools, mcp, assistantMessageId, signal, workflowContext)
@@ -801,6 +820,7 @@ export class CodexHarness {
     if ("projectRef" in properties) args.projectRef = session.projectId;
     if ("projectId" in properties) args.projectId = session.projectId;
     if ("actor" in properties) args.actor = `agent:${session.id}`;
+    if ("author" in properties) args.author = `agent:${session.id}`;
     if ("sessionId" in properties) args.sessionId = session.id;
     if ("clientId" in properties) args.clientId = "productdesign-agent-harness";
     if ("model" in properties) args.model = session.model;
@@ -812,8 +832,16 @@ export class CodexHarness {
         ? this.openDiagram(session, args)
         : await mcp.callTool(tool.name, args);
     let text = mcpResultText(result);
-    if (MUTATING_AGENT_MCP_TOOLS.has(tool.name)) {
-      if (!result.isError) this.publishMutationEvent(session, tool.name, args, mcpResultText(result));
+    if (MUTATING_AGENT_MCP_TOOLS.has(tool.name) && !result.isError) {
+      this.publishMutationEvent(session, tool.name, args, mcpResultText(result));
+      try {
+        const checked = await mcp.callTool("validate_design_contract", { projectRef: session.projectId, includeSchemas: false });
+        text = checked.isError
+          ? `${text}\n\n[设计已保存；后续检查返回错误，不要重复写入。请单独重新读取设计检查结果。]\n${mcpResultText(checked, 8_000)}`
+          : `${text}\n\n[保存后的服务端设计检查；未评估不等于通过]\n${mcpResultText(checked, 8_000)}`;
+      } catch {
+        text = `${text}\n\n[设计已保存；后续检查暂不可用，不要重复写入。请单独重新读取设计检查结果。]`;
+      }
     }
     if (shouldRefreshAgentWorkflow(tool.name, result, text)) {
       const workflowAfter = await mcp.callTool("get_project_workflow", { projectRef: session.projectId, includeNodes: false, offset: 0, limit: 20 });
@@ -822,9 +850,10 @@ export class CodexHarness {
     return result.isError ? `[MCP 工具返回错误]\n${text}` : text;
   }
 
-  private async loadWorkflowContext(projectId: string, mcp: LocalMcpClient): Promise<string> {
+  private async loadWorkflowContext(projectId: string, mcp: LocalMcpClient, sessionId: string): Promise<string> {
     const result = await mcp.callTool("get_project_workflow", { projectRef: projectId, includeNodes: false, offset: 0, limit: 20 });
-    return mcpResultText(result, 8_000);
+    const designCheck = await mcp.callTool("validate_design_contract", { projectRef: projectId, includeSchemas: false });
+    return `${mcpResultText(result, 8_000)}\n\n[结构化设计检查；unassessed 不等于通过]\n${mcpResultText(designCheck, 8_000)}\n\n[本轮实时设计依据；已批准与草稿分离]\n${JSON.stringify(buildDesignTurnContext(this.store, projectId, this.activeRuns.get(sessionId)?.pageContext ?? null))}`;
   }
 
   private openDiagram(session: AgentSession, args: Record<string, unknown>): AgentMcpResult {
@@ -948,8 +977,10 @@ export class CodexHarness {
       "你是 ProductDesign 项目工作台中的设计 Agent，不是普通聊天机器人。",
       `当前会话唯一项目 ID: ${session.projectId}。不得访问或修改其他项目。`,
       "你的职责是需求澄清、功能拆分、方案权衡、流程和数据模型设计、一致性检查。禁止代码开发、命令执行、修改源文件、部署、编造测试证据或自行批准。当前工具允许读取设计资料、编辑受控设计画布和数据模型，以及创建待确认的文档草稿；不得代替用户完成批准或验收。文档属于项目，画布、节点、计划、数据库模型和证据通过 DocumentReference 引用固定版本；需要事实时先调用工具，不能凭空声称已完成。",
-      "会话初始化时已注入一次项目 workflow 快照；任务包或该快照是当前上下文真源。不要为每个工具动作重复读取项目、节点或租约。仅在终态流转、LEASE_LOST/TASK_REVISION_DRIFT/POLICY_VERSION_STALE/WORK_ORDER_CONTEXT_INVALID 或明确需要确认修订时刷新 workflow。",
+      "每一轮都重新读取服务端 workflow、当前批准资料、待确认草稿、相关节点、决定与结构化设计检查。旧对话和模型摘要不是最新批准依据。不要为每个工具动作重复读取项目、节点或租约。仅在终态流转、LEASE_LOST/TASK_REVISION_DRIFT/POLICY_VERSION_STALE/WORK_ORDER_CONTEXT_INVALID 或明确需要确认修订时刷新 workflow。",
       "修改画布或数据库模型前先读取当前实体和 updatedAt，写入时携带 expectedUpdatedAt。所有写入必须使用提供的 MCP 工具。",
+      "设计推进顺序是：先区分已确认事实和待澄清假设；关键缺口只问必要问题；给出可比较的方案与代价；按选定方向形成设计草稿；核对覆盖、接口和依赖；针对失败项局部修订。未得到用户确认，不把建议写成已批准决定。",
+      "复用当前已批准的需求基线，先澄清缺口并呈现方案权衡；改动设计后调用 validate_design_contract 核对逐条覆盖、权威 ID/版本、接口和阶段依赖。不把模型自述当作已覆盖；未评估或部分覆盖必须明确报告，不能宣告完成。",
       "如果工作流阻塞，明确说明缺失项和解除条件。不要调用删除、备份恢复、外部数据库部署、LLM 配置或 Agent 会话工具。",
       "用简洁中文报告真实完成结果，并列出创建或更新的实体名称；工具失败时不要伪造成功。",
       workflowContext ? `会话初始化 workflow 快照：\n${workflowContext}` : "",

@@ -1,3 +1,4 @@
+import { CodexRuntimePanel, useCodexRuntime } from "./CodexRuntimePanel";
 import {
   Bot,
   ChevronDown,
@@ -14,7 +15,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent, type ReactElement } from "react";
 import type { AgentApproval, AgentMessage, AgentSession, AgentWorkspaceSnapshot, LlmProfile } from "../../shared/types";
 import { api } from "../api";
-import { DESIGN_SUBSCRIPTION_BLOCKED_MESSAGE, OPEN_DESIGN_ASSISTANT, designRequestText, type DesignAssistantRequest } from "./designAssistant";
+import { OPEN_DESIGN_ASSISTANT, designRequestText, type DesignAssistantRequest } from "./designAssistant";
 import { formatTime } from "../ui";
 import { stableProjectAccent, useWorkspaceContext } from "./workspace";
 import { useAgentUiBridge } from "./agentUiBridge";
@@ -90,6 +91,8 @@ export function AgentDock(): ReactElement {
   const [decidingApprovalId, setDecidingApprovalId] = useState("");
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [configuring, setConfiguring] = useState(false);
+  const configLock = useRef(false);
   const [error, setError] = useState("");
   const messageEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -98,7 +101,9 @@ export function AgentDock(): ReactElement {
   const routeProject = projects.find((item) => item.id === workspace);
   const selectedProfile = profiles.find((item) => item.id === profileId);
   const sessionProfile = profiles.find((item) => item.id === activeSession?.profileId);
-  const subscriptionBlocked = selectedProfile?.protocol === "openai-responses" || sessionProfile?.protocol === "openai-responses" || selectedProfile?.authMode === "chatgpt" || sessionProfile?.authMode === "chatgpt";
+  const usesCodex = selectedProfile?.protocol === "openai-responses" || sessionProfile?.protocol === "openai-responses" || selectedProfile?.authMode === "chatgpt" || sessionProfile?.authMode === "chatgpt";
+  const runtime = useCodexRuntime(open && usesCodex);
+  const subscriptionBlocked = usesCodex && (runtime.checking || runtime.status?.status !== "ready" || Boolean(runtime.error));
   const usableProfiles = profiles.filter((item) => item.enabled);
 
   const loadWorkspace = useCallback(async (targetProjectId: string, keepSession = true) => {
@@ -287,6 +292,7 @@ export function AgentDock(): ReactElement {
       const request = (event as CustomEvent<DesignAssistantRequest>).detail;
       if (!request?.projectId) return;
       setOpen(true); setMinimized(false);
+      if (configLock.current) { setError("模型配置正在保存，请完成后再切换设计项目"); return; }
       if (activeSession?.status === "running" && activeSession.projectId !== request.projectId) {
         setError("另一项目的会话仍在运行，请先结束后再打开此项目的设计助手"); return;
       }
@@ -301,25 +307,37 @@ export function AgentDock(): ReactElement {
   }, [activeSession, input, projectId]);
 
   const changeProfile = async (nextProfileId: string) => {
+    if (configLock.current) return;
     const nextProfile = profiles.find((item) => item.id === nextProfileId);
     if (!nextProfile) return;
-    setProfileId(nextProfileId);
-    setModel(nextProfile.defaultModel);
-    if (activeSession) {
-      try {
-        const next = await api.updateAgentSession(activeSession.id, { profileId: nextProfileId, model: nextProfile.defaultModel });
-        setSnapshot((current) => current ? { ...current, sessions: current.sessions.map((item) => item.id === next.id ? next : item) } : current);
-      } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-    }
+    const previous = { profileId, model };
+    setProfileId(nextProfileId); setModel(nextProfile.defaultModel); setError("");
+    if (!activeSession) return;
+    configLock.current = true; setConfiguring(true);
+    try {
+      const next = await api.updateAgentSession(activeSession.id, { profileId: nextProfileId, model: nextProfile.defaultModel });
+      setSnapshot((current) => current ? { ...current, sessions: current.sessions.map((item) => item.id === next.id ? next : item) } : current);
+      setProfileId(next.profileId); setModel(next.model);
+    } catch (reason) {
+      setProfileId(previous.profileId); setModel(previous.model);
+      setError(`模型配置未保存，已恢复原选择：${reason instanceof Error ? reason.message : String(reason)}`);
+    } finally { configLock.current = false; setConfiguring(false); }
   };
 
   const changeModel = async (nextModel: string) => {
-    setModel(nextModel);
+    if (configLock.current) return;
+    const previousModel = model;
+    setModel(nextModel); setError("");
     if (!activeSession) return;
+    configLock.current = true; setConfiguring(true);
     try {
       const next = await api.updateAgentSession(activeSession.id, { model: nextModel });
       setSnapshot((current) => current ? { ...current, sessions: current.sessions.map((item) => item.id === next.id ? next : item) } : current);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+      setModel(next.model);
+    } catch (reason) {
+      setModel(previousModel);
+      setError(`模型未保存，已恢复原选择：${reason instanceof Error ? reason.message : String(reason)}`);
+    } finally { configLock.current = false; setConfiguring(false); }
   };
 
   const decideApproval = async (approval: AgentApproval, decision: "approve_once" | "deny") => {
@@ -365,8 +383,8 @@ export function AgentDock(): ReactElement {
 
   const sendMessage = async () => {
     const content = input.trim();
-    if (!activeSession || !content || activeSession.status === "running") return;
-    if (subscriptionBlocked) { setError(DESIGN_SUBSCRIPTION_BLOCKED_MESSAGE); return; }
+    if (!activeSession || !content || activeSession.status === "running" || configLock.current) return;
+    if (subscriptionBlocked) { setError(runtime.error || runtime.status?.message || "请先检查设计运行环境"); return; }
     setError("");
     try {
       if (pageContext.projectId && pageContext.projectId !== activeSession.projectId) {
@@ -384,7 +402,7 @@ export function AgentDock(): ReactElement {
   };
 
   const statusLabel = useMemo(() => {
-    if (subscriptionBlocked) return "设计执行未开放";
+    if (subscriptionBlocked) return "运行环境待检查";
     if (!activeSession) return "未创建会话";
     if (activeSession.status === "running") return "运行中";
     if (activeSession.status === "failed") return "运行失败";
@@ -446,7 +464,7 @@ export function AgentDock(): ReactElement {
                   <span>项目工作台</span>
                   <div className="agent-select-wrap">
                     <i style={{ background: projectId ? stableProjectAccent(projectId) : "#698093" }} />
-                    <select value={projectId} onChange={(event) => changeProject(event.target.value)} disabled={activeSession?.status === "running"}>
+                    <select value={projectId} onChange={(event) => changeProject(event.target.value)} disabled={activeSession?.status === "running" || configuring}>
                       <option value="">选择项目</option>
                       {projects.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.code}</option>)}
                     </select>
@@ -457,25 +475,25 @@ export function AgentDock(): ReactElement {
                   <span>会话</span>
                   <div className="agent-session-row">
                     <div className="agent-select-wrap">
-                      <select value={activeSessionId} onChange={(event) => setActiveSessionId(event.target.value)} disabled={!snapshot?.sessions.length}>
+                      <select value={activeSessionId} onChange={(event) => setActiveSessionId(event.target.value)} disabled={!snapshot?.sessions.length || configuring}>
                         {!snapshot?.sessions.length && <option value="">暂无会话</option>}
                         {snapshot?.sessions.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
                       </select>
                       <ChevronDown size={14} />
                     </div>
-                    <button onClick={createSession} title="新建会话" disabled={!projectId || !profileId || loading}><MessageSquarePlus size={17} /></button>
-                    <button onClick={deleteSession} title={activeSession?.status === "running" ? "终止并删除会话" : "删除会话"} disabled={!activeSession || loading}><Trash2 size={16} /></button>
+                    <button onClick={createSession} title="新建会话" disabled={!projectId || !profileId || loading || configuring}><MessageSquarePlus size={17} /></button>
+                    <button onClick={deleteSession} title={activeSession?.status === "running" ? "终止并删除会话" : "删除会话"} disabled={!activeSession || loading || configuring}><Trash2 size={16} /></button>
                   </div>
                 </label>
               </div>
 
               <div className="agent-runtime-bar">
                 <div className="agent-runtime-selects">
-                  <select value={profileId} onChange={(event) => void changeProfile(event.target.value)} disabled={activeSession?.status === "running"}>
+                  <select aria-label="模型配置" value={profileId} onChange={(event) => void changeProfile(event.target.value)} disabled={activeSession?.status === "running" || configuring}>
                     <option value="">选择 LLM 配置</option>
                     {usableProfiles.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.protocol}</option>)}
                   </select>
-                  <select value={model} onChange={(event) => void changeModel(event.target.value)} disabled={!selectedProfile || activeSession?.status === "running"}>
+                  <select aria-label="当前模型" value={model} onChange={(event) => void changeModel(event.target.value)} disabled={!selectedProfile || activeSession?.status === "running" || configuring}>
                     {(selectedProfile?.models ?? []).map((item) => <option key={item} value={item}>{item}</option>)}
                   </select>
                   <span className="cell-sub">仅产品设计</span>
@@ -488,7 +506,7 @@ export function AgentDock(): ReactElement {
               )}
               {error && <div className="agent-error">{error}</div>}
 
-              {subscriptionBlocked ? <div className="agent-error">{DESIGN_SUBSCRIPTION_BLOCKED_MESSAGE}</div> : <div className="agent-control-note">API Key 设计请求由对应 API 提供方独立计费，不使用 ChatGPT 订阅额度。</div>}
+              {usesCodex ? <CodexRuntimePanel runtime={runtime} /> : <div className="agent-control-note">API Key 设计请求由对应 API 提供方独立计费，不使用 ChatGPT 订阅额度。</div>}
               <div className="agent-control-note"><Shield size={14} />仅生成和修改项目设计资料，不执行命令、不写目标项目源码。设计结论交给你确认。</div>
 
               <div className="agent-message-list">
@@ -544,7 +562,7 @@ export function AgentDock(): ReactElement {
                     placeholder="描述设计目标或修改意见，Enter 发送，Shift+Enter 换行"
                     disabled={!activeSession || activeSession.status === "running"}
                   />
-                  <button onClick={() => void sendMessage()} disabled={!activeSession || !input.trim() || activeSession.status === "running" || subscriptionBlocked} aria-label="发送"><Send size={18} /></button>
+                  <button onClick={() => void sendMessage()} disabled={!activeSession || !input.trim() || activeSession.status === "running" || subscriptionBlocked || configuring} aria-label="发送"><Send size={18} /></button>
                 </div>
               </div>
             </>

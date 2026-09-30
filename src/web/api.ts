@@ -1,4 +1,7 @@
+import type { DesignContractReport } from "../shared/designContract";
 import type {
+  AgentTaskRetryCandidate,
+  AgentTaskRetryRequestResult,
   CodexAccountStatus,
   CodexLoginStart,
   CodexModel,
@@ -230,6 +233,8 @@ export const api = {
   dashboard: () => request<DashboardData>("GET", "/api/dashboard"),
   storageRetention: () => request<StorageRetentionSummary>("GET", "/api/storage-retention"),
 
+  getCodexRuntime: () => request<CodexRuntimeStatus>("GET", "/api/codex/runtime"),
+  checkCodexRuntime: () => request<CodexRuntimeStatus>("POST", "/api/codex/runtime/check", {}),
   getCodexAccount: () => request<CodexAccountStatus>("GET", "/api/codex/account", undefined, { "x-productdesign-local-auth": "1" }),
   listCodexModels: () => request<{ models: CodexModel[] }>("GET", "/api/codex/models", undefined, { "x-productdesign-local-auth": "1" }),
   startCodexLogin: (type: "chatgpt" | "chatgptDeviceCode") => request<CodexLoginStart>("POST", "/api/codex/login", { type }, { "x-productdesign-local-auth": "1" }),
@@ -269,6 +274,7 @@ export const api = {
 
   getProject: (id: string) => request<Project>("GET", `/api/projects/${id}`),
   getProjectWorkspace: (id: string) => request<ProjectWorkspace>("GET", `/api/projects/${id}/workspace`),
+  getDesignContractValidation: (id: string, planId?: string) => request<DesignContractReport>("GET", `/api/projects/${id}/design-contract-validation${qs({ planId })}`),
   getProjectWorkflow: (id: string) => request<ProjectWorkflow>("GET", `/api/projects/${id}/workflow`),
   listDesignChangeRecoveries: (id: string) => request<DesignChangeRecovery[]>("GET", `/api/projects/${id}/design-change-recoveries`),
   submitDesignChangeIntent: (id: string, body: Omit<DesignChangeIntentInput, "projectId"> & { correctsChangeId?: string }) => request<DesignChangeIntentResult>("POST", `/api/projects/${id}/design-change-intents`, body),
@@ -286,6 +292,8 @@ export const api = {
   updateAgentTaskCapacity: (id: string, patch: Partial<Omit<AgentTaskCapacity, "projectId" | "updatedAt">>) =>
     request<AgentTaskCapacity>("PATCH", `/api/projects/${id}/agent-task-capacity`, patch),
   listAgentRunners: (id: string) => request<AgentRunnerRegistration[]>("GET", `/api/projects/${id}/agent-runners`),
+  listAgentTaskRetryCandidates: (id: string) => request<AgentTaskRetryCandidate[]>("GET", `/api/projects/${id}/agent-task-retry-candidates`),
+  requestAgentTaskRetry: (id: string, body: { taskKey: string; taskRevision: string; failedWorkOrderId: string; expectedAttempt: number; reason: string; remediation: string; idempotencyKey: string }) => request<AgentTaskRetryRequestResult>("POST", `/api/projects/${id}/agent-task-retry-requests`, body),
   listAgentTaskLeases: (id: string) => request<AgentTaskLeaseRecord[]>("GET", `/api/projects/${id}/agent-task-leases`),
   releaseAgentTaskManually: (projectId: string, workOrderId: string, reason: string) =>
     request<AgentTaskLeaseRecord>("POST", `/api/projects/${projectId}/agent-task-leases/${encodeURIComponent(workOrderId)}/release`, { reason }),
@@ -441,3 +449,11 @@ export const api = {
   restoreBackup: (id: string, confirmation: string) =>
     request<{ ok: boolean; backup: Backup; restored: Record<string, number> }>("POST", `/api/backups/${id}/restore`, { confirmation }),
 };
+
+export interface CodexRuntimeStatus {
+  status: "unchecked" | "ready" | "unavailable";
+  message: string;
+  code?: string;
+  version?: string;
+  checkedAt?: string;
+}

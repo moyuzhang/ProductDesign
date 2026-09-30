@@ -62,3 +62,13 @@ describe("project creation handoff", () => {
     expect(mocks.navigate).not.toHaveBeenCalled();
   });
 });
+
+it("does not let a slow older search overwrite the latest result or error state", async () => {
+  let oldResolve!: (value: unknown) => void;
+  mocks.pageProjects.mockReturnValueOnce(new Promise((done) => { oldResolve = done; })).mockResolvedValueOnce({ items: [], total: 0 });
+  await fill('input[placeholder="搜索名称 / 编号 / 摘要"]', "old");
+  await fill('input[placeholder="搜索名称 / 编号 / 摘要"]', "new");
+  expect(container.textContent).toContain("没有符合筛选的项目");
+  await act(async () => oldResolve({ items: [{ id: "old", name: "过期查询结果", code: "OLD", stage: "设计", health: "正常", progress: 0, riskLevel: "P2", dueAt: "", updatedAt: "2026-09-30T00:00:00Z" }], total: 1 }));
+  expect(container.textContent).not.toContain("过期查询结果"); expect(container.textContent).toContain("没有符合筛选的项目");
+});

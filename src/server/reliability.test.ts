@@ -1,3 +1,4 @@
+import { DESIGN_CODEX_CONFIG } from "./codexDesignRuntime.js";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -73,13 +74,14 @@ function harnessFixture(resume = true) {
   const store = {
     getAgentSession: vi.fn(() => session), getProject: vi.fn(() => ({ ...projectInput, id: "project" })),
     getLlmProfile: vi.fn(() => ({ id: "profile", enabled: true, credentialConfigured: true, protocol: "openai-responses", timeoutMs: 1000, apiKeyEnv: "TEST_ONLY_KEY", baseUrl: "https://example.test" })),
+    listDesignDocs: vi.fn(() => []), listDiagrams: vi.fn(() => []), listGovernance: vi.fn(() => []),
     listAgentMessages: vi.fn(() => []), resolveLlmKey: vi.fn(() => undefined),
     updateAgentSession: vi.fn((_id, patch) => Object.assign(session, patch)),
     updateAgentMessage: vi.fn((_id, patch) => patch), listAgentApprovals: vi.fn(() => []),
   };
   const mcp = { listAgentTools: vi.fn(async () => [] as Array<{ name: string; inputSchema: Record<string, unknown> }>), callTool: vi.fn(async () => ({ content: [{ type: "text", text: "fixture workflow" }] })), close: vi.fn(async () => {}) };
   vi.spyOn(LocalMcpClient, "connect").mockResolvedValue(mcp as unknown as LocalMcpClient);
-  return { store, mcp, session, harness: new CodexHarness(store as unknown as Store, dir, () => ({} as McpServer)) };
+  return { store, mcp, session, harness: new CodexHarness(store as unknown as Store, dir, () => ({} as McpServer), undefined, { ensure: async () => {} }) };
 }
 function fakeChild(respond: (method: string) => Record<string, unknown> | undefined) {
   const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), exitCode: null as number | null, kill: vi.fn() });
@@ -89,7 +91,8 @@ function fakeChild(respond: (method: string) => Record<string, unknown> | undefi
   child.stdin.on("data", (data: Buffer) => {
     const request = JSON.parse(data.toString()); methods.push(request.method); requests.push(request);
     if (!request.id) return;
-    const response = respond(request.method);
+    const response = request.method === "config/read" ? { result: { config: DESIGN_CODEX_CONFIG } } : respond(request.method);
+    if (response?.result && typeof response.result === "object" && "thread" in response.result) Object.assign(response.result, { approvalPolicy: "never", sandbox: { type: "readOnly", networkAccess: false } });
     if (response) queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: request.id, ...response })}\n`));
   });
   spawn.mockReturnValue(child);

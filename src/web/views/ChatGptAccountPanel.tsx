@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactElement } from "rea
 import type { CodexAccountStatus, CodexLoginStart, CodexModel } from "../../shared/types";
 import { api } from "../api";
 import { ErrorBanner } from "../ui";
-import { DESIGN_SUBSCRIPTION_BLOCKED_MESSAGE } from "./designAssistant";
+
 
 export type AccountModel = CodexModel;
 
@@ -92,7 +92,7 @@ export function ChatGptAccountPanel(props: {
 
   return <section className="chatgpt-account-panel panel" aria-label="ChatGPT 账户登录">
     <h2>ChatGPT 账户登录</h2>
-    <p className="error-banner">{DESIGN_SUBSCRIPTION_BLOCKED_MESSAGE} 如主动选择 API Key 设计通道，将由对应 API 独立计费。</p>
+
     <p>供本机个人使用，通过官方 Codex 登录使用符合条件的订阅。账户共享于本机 ProductDesign 的 ChatGPT 配置；可用模型与额度取决于账户权限。</p>
     <p role="status">{account?.status === "signed-in" ? `已登录${account.email ? ` · ${account.email}` : ""}${account.planType ? ` · ${account.planType}` : ""}` : account ? "未登录" : error ? "账户状态未知" : "正在读取账户状态…"}</p>
     {error ? <ErrorBanner message={error} /> : null}
