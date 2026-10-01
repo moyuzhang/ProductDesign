@@ -1,3 +1,6 @@
+import { externalWorkspaceSchema, sameExternalWorkspace } from "./externalWorkspace.js";
+import { assertExternalWorkspaceClaim } from "./agentTaskLeases.js";
+import type { ExternalWorkspaceBinding } from "../shared/types.js";
 import { createHash, randomUUID } from "node:crypto";
 import type {
   AgentBlueprintKey,
@@ -230,6 +233,16 @@ export function ensureCoordinationLeaseSchema(store: Store): void {
       response_json TEXT NOT NULL,
       created_at TEXT NOT NULL,
       PRIMARY KEY (operation, idempotency_key)
+    );
+    CREATE TABLE IF NOT EXISTS agent_child_dispatch_receipts (
+      operation TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      coordination_lease_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      dispatch_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (operation, project_id, coordination_lease_id, idempotency_key)
     );
     CREATE TABLE IF NOT EXISTS agent_child_task_dispatches (
       dispatch_id TEXT PRIMARY KEY,
@@ -567,7 +580,7 @@ export function listCoordinationLeases(store: Store, projectId: string): Array<O
     .map((row) => ({ ...mapLease(row, false), leaseToken: undefined } as Omit<AgentCoordinationLease, "leaseToken">));
 }
 
-function expectedChild(store: Store, parent: CoordinationLeaseRow, taskId: string, taskKey: string | undefined, role: Exclude<AgentBlueprintKey, "approver">): { taskKey: string; taskRevision: string; taskId: string; planId: string; poolId: string; agentId: string; workScopes: string[] } {
+function expectedChild(store: Store, parent: CoordinationLeaseRow, taskId: string, taskKey: string | undefined, role: Exclude<AgentBlueprintKey, "approver">, allowOwnedLease = false): { taskKey: string; taskRevision: string; taskId: string; planId: string; poolId: string; agentId: string; workScopes: string[] } {
   const queue = QUEUE_BY_STAGE[parent.stage];
   if (!queue || CHILD_ROLE_BY_STAGE[parent.stage] !== role) {
     throw new CoordinationLeaseError(409, "STAGE_ACTION_FORBIDDEN", `阶段 ${parent.stage} 不能派发 ${role}`);
@@ -595,7 +608,7 @@ function expectedChild(store: Store, parent: CoordinationLeaseRow, taskId: strin
     || (parent.stage === "implementation" && task.deliveryTrack !== "implementation")) {
     throw new CoordinationLeaseError(409, "STAGE_TASK_MISMATCH", "任务线路与当前协调阶段不匹配");
   }
-  if (!task.available) throw new CoordinationLeaseError(409, "CHILD_TASK_NOT_AVAILABLE", task.availabilityReason || "任务当前不可派发");
+  if (!allowOwnedLease && !task.available) throw new CoordinationLeaseError(409, "CHILD_TASK_NOT_AVAILABLE", task.availabilityReason || "任务当前不可派发");
   return {
     taskKey: task.taskKey,
     taskRevision: task.taskRevision,
@@ -608,6 +621,8 @@ function expectedChild(store: Store, parent: CoordinationLeaseRow, taskId: strin
 }
 
 export interface DispatchChildTaskInput {
+  /** Optional retry key, scoped to this operation, project and parent lease. */
+  idempotencyKey?: string;
   projectId: string;
   coordinationLeaseId: string;
   leaseToken: string;
@@ -620,9 +635,76 @@ export interface DispatchChildTaskInput {
   poolId?: string;
 }
 
+type ReassignChildTaskInput = DispatchChildTaskInput & { dispatchId: string; reason?: string };
+
+function dispatchParent(store: Store, input: DispatchChildTaskInput): CoordinationLeaseRow {
+  // Parent bearer identity, credential audience and live session binding must be
+  // checked before even looking up a receipt (including conflicting requests).
+  const parent = activeParent(store, input.projectId, input.coordinationLeaseId, input.leaseToken, input.mainAgentId);
+  if (!parent.target_plan_id && !parent.target_task_key) throw new CoordinationLeaseError(409, "COORDINATION_TARGET_INVALID", "父协调租约未绑定有效目标，请重新领取");
+  if (parent.status !== "active") throw new CoordinationLeaseError(409, "COORDINATION_PAUSED", "父协调租约已暂停");
+  return parent;
+}
+
+function replayChildDispatch(store: Store, parent: CoordinationLeaseRow, dispatchId: string): AgentChildTaskDispatch {
+  const read = () => store.db.prepare("SELECT * FROM agent_child_task_dispatches WHERE dispatch_id=? AND project_id=? AND coordination_lease_id=?")
+    .get(dispatchId, parent.project_id, parent.id) as DispatchRow | undefined;
+  let row = read();
+  const lost = () => new CoordinationLeaseError(409, "DISPATCH_LOST", "原子任务派发或租约已失效；不能重放为可执行授权");
+  if (!row || !ACTIVE_CHILD_STATUSES.includes(row.status) || row.stage !== parent.stage) throw lost();
+  // The task must still exist at the same revision, stage and assignment. An
+  // owned active lease makes the task unavailable to NEW claims, not to replay.
+  const expected = expectedChild(store, parent, row.task_id, row.task_key, row.role, Boolean(row.child_work_order_id));
+  // Queue inspection may sweep expired child leases. Never trust the row read
+  // before that sweep, nor the dispatch status when the child state lags it.
+  row = read();
+  if (!row || !ACTIVE_CHILD_STATUSES.includes(row.status) || expected.taskKey !== row.task_key
+    || expected.taskRevision !== row.task_revision
+    || normalizeAgentId(expected.agentId) !== normalizeAgentId(row.agent_id)
+    || expected.poolId !== row.pool_id) throw lost();
+  if (row.child_work_order_id) {
+    const child = getAgentTaskLeaseByWorkOrder(store, row.child_work_order_id);
+    if (!child || !["claimed", "running"].includes(child.status) || child.leaseExpiresAt <= now()
+      || child.coordinationDispatchId !== row.dispatch_id || child.projectId !== row.project_id
+      || child.taskId !== row.task_id || child.taskKey !== row.task_key || child.taskRevision !== row.task_revision
+      || child.role !== row.role || child.agentId !== row.agent_id || child.workerId !== row.worker_id
+      || child.poolId !== row.pool_id) throw lost();
+  } else if (row.status !== "dispatched") throw lost();
+  return mapDispatch(row);
+}
+
+function withDispatchReceipt(store: Store, operation: "dispatch" | "reassign", input: DispatchChildTaskInput | ReassignChildTaskInput,
+  mutate: () => AgentChildTaskDispatch): AgentChildTaskDispatch {
+  const parent = dispatchParent(store, input);
+  if (input.idempotencyKey === undefined) return mutate();
+  const key = input.idempotencyKey.trim();
+  if (!key || key.length > 300) throw new CoordinationLeaseError(400, "INVALID_IDEMPOTENCY_KEY", "idempotencyKey 必须是 1-300 字符");
+  // Explicit fixed-order intent fields avoid object ordering and transport-only
+  // fields. Neither parent bearer tokens nor auth session tokens are persisted.
+  const reassignment = operation === "reassign" ? input as ReassignChildTaskInput : undefined;
+  const hash = requestHash({
+    ...(reassignment ? { dispatchId: reassignment.dispatchId.trim(), reason: reassignment.reason?.trim() || "reassigned_by_main_agent" }
+      : { taskId: input.taskId.trim(), taskKey: input.taskKey?.trim() || "" }),
+    role: input.role, agentId: input.agentId?.trim() || "", workerId: input.workerId?.trim() || "", poolId: input.poolId?.trim() || "",
+  });
+  const scope = [operation, input.projectId, parent.id, key];
+  const receipt = store.db.prepare(`SELECT request_hash, dispatch_id FROM agent_child_dispatch_receipts
+    WHERE operation=? AND project_id=? AND coordination_lease_id=? AND idempotency_key=?`)
+    .get(...scope) as { request_hash: string; dispatch_id: string } | undefined;
+  if (receipt) {
+    if (receipt.request_hash !== hash) throw new CoordinationLeaseError(409, "IDEMPOTENCY_CONFLICT", "同一 idempotencyKey 不能用于不同派发请求");
+    return replayChildDispatch(store, parent, receipt.dispatch_id);
+  }
+  const result = mutate();
+  store.db.prepare(`INSERT INTO agent_child_dispatch_receipts
+    (operation,project_id,coordination_lease_id,idempotency_key,request_hash,dispatch_id,created_at) VALUES (?,?,?,?,?,?,?)`)
+    .run(...scope, hash, result.dispatchId, now());
+  return result;
+}
+
 export function dispatchChildTask(store: Store, input: DispatchChildTaskInput): AgentChildTaskDispatch {
   ensureCoordinationLeaseSchema(store);
-  return coordinationTransaction(store, input.projectId, () => dispatchChildTaskInTransaction(store, input));
+  return coordinationTransaction(store, input.projectId, () => withDispatchReceipt(store, "dispatch", input, () => dispatchChildTaskInTransaction(store, input)));
 }
 
 function dispatchChildTaskInTransaction(store: Store, input: DispatchChildTaskInput): AgentChildTaskDispatch {
@@ -701,7 +783,7 @@ export function reclaimChildTask(store: Store, input: { projectId: string; coord
 
 export function reassignChildTask(store: Store, input: DispatchChildTaskInput & { dispatchId: string; reason?: string }): AgentChildTaskDispatch {
   ensureCoordinationLeaseSchema(store);
-  return coordinationTransaction(store, input.projectId, () => reassignChildTaskInTransaction(store, input));
+  return coordinationTransaction(store, input.projectId, () => withDispatchReceipt(store, "reassign", input, () => reassignChildTaskInTransaction(store, input)));
 }
 
 function reassignChildTaskInTransaction(store: Store, input: DispatchChildTaskInput & { dispatchId: string; reason?: string }): AgentChildTaskDispatch {
@@ -710,7 +792,8 @@ function reassignChildTaskInTransaction(store: Store, input: DispatchChildTaskIn
     .get(input.dispatchId, parent.id) as DispatchRow | undefined;
   if (!existing || !ACTIVE_CHILD_STATUSES.includes(existing.status)) throw new CoordinationLeaseError(409, "DISPATCH_NOT_ACTIVE", "子任务派发已结束");
   reclaimChildren(store, parent.id, input.reason?.trim() || "reassigned_by_main_agent", existing.dispatch_id);
-  const next = dispatchChildTask(store, { ...input, taskId: existing.task_id, taskKey: existing.task_key, role: existing.role });
+  // Internal mutation deliberately does not create a second dispatch receipt.
+  const next = dispatchChildTaskInTransaction(store, { ...input, taskId: existing.task_id, taskKey: existing.task_key, role: existing.role });
   store.db.prepare("UPDATE agent_child_task_dispatches SET dispatch_version=?, status='dispatched' WHERE dispatch_id=?")
     .run(existing.dispatch_version + 1, next.dispatchId);
   return mapDispatch(store.db.prepare("SELECT * FROM agent_child_task_dispatches WHERE dispatch_id=?").get(next.dispatchId) as DispatchRow);
@@ -773,6 +856,8 @@ export function listChildTaskDispatches(store: Store, projectId: string, coordin
 }
 
 export interface ClaimDispatchedChildTaskInput {
+  externalWorkspace?: ExternalWorkspaceBinding;
+  authSessionToken?: string;
   projectId: string;
   dispatchId: string;
   agentId: string;
@@ -786,6 +871,10 @@ export interface ClaimDispatchedChildTaskInput {
 }
 
 export function claimDispatchedChildTask(store: Store, input: ClaimDispatchedChildTaskInput): string {
+  return store.db.transaction(() => claimDispatchedChildTaskAtomic(store, input)).immediate();
+}
+
+function claimDispatchedChildTaskAtomic(store: Store, input: ClaimDispatchedChildTaskInput): string {
   ensureCoordinationLeaseSchema(store);
   expireCoordinationLeases(store, input.projectId);
   const dispatch = store.db.prepare("SELECT d.*, c.status AS parent_status, c.lease_expires_at AS parent_expires FROM agent_child_task_dispatches d JOIN agent_coordination_leases c ON c.id=d.coordination_lease_id WHERE d.dispatch_id=? AND d.project_id=?")
@@ -797,9 +886,12 @@ export function claimDispatchedChildTask(store: Store, input: ClaimDispatchedChi
   if (dispatch.agent_id !== input.agentId || dispatch.worker_id !== input.workerId) {
     throw new CoordinationLeaseError(409, "CHILD_IDENTITY_MISMATCH", "只能由 Main Agent 派发的精确子 Agent/workerId 领取");
   }
+  assertExternalWorkspaceClaim(store, { ...input, role: dispatch.role });
   if (dispatch.status !== "dispatched" && dispatch.child_work_order_id) {
     const current = getAgentTaskLeaseByWorkOrder(store, dispatch.child_work_order_id);
     if (current && ["claimed", "running"].includes(current.status)) {
+      if (input.externalWorkspace && !sameExternalWorkspace(externalWorkspaceSchema.parse(input.externalWorkspace), current.externalWorkspace))
+        throw new CoordinationLeaseError(409, "EXTERNAL_WORKSPACE_IMMUTABLE", "原派发领取已固定外部工作区，不允许重试时更换");
       const snapshot = buildAgentOrchestration(store, input.projectId, true);
       if (!snapshot) throw new CoordinationLeaseError(404, "PROJECT_NOT_FOUND", "项目不存在");
       return JSON.stringify(buildAgentTaskPackage(store, input.projectId, {
@@ -811,6 +903,7 @@ export function claimDispatchedChildTask(store: Store, input: ClaimDispatchedChi
     }
   }
   const leaseInput: ClaimAgentTaskInput = {
+    externalWorkspace: input.externalWorkspace, authSessionToken: input.authSessionToken,
     projectId: input.projectId, taskId: dispatch.task_id, taskKey: dispatch.task_key, role: dispatch.role,
     agentId: input.agentId, workerId: input.workerId, poolId: input.poolId || dispatch.pool_id,
     sessionId: input.sessionId, runId: input.runId, capabilities: input.capabilities, leaseSeconds: input.leaseSeconds,

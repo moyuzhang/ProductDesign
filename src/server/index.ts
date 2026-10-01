@@ -1,3 +1,6 @@
+import { CodexDesignRuntime } from "./codexDesignRuntime.js";
+import { CodexAccount } from "./codexAccount.js";
+import { EventStreams } from "./eventStreams.js";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -30,7 +33,7 @@ function toWebHeaders(headers: Record<string, string | string[] | undefined>): H
   return h;
 }
 
-async function handleMcpRequest(handler: McpHttpHandler, request: FastifyRequest, reply: FastifyReply): Promise<void> {
+async function handleMcpRequest(handler: McpHttpHandler, request: FastifyRequest, reply: FastifyReply, eventStreams: EventStreams): Promise<void> {
   const url = `http://${request.headers.host ?? "127.0.0.1:4310"}${request.url}`;
   const init: RequestInit = {
     method: request.method,
@@ -45,7 +48,10 @@ async function handleMcpRequest(handler: McpHttpHandler, request: FastifyRequest
     reply.hijack();
     reply.raw.statusCode = webResponse.status;
     webResponse.headers.forEach((value, key) => reply.raw.setHeader(key, value));
-    Readable.fromWeb(webResponse.body as unknown as ReadableStream<Uint8Array>).pipe(reply.raw);
+    const stream = Readable.fromWeb(webResponse.body as unknown as ReadableStream<Uint8Array>);
+    stream.on("error", () => reply.raw.destroy());
+    stream.pipe(reply.raw);
+    eventStreams.track(reply.raw, () => stream.destroy());
     return;
   }
   const body = webResponse.body ? Buffer.from(await webResponse.arrayBuffer()) : undefined;
@@ -59,17 +65,20 @@ export function buildApp(options: BuildOptions = {}) {
   const dataDir = options.dataDir ?? resolve("data");
   const store = new Store(dbPath, dataDir);
   const agentUiEvents = new AgentUiEventBus();
+  const eventStreams = new EventStreams();
+  const codexAccount = new CodexAccount(dataDir);
+  const codexRuntime = new CodexDesignRuntime();
   let harness: CodexHarness;
-  harness = new CodexHarness(store, dataDir, () => createMcpServer({ store, dbPath, dataDir, harness, trustedInternal: true }), agentUiEvents);
+  harness = new CodexHarness(store, dataDir, () => createMcpServer({ store, dbPath, dataDir, harness, trustedInternal: true }), agentUiEvents, codexRuntime);
   syncManagedProjectStorage(store, dataDir);
   reconcilePlanDeliveryProjections(store);
   const app = Fastify({ logger: options.logger ?? false });
-  registerApi(app, { store, dataDir, harness, agentUiEvents, trustedInternal: options.trustedInternalApi });
+  registerApi(app, { store, dataDir, harness, agentUiEvents, eventStreams, codexAccount, codexRuntime, trustedInternal: options.trustedInternalApi });
 
   const mcpHandler = createMcpHandler(() => createMcpServer({ store, dbPath, dataDir, harness }));
   app.all("/mcp", async (request, reply) => {
     try {
-      await handleMcpRequest(mcpHandler, request, reply);
+      await handleMcpRequest(mcpHandler, request, reply, eventStreams);
     } catch (error) {
       request.log.error({ err: error, method: request.method, url: request.url }, "MCP request failed");
       if (!reply.sent) reply.code(500).send({ message: "MCP 处理失败" });
@@ -91,8 +100,13 @@ export function buildApp(options: BuildOptions = {}) {
     });
   }
 
+  app.addHook("preClose", async () => {
+    eventStreams.close();
+    await harness.close();
+  });
   app.addHook("onClose", async () => {
-    harness.close();
+    await harness.close();
+    await codexAccount.close();
     store.close();
   });
   return app;
@@ -108,6 +122,17 @@ if (isDirectRun) {
   void (async () => {
     try {
       const app = buildApp({ logger: true });
+      let shuttingDown = false;
+      const shutdown = () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        void app.close().catch((error: unknown) => {
+          console.error("[pcs] 关闭失败:", error);
+          process.exitCode = 1;
+        });
+      };
+      process.once("SIGINT", shutdown);
+      process.once("SIGTERM", shutdown);
       await app.listen({ port, host });
       console.log(`[pcs] API 已启动: http://${host}:${port} (数据库: data/control-surface.db)`);
     } catch (error) {

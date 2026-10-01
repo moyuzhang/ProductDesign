@@ -1,3 +1,4 @@
+import { migrateDesignChangeLineage } from "./designChangeLineage.js";
 import Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
@@ -81,6 +82,28 @@ export class DiagramTemplateRevisionConflictError extends Error {
   constructor(message: string, readonly serverUpdatedAt: string | null) { super(message); }
 }
 export class DiagramTemplateRevokedError extends Error {}
+export class ProjectRepositoryError extends Error {
+  constructor(readonly statusCode: number, readonly code: string, message: string) { super(message); }
+}
+
+/** Repository identities are labels only: never resolve them as URLs or filesystem paths. */
+export function normalizeExternalRepositoryId(value: unknown): string {
+  if (value === undefined) return "";
+  if (typeof value !== "string") {
+    throw new ProjectRepositoryError(400, "EXTERNAL_REPOSITORY_ID_INVALID", "externalRepositoryId 必须是字符串");
+  }
+  const normalized = value.trim();
+  if (normalized.length > 500 || !/^(?:[A-Za-z0-9][A-Za-z0-9._:/@-]*)?$/.test(normalized)) {
+    throw new ProjectRepositoryError(400, "EXTERNAL_REPOSITORY_ID_INVALID", "externalRepositoryId 必须为空或不超过 500 字符的安全仓库标识");
+  }
+  return normalized;
+}
+
+function assertProjectRepositoryMode(repositoryPath: string, externalRepositoryId: string): void {
+  if (repositoryPath && externalRepositoryId) {
+    throw new ProjectRepositoryError(400, "PROJECT_REPOSITORY_MODE_CONFLICT", "repositoryPath 与 externalRepositoryId 不能同时设置");
+  }
+}
 
 /**
  * 子画布镜像根节点索引：diagramId → 指向该画布的父节点标签集合。
@@ -145,7 +168,7 @@ export interface DesignDocPageQuery {
 interface ProjectRow {
   id: string; code: string; name: string; summary: string; stage: string; health: string;
   progress: number; risk_level: string; risk_summary: string; blocker_summary: string;
-  next_step: string; repository_path: string; start_at: string; due_at: string;
+  next_step: string; repository_path: string; external_repository_id: string; start_at: string; due_at: string;
   created_at: string; updated_at: string;
 }
 
@@ -254,7 +277,7 @@ interface NodeDatabaseBindingRow {
 }
 
 interface LlmProfileRow {
-  id: string; name: string; provider: string; protocol: string; base_url: string;
+  id: string; name: string; provider: string; protocol: string; base_url: string; auth_mode: string;
   api_key_env: string; models: string; default_model: string; enabled: number;
   reasoning_effort: string; timeout_ms: number; created_at: string; updated_at: string;
 }
@@ -298,7 +321,7 @@ function mapProject(r: ProjectRow): Project {
     stage: r.stage as Project["stage"], health: r.health as Project["health"],
     progress: r.progress, riskLevel: r.risk_level as Project["riskLevel"],
     riskSummary: r.risk_summary, blockerSummary: r.blocker_summary, nextStep: r.next_step,
-    repositoryPath: r.repository_path, startAt: r.start_at, dueAt: r.due_at,
+    repositoryPath: r.repository_path, externalRepositoryId: r.external_repository_id ?? "", startAt: r.start_at, dueAt: r.due_at,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -404,6 +427,7 @@ function mapLlmProfile(r: LlmProfileRow, credentials: LlmCredentialVault): LlmPr
     id: r.id,
     name: r.name,
     provider: r.provider,
+    authMode: r.auth_mode === "chatgpt" ? "chatgpt" : "api-key",
     protocol: r.protocol as LlmProfile["protocol"],
     baseUrl: r.base_url,
     apiKeyEnv: r.api_key_env,
@@ -800,6 +824,10 @@ export class Store {
     this.db = new Database(filePath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
+    const projectColumns = this.db.prepare("PRAGMA table_info(projects)").all() as Array<{ name: string }>;
+    if (!projectColumns.some((column) => column.name === "external_repository_id")) {
+      this.db.exec("ALTER TABLE projects ADD COLUMN external_repository_id TEXT NOT NULL DEFAULT ''");
+    }
     ensureAgentSecuritySchema(this);
     try { this.db.exec("ALTER TABLE diagrams ADD COLUMN groups TEXT NOT NULL DEFAULT '[]'"); } catch { /* column exists */ }
     try { this.db.exec("ALTER TABLE diagrams ADD COLUMN type TEXT NOT NULL DEFAULT 'free'"); } catch { /* column exists */ }
@@ -851,6 +879,7 @@ export class Store {
     try { this.db.exec("ALTER TABLE agent_sessions ADD COLUMN control_mode TEXT NOT NULL DEFAULT 'restricted'"); } catch { /* column exists */ }
     try { this.db.exec("ALTER TABLE diagrams ADD COLUMN layers TEXT"); } catch { /* column exists */ }
     try { this.db.exec("ALTER TABLE diagrams ADD COLUMN components TEXT"); } catch { /* column exists */ }
+    try { this.db.exec("ALTER TABLE llm_profiles ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'api-key'"); } catch { /* column exists */ }
     let addedReasoningEffort = false;
     try {
       this.db.exec("ALTER TABLE llm_profiles ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'none'");
@@ -867,6 +896,7 @@ export class Store {
     this.migrateDocumentReferences();
     this.repairDuplicateProjectDocumentReferences();
     this.ensureAllProjectsHaveMainDiagrams();
+    migrateDesignChangeLineage(this);
   }
 
   private migratePlanRoleAssignments(): void {
@@ -1154,20 +1184,22 @@ export class Store {
   }
 
   insertProject(input: Omit<Project, "id" | "createdAt" | "updatedAt"> & { id?: string }): Project {
+    const externalRepositoryId = normalizeExternalRepositoryId(input.externalRepositoryId);
+    assertProjectRepositoryMode(input.repositoryPath, externalRepositoryId);
     const ts = nowIso();
     const row: ProjectRow = {
       id: input.id ?? newId(), code: input.code, name: input.name, summary: input.summary,
       stage: input.stage, health: input.health, progress: input.progress,
       risk_level: input.riskLevel, risk_summary: input.riskSummary,
       blocker_summary: input.blockerSummary, next_step: input.nextStep,
-      repository_path: input.repositoryPath, start_at: input.startAt, due_at: input.dueAt,
+      repository_path: input.repositoryPath, external_repository_id: externalRepositoryId, start_at: input.startAt, due_at: input.dueAt,
       created_at: ts, updated_at: ts,
     };
     this.db.prepare(
       `INSERT INTO projects (id, code, name, summary, stage, health, progress, risk_level,
-        risk_summary, blocker_summary, next_step, repository_path, start_at, due_at, created_at, updated_at)
+        risk_summary, blocker_summary, next_step, repository_path, external_repository_id, start_at, due_at, created_at, updated_at)
        VALUES (@id, @code, @name, @summary, @stage, @health, @progress, @risk_level,
-        @risk_summary, @blocker_summary, @next_step, @repository_path, @start_at, @due_at, @created_at, @updated_at)`
+        @risk_summary, @blocker_summary, @next_step, @repository_path, @external_repository_id, @start_at, @due_at, @created_at, @updated_at)`
     ).run(row);
     const project = mapProject(row);
     this.ensureProjectMainDiagram(project);
@@ -1175,16 +1207,31 @@ export class Store {
   }
 
   updateProject(id: string, patch: Partial<Project>): Project | undefined {
-    const current = this.getProject(id);
-    if (!current) return undefined;
-    const next: Project = { ...current, ...patch, id: current.id, createdAt: current.createdAt, updatedAt: nowIso() };
-    this.db.prepare(
-      `UPDATE projects SET code=@code, name=@name, summary=@summary, stage=@stage, health=@health,
-        progress=@progress, risk_level=@riskLevel, risk_summary=@riskSummary,
-        blocker_summary=@blockerSummary, next_step=@nextStep, repository_path=@repositoryPath,
-        start_at=@startAt, due_at=@dueAt, updated_at=@updatedAt WHERE id=@id`
-    ).run(next);
-    return next;
+    return this.db.transaction(() => {
+      const current = this.getProject(id);
+      if (!current) return undefined;
+      const externalRepositoryId = normalizeExternalRepositoryId(patch.externalRepositoryId === undefined ? current.externalRepositoryId : patch.externalRepositoryId);
+      const next: Project = { ...current, ...patch, externalRepositoryId, id: current.id, createdAt: current.createdAt, updatedAt: nowIso() };
+      assertProjectRepositoryMode(next.repositoryPath, externalRepositoryId);
+      if (next.repositoryPath !== current.repositoryPath || externalRepositoryId !== (current.externalRepositoryId ?? "")) {
+        const timestamp = nowIso();
+        // The lease schemas are initialized lazily. Inspect existing tables without creating them.
+        const taskLeasesExist = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_task_leases'").get();
+        const coordinationLeasesExist = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_coordination_leases'").get();
+        const taskLease = taskLeasesExist && this.db.prepare("SELECT 1 FROM agent_task_leases WHERE project_id=? AND status IN ('claimed','running') AND lease_expires_at>? LIMIT 1").get(id, timestamp);
+        const coordinationLease = coordinationLeasesExist && this.db.prepare("SELECT 1 FROM agent_coordination_leases WHERE project_id=? AND status IN ('active','paused') AND lease_expires_at>? LIMIT 1").get(id, timestamp);
+        if (taskLease || coordinationLease) {
+          throw new ProjectRepositoryError(409, "PROJECT_REPOSITORY_ACTIVE_LEASE", "项目仍有活动租约，不能更改仓库路径或外部仓库标识");
+        }
+      }
+      this.db.prepare(
+        `UPDATE projects SET code=@code, name=@name, summary=@summary, stage=@stage, health=@health,
+          progress=@progress, risk_level=@riskLevel, risk_summary=@riskSummary,
+          blocker_summary=@blockerSummary, next_step=@nextStep, repository_path=@repositoryPath,
+          external_repository_id=@externalRepositoryId, start_at=@startAt, due_at=@dueAt, updated_at=@updatedAt WHERE id=@id`
+      ).run(next);
+      return next;
+    }).immediate();
   }
 
   /**
@@ -2036,6 +2083,14 @@ export class Store {
     return this.db.prepare("DELETE FROM node_database_bindings WHERE id = ?").run(id).changes > 0;
   }
 
+  // Keep insertion order: undo/redo use rowid, not timestamps (which may tie).
+  listDiagramRevisions(diagramId: string): Array<{ id: string; diagramId: string; beforeJson: string; afterJson: string; actor: string; undone: number; createdAt: string }> {
+    return this.db.prepare(
+      `SELECT id, diagram_id AS diagramId, before_json AS beforeJson, after_json AS afterJson,
+        actor, undone, created_at AS createdAt FROM diagram_revisions WHERE diagram_id = ? ORDER BY rowid ASC`,
+    ).all(diagramId) as Array<{ id: string; diagramId: string; beforeJson: string; afterJson: string; actor: string; undone: number; createdAt: string }>;
+  }
+
   recordDiagramRevision(diagramId: string, before: Diagram, after: Diagram, actor: string): string {
     const id = newId();
     const transaction = this.db.transaction(() => {
@@ -2297,6 +2352,7 @@ export class Store {
       id: input.id ?? newId(),
       name: input.name,
       provider: input.provider,
+      auth_mode: input.authMode ?? "api-key",
       protocol: input.protocol,
       base_url: input.baseUrl,
       api_key_env: input.apiKeyEnv,
@@ -2310,8 +2366,8 @@ export class Store {
       updated_at: ts,
     };
     this.db.prepare(
-      `INSERT INTO llm_profiles (id, name, provider, protocol, base_url, api_key_env, models, default_model, enabled, reasoning_effort, timeout_ms, created_at, updated_at)
-       VALUES (@id, @name, @provider, @protocol, @base_url, @api_key_env, @models, @default_model, @enabled, @reasoning_effort, @timeout_ms, @created_at, @updated_at)`
+      `INSERT INTO llm_profiles (id, name, provider, auth_mode, protocol, base_url, api_key_env, models, default_model, enabled, reasoning_effort, timeout_ms, created_at, updated_at)
+       VALUES (@id, @name, @provider, @auth_mode, @protocol, @base_url, @api_key_env, @models, @default_model, @enabled, @reasoning_effort, @timeout_ms, @created_at, @updated_at)`
     ).run(row);
     this.applyApiKey(row.id, input.apiKey);
     return this.getLlmProfile(row.id)!;
@@ -2323,7 +2379,7 @@ export class Store {
     this.applyApiKey(id, patch.apiKey);
     const next = { ...current, ...patch, id: current.id, createdAt: current.createdAt, updatedAt: nowIso() };
     this.db.prepare(
-      `UPDATE llm_profiles SET name=@name, provider=@provider, protocol=@protocol, base_url=@baseUrl,
+      `UPDATE llm_profiles SET name=@name, provider=@provider, auth_mode=@authMode, protocol=@protocol, base_url=@baseUrl,
        api_key_env=@apiKeyEnv, models=@modelsJson, default_model=@defaultModel, enabled=@enabledInt,
        reasoning_effort=@reasoningEffort, timeout_ms=@timeoutMs, updated_at=@updatedAt WHERE id=@id`
     ).run({ ...next, modelsJson: JSON.stringify(next.models), enabledInt: next.enabled ? 1 : 0 });
@@ -2609,7 +2665,7 @@ export class Store {
     ).run(backup);
   }
 
-  restoreBusinessSnapshot(snapshot: unknown): { projects: number; workNodes: number; plans: number; evidence: number; governance: number; designDocs: number; documentRevisions: number; documentReferences: number; diagrams: number; databaseModels: number; nodeDatabaseBindings: number } {
+  restoreBusinessSnapshot(snapshot: unknown): { projects: number; workNodes: number; plans: number; evidence: number; governance: number; designDocs: number; documentRevisions: number; documentReferences: number; diagrams: number; diagramRevisions: number; databaseModels: number; nodeDatabaseBindings: number } {
     if (!snapshot || typeof snapshot !== "object") throw new Error("备份内容不是有效对象");
     const data = snapshot as Record<string, unknown>;
     if (!Array.isArray(data.projects) || !Array.isArray(data.governance)) throw new Error("备份缺少 projects 或 governance 数据");
@@ -2629,6 +2685,23 @@ export class Store {
     const documentRevisions = data.documentRevisions ? grouped("documentRevisions") as DocumentRevision[] : [];
     const documentReferences = data.documentReferences ? grouped("documentReferences") as DocumentReference[] : [];
     const diagrams = grouped("diagrams") as Diagram[];
+    const diagramRevisions = data.diagramRevisions !== undefined
+      ? grouped("diagramRevisions") as ReturnType<Store["listDiagramRevisions"]> : [];
+    const diagramIds = new Set(diagrams.map((diagram) => diagram.id));
+    for (const revision of diagramRevisions) {
+      if (!revision || typeof revision.id !== "string" || !diagramIds.has(revision.diagramId)
+        || typeof revision.actor !== "string" || typeof revision.createdAt !== "string"
+        || ![0, 1].includes(revision.undone)
+        || typeof revision.beforeJson !== "string" || typeof revision.afterJson !== "string") {
+        throw new Error("备份中的 diagramRevisions 格式无效");
+      }
+      for (const json of [revision.beforeJson, revision.afterJson]) {
+        const diagram = JSON.parse(json) as Diagram;
+        if (!diagram || diagram.id !== revision.diagramId || !Array.isArray(diagram.nodes) || !Array.isArray(diagram.edges)) {
+          throw new Error("备份中的画布历史内容无效");
+        }
+      }
+    }
     const restoredEvidence = [...evidence];
     const restoredEvidenceIds = new Set(restoredEvidence.map((item) => item.id));
     for (const item of legacyEvidenceFromDiagrams(diagrams)) {
@@ -2661,6 +2734,11 @@ export class Store {
       for (const revision of documentRevisions) this.insertDocumentRevision(revision);
       for (const reference of documentReferences) this.insertDocumentReference(reference);
       for (const diagram of diagrams) this.insertDiagram(diagram);
+      const insertDiagramRevision = this.db.prepare(
+        `INSERT INTO diagram_revisions (id, diagram_id, before_json, after_json, actor, undone, created_at)
+         VALUES (@id, @diagramId, @beforeJson, @afterJson, @actor, @undone, @createdAt)`,
+      );
+      for (const revision of diagramRevisions) insertDiagramRevision.run(revision);
       for (const model of databaseModels) this.insertDatabaseModel(model);
       for (const binding of nodeDatabaseBindings) this.insertNodeDatabaseBinding(binding);
       for (const project of projects) this.ensureProjectMainDiagram(project);
@@ -2676,6 +2754,7 @@ export class Store {
       documentRevisions: documentRevisions.length || designDocs.length,
       documentReferences: documentReferences.length + designDocs.filter((doc) => Boolean((doc as DesignDoc & { nodeId?: string }).nodeId)).length,
       diagrams: diagrams.length,
+      diagramRevisions: diagramRevisions.length,
       databaseModels: databaseModels.length,
       nodeDatabaseBindings: nodeDatabaseBindings.length,
     };
@@ -2730,10 +2809,19 @@ CREATE TABLE IF NOT EXISTS projects (
   blocker_summary TEXT NOT NULL DEFAULT '',
   next_step TEXT NOT NULL DEFAULT '',
   repository_path TEXT NOT NULL DEFAULT '',
+  external_repository_id TEXT NOT NULL DEFAULT '',
   start_at TEXT NOT NULL DEFAULT '',
   due_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS design_change_active_nodes (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  diagram_id TEXT NOT NULL REFERENCES diagrams(id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL,
+  change_id TEXT NOT NULL,
+  PRIMARY KEY(project_id, diagram_id, node_id)
 );
 
 CREATE TABLE IF NOT EXISTS schema_migrations (

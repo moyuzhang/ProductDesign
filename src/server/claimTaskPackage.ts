@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Store } from "./db.js";
-import { approvalGroupLeases, claimAgentTask, ensureAgentTaskLeaseSchema, expireStaleAgentTasks, taskPackageLease, type ClaimAgentTaskInput, type AgentTaskLeaseContext } from "./agentTaskLeases.js";
+import { assertExternalWorkspaceClaim, approvalGroupLeases, claimAgentTask, ensureAgentTaskLeaseSchema, expireStaleAgentTasks, taskPackageLease, type ClaimAgentTaskInput, type AgentTaskLeaseContext } from "./agentTaskLeases.js";
 import * as orchestration from "./orchestration.js";
 
 /** Commit a claim only after its complete wire payload can be produced. */
@@ -17,6 +17,7 @@ export function claimTaskPackage(store: Store, input: ClaimAgentTaskInput, conte
     sessionId,
     runId: input.runId || `claim-run-${suffix}`,
   };
+  assertExternalWorkspaceClaim(store, resolved);
   ensureAgentTaskLeaseSchema(store);
   expireStaleAgentTasks(store, input.projectId);
   return store.db.transaction(() => {

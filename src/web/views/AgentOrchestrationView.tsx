@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState, type ReactElement } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { ArrowRight, Bot, Check, Clipboard, ExternalLink, FolderOpen, Pencil, RefreshCw, ShieldCheck, UserCheck, Wrench, XCircle } from "lucide-react";
 import type { AgentBlueprintKey, AgentBlueprintOverride, AgentExecutableQueueKey, AgentOrchestration, AgentOrchestrationQueueKey, AgentTaskLeaseRecord } from "../../shared/types";
 import { api } from "../api";
+import { AgentTaskRetryPanel } from "./AgentTaskRetryPanel";
 import { navigate } from "../App";
 import { EmptyState, ErrorBanner, Field, Modal, Spinner, formatTime } from "../ui";
 import { agentVisibleContent, useAgentUiBridge } from "./agentUiBridge";
@@ -42,6 +43,12 @@ function leaseStatusLabel(status: LeaseRecord["status"]): string {
 
 export function AgentOrchestrationView(): ReactElement {
   const { workspace } = useWorkspaceContext();
+  const requestId = useRef(0);
+  const workspaceRef = useRef(workspace);
+  workspaceRef.current = workspace;
+  const scopeRevision = useRef(0);
+  const releaseLock = useRef(false);
+  const handoffRequest = useRef(0);
   const [data, setData] = useState<AgentOrchestration | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -65,21 +72,25 @@ export function AgentOrchestrationView(): ReactElement {
 
   const reload = () => {
     if (!workspace) return;
+    const currentRequest = ++requestId.current;
     setLoading(true);
     setError("");
     Promise.all([api.getAgentOrchestration(workspace), api.listAgentTaskLeases(workspace)])
-      .then(([nextData, nextLeases]) => { setData(nextData); setLeases(nextLeases); })
-      .catch((cause: Error) => setError(cause.message))
-      .finally(() => setLoading(false));
+      .then(([nextData, nextLeases]) => { if (currentRequest === requestId.current && workspaceRef.current === workspace) { setData(nextData); setLeases(nextLeases); } })
+      .catch((cause: Error) => { if (currentRequest === requestId.current && workspaceRef.current === workspace) setError(cause.message); })
+      .finally(() => { if (currentRequest === requestId.current && workspaceRef.current === workspace) setLoading(false); });
   };
 
   useEffect(() => {
-    setData(null);
+    requestId.current += 1; scopeRevision.current += 1; handoffRequest.current += 1;
+    setData(null); setLeases([]); setError("");
+    setReleaseTarget(null); setReleaseReason(""); setEditing(null); setDraft(null);
     setHandoff(null);
     setOffsets(createOrchestrationQueueOffsets());
     setLeaseHistoryOffset(0);
     setRuntimeOffset(0);
     reload();
+    return () => { requestId.current += 1; };
     // workspace is the reload boundary; keeping reload local avoids stale project reads.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspace]);
@@ -112,7 +123,7 @@ export function AgentOrchestrationView(): ReactElement {
 
   if (!workspace) return <EmptyState text="先选择一个项目。Agent 编排是项目级蓝图，选定项目后会自动生成设计、施工、审计队列和人工批准节点。" />;
   if (loading && !data) return <Spinner />;
-  if (error && !data) return <ErrorBanner message={error} />;
+  if (error && !data) return <div><ErrorBanner message={error} /><button className="btn" onClick={reload}>重试加载编排</button></div>;
   if (!data) return <Spinner />;
 
   const activeLeases = leases.filter((lease) => ACTIVE_LEASE_STATUSES.has(lease.status));
@@ -125,29 +136,35 @@ export function AgentOrchestrationView(): ReactElement {
   const runtimePagination = paginateOrchestrationQueue(runtimeItems, runtimeOffset, RUNTIME_PAGE_SIZE);
 
   const copyBootstrap = async () => {
-    await navigator.clipboard.writeText(data.bootstrapPrompt);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
+    try {
+      await navigator.clipboard.writeText(data.bootstrapPrompt);
+      if (workspaceRef.current !== data.project.id) return;
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch (cause) { if (workspaceRef.current === data.project.id) setError(cause instanceof Error ? cause.message : "复制失败，请检查剪贴板权限"); }
   };
 
   const previewHandoff = async (item: { id: string; planItemId: string | null }) => {
     if (!data) return;
     setError("");
+    const request = ++handoffRequest.current;
     try {
       const target = item.planItemId ? { planId: item.planItemId } : { taskId: item.id };
       const { serialized } = await api.getCoordinationHandoff(data.project.id, target);
+      if (request !== handoffRequest.current || workspaceRef.current !== data.project.id) return;
       const parsed = JSON.parse(serialized) as { binding: { type: "plan" | "task"; proposalRevision?: number;
         taskKey?: string; taskRevision?: string } };
       setHandoff({ serialized, target: parsed.binding.type === "plan"
         ? { ...target, expectedProposalRevision: parsed.binding.proposalRevision }
         : { ...target, expectedTaskKey: parsed.binding.taskKey, expectedTaskRevision: parsed.binding.taskRevision } });
-    } catch (cause) { setHandoff(null); setError(cause instanceof Error ? cause.message : String(cause)); }
+    } catch (cause) { if (request === handoffRequest.current && workspaceRef.current === data.project.id) { setHandoff(null); setError(cause instanceof Error ? cause.message : String(cause)); } }
   };
 
   const exportHandoff = async (mode: "copy" | "download") => {
     if (!handoff || !data) return;
     try {
       const fresh = await api.getCoordinationHandoff(data.project.id, handoff.target);
+      if (workspaceRef.current !== data.project.id) return;
       if (fresh.serialized !== handoff.serialized) throw new Error("交接目标已变化，请重新预览");
       if (mode === "copy") await navigator.clipboard.writeText(handoff.serialized);
       else {
@@ -156,33 +173,36 @@ export function AgentOrchestrationView(): ReactElement {
         link.href = href; link.download = "coordination-handoff.json"; link.click();
         URL.revokeObjectURL(href);
       }
-    } catch (cause) { setHandoff(null); setError(cause instanceof Error ? cause.message : String(cause)); }
+    } catch (cause) { if (workspaceRef.current === data.project.id) { setHandoff(null); setError(cause instanceof Error ? cause.message : String(cause)); } }
   };
 
   const confirmManualRelease = async () => {
-    if (!releaseTarget || !data || !releaseReason.trim()) return;
+    if (!releaseTarget || !data || !releaseReason.trim() || releaseLock.current) return;
+    releaseLock.current = true;
+    const scope = scopeRevision.current;
+    const stillCurrent = () => scope === scopeRevision.current && workspaceRef.current === data.project.id;
     setReleasingLeaseId(releaseTarget.workOrderId);
     setError("");
     try {
       await api.releaseAgentTaskManually(data.project.id, releaseTarget.workOrderId, releaseReason.trim());
-      const [nextData, nextLeases] = await Promise.all([
-        api.getAgentOrchestration(data.project.id),
-        api.listAgentTaskLeases(data.project.id),
-      ]);
-      setData(nextData);
-      setLeases(nextLeases);
+      if (!stillCurrent()) return;
+      reload();
       setReleaseTarget(null);
       setReleaseReason("");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (stillCurrent()) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
+      releaseLock.current = false;
       setReleasingLeaseId("");
     }
   };
 
   const openEdit = async (key: AgentBlueprintKey, name: string) => {
+    if (saving) return;
+    const scope = scopeRevision.current;
     try {
       const overrides = await api.listAgentBlueprints();
+      if (scope !== scopeRevision.current || workspaceRef.current !== data.project.id) return;
       const found = overrides.find((item) => item.key === key);
       setDraft(found ?? {
         key,
@@ -195,7 +215,7 @@ export function AgentOrchestrationView(): ReactElement {
       });
       setEditing(key);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (scope === scopeRevision.current && workspaceRef.current === data.project.id) setError(cause instanceof Error ? cause.message : String(cause));
     }
   };
 
@@ -211,8 +231,8 @@ export function AgentOrchestrationView(): ReactElement {
         boundaries: draft.boundaries,
         allowedMcpTools: draft.allowedMcpTools,
       });
-      const fresh = await api.getAgentOrchestration(data.project.id);
-      setData(fresh);
+      if (workspaceRef.current !== data.project.id) return;
+      reload();
       setEditing(null);
       setDraft(null);
     } catch (cause) {
@@ -275,6 +295,8 @@ export function AgentOrchestrationView(): ReactElement {
           <article><span>外部 Runner</span><strong>{data.runners?.filter((runner) => runner.status === "online").length ?? 0}</strong><small>登记 {data.runners?.length ?? 0} · 最大尝试 {data.capacity.maxAttempts}</small></article>
         </section>
       ) : null}
+
+      <AgentTaskRetryPanel projectId={data.project.id} />
 
       <section className="orchestration-section orchestration-leases" aria-label="租约管理" data-testid="lease-management">
         <div className="orchestration-section-title">

@@ -64,6 +64,8 @@ export interface Project {
   blockerSummary: string;
   nextStep: string;
   repositoryPath: string;
+  /** Opaque external source identity; empty/absent retains service-local mode. */
+  externalRepositoryId?: string;
   startAt: string;
   dueAt: string;
   createdAt: string;
@@ -239,7 +241,19 @@ export interface DesignChangeRequest {
 
 export type DesignChangeIntentStatus = "pending" | "applied" | "dismissed" | "stale";
 
+export interface DesignChangeRecovery {
+  correctsChangeId: string;
+  diagramId: string;
+  nodeId: string;
+  rootPlanId: string;
+  nodeLabel: string;
+  expectedUpdatedAt: string;
+  reason: string;
+  requiresIndependentApproval: true;
+}
+
 export interface DesignChangeIntentInput {
+  correctsChangeId?: string;
   projectId: string;
   diagramId: string;
   nodeId: string;
@@ -252,6 +266,7 @@ export interface DesignChangeIntentInput {
 }
 
 export interface DesignChangeIntentTaskContext {
+  correctsChangeId?: string;
   intentId: string;
   rootPlanId: string;
   impactedPlanIds: string[];
@@ -273,6 +288,7 @@ export interface DesignChangeIntentResult {
 }
 
 export interface DesignChangeResult {
+  correctsChangeId?: string;
   changeId: string;
   projectId: string;
   diagramId: string;
@@ -335,7 +351,19 @@ export type LlmProtocol = (typeof LLM_PROTOCOLS)[number];
 export const LLM_REASONING_EFFORTS = ["none", "low", "high", "max"] as const;
 export type LlmReasoningEffort = (typeof LLM_REASONING_EFFORTS)[number];
 
+export interface CodexModel { id: string; model: string; displayName: string; isDefault: boolean }
+export interface CodexAccountStatus {
+  status: "signed-out" | "signed-in";
+  email?: string;
+  planType?: string;
+  login: { loginId: string; status: "pending" | "succeeded" | "failed" | "cancelled" | "expired"; message?: string; expiresAt: string } | null;
+}
+export type CodexLoginStart = ({ type: "chatgpt"; loginId: string; authUrl: string }
+  | { type: "chatgptDeviceCode"; loginId: string; verificationUrl: string; userCode: string }) & { expiresAt: string };
+
 export interface LlmProfile {
+  /** Missing on legacy clients means API key authentication. */
+  authMode?: "api-key" | "chatgpt";
   id: string;
   name: string;
   provider: string;
@@ -1072,6 +1100,7 @@ export interface PlanDeliveryLayerGate {
 }
 
 export interface ProjectWorkflow {
+  designChangeRecoveries?: DesignChangeRecovery[];
   policyVersion: string;
   projectId: string;
   phase: ProjectWorkflowPhase;
@@ -1343,7 +1372,18 @@ export interface AgentChildTaskDispatch {
   updatedAt: string;
 }
 
+/** Runner attestation, never a service-verified Git observation. Frozen on claim. */
+export interface ExternalWorkspaceBinding {
+  repositoryId: string;
+  workspaceId: string;
+  workspacePath: string;
+  workspaceBranch: string;
+  baselineRevision: string;
+}
+
 export interface AgentWorkingDirectory {
+  location?: "service" | "external";
+  verification?: "service-filesystem" | "runner-attestation";
   repositoryPath: string;
   configured: boolean;
   absolute: boolean;
@@ -1415,7 +1455,7 @@ export interface AgentTaskPackage {
   agentSecurityPolicyVersion: string;
   workOrderStatus: "unclaimed" | "claimed" | "running";
   requiredSubmissionFields: string[];
-  project: Pick<Project, "id" | "code" | "name" | "repositoryPath">;
+  project: Pick<Project, "id" | "code" | "name" | "repositoryPath" | "externalRepositoryId">;
   workingDirectory: AgentWorkingDirectory;
   workflow: Pick<ProjectWorkflow, "phase" | "phaseLabel" | "status" | "summary" | "nextAction">;
   task: AgentOrchestrationTask & { role: AgentBlueprintKey };
@@ -1452,6 +1492,7 @@ export interface AgentTaskPackage {
     leaseExpiresAt: string;
     heartbeatSeconds: number;
     requiredForAgentWrites: true;
+    externalWorkspace?: ExternalWorkspaceBinding;
     workScopes: string[];
     workspace: {
       key: string;
@@ -1464,6 +1505,8 @@ export interface AgentTaskPackage {
   };
   launch: {
     manualStartRequired: true;
+    executionOwner?: "external-harness";
+    sourceVerification?: "runner-attestation";
     workingDirectory: string;
     instructions: string[];
     prompt: string;
@@ -1656,4 +1699,28 @@ export interface DatabaseDeployResult {
   target: string;
   executedStatements: number;
   executedAt: string;
+}
+
+/** Exact exhausted lease eligible for a separately approved one-attempt recovery. */
+export interface AgentTaskRetryCandidate {
+  taskId: string;
+  taskKey: string;
+  taskRevision: string;
+  failedWorkOrderId: string;
+  attempt: number;
+  maxAttempts: number;
+  title: string;
+  actionCode: string;
+  role: AgentBlueprintKey;
+  diagramId: string | null;
+  nodeId: string | null;
+  lastError: string;
+  pendingRequestId?: string;
+}
+export interface AgentTaskRetryRequestResult {
+  requestId: string;
+  status: "pending" | "approved";
+  approvalTaskId: string;
+  additionalAttempts: 1;
+  authorizesRetry: boolean;
 }

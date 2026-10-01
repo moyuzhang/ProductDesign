@@ -1,3 +1,4 @@
+import { recordDesignChangeLineage } from "./designChangeLineage.js";
 import { createHash } from "node:crypto";
 import type {
   DesignChangeRequest,
@@ -601,8 +602,11 @@ function requestDesignChangeInTransaction(
   if (documents.some((document) => !document || document.projectId !== project.id || !referencedDocumentIds.has(document.id))) {
     throw new DesignChangeError(409, "DOCUMENT_SCOPE_MISMATCH", "受影响文档不存在、跨项目或未被当前节点/计划引用");
   }
+  let correctsChangeId: string | undefined;
   if (input.intentId) {
     const intent = assertDesignChangeIntentCurrent(store, input.intentId, project.id);
+    correctsChangeId = intent.correctsChangeId;
+    if (correctsChangeId && !input.requirementImpact) throw new DesignChangeError(409, "CORRECTION_REQUIREMENT_IMPACT_REQUIRED", "需求影响更正必须经独立审批明确确认存在需求影响");
     if (!rootPlanIds.includes(intent.rootPlanId) || intent.reason !== input.reason || intent.changeSummary !== input.changeSummary
       || intent.impactedDocumentIds.slice().sort().join("\u001f") !== input.impactedDocumentIds.slice().sort().join("\u001f")) {
       throw new DesignChangeError(409, "DESIGN_CHANGE_INTENT_PAYLOAD_MISMATCH", "正式变更业务内容与冻结意图不一致");
@@ -629,6 +633,8 @@ function requestDesignChangeInTransaction(
     if (latest.diagramUpdatedAt !== input.expectedUpdatedAt) {
       throw new DesignChangeError(409, "DIAGRAM_REVISION_CONFLICT", "画布已变化，请刷新影响预览后重试");
     }
+    // Revalidate frozen source/scope under the same write transaction, not only during preflight.
+    if (input.intentId) assertDesignChangeIntentCurrent(store, input.intentId, project.id);
     if (context.agent) assertEnrolledApprovalProofs(store, input, context, false);
     const changeId = newId();
     const createdAt = nowIso();
@@ -648,6 +654,7 @@ function requestDesignChangeInTransaction(
         nodeId: node.id,
         changeSummary: input.changeSummary,
         requirementImpact: input.requirementImpact,
+        ...(correctsChangeId ? { correctsChangeId } : {}),
         impactedDocumentIds: input.impactedDocumentIds,
         impactedPlanIds: input.impactedPlanIds,
         reusableWorkSummary: input.reusableWorkSummary,
@@ -730,6 +737,7 @@ function requestDesignChangeInTransaction(
     reconcilePlanDeliveryProjections(store);
 
     const result: DesignChangeResult = {
+      ...(correctsChangeId ? { correctsChangeId } : {}),
       changeId,
       projectId: project.id,
       diagramId: diagram.id,
@@ -749,6 +757,7 @@ function requestDesignChangeInTransaction(
     store.db.prepare(
       "INSERT INTO design_change_requests (idempotency_key, request_hash, change_id, response_json, created_at) VALUES (?, ?, ?, ?, ?)",
     ).run(input.idempotencyKey, hash, changeId, JSON.stringify(result), createdAt);
+    recordDesignChangeLineage(store, result);
     const workflow = buildProjectWorkflow(store, project.id);
     result.nextAction = workflow?.nodes.find((item) => item.diagramId === diagram.id && item.nodeId === node.id)?.nextAction ?? null;
     if (input.intentId) finishDesignChangeIntent(store, input.intentId, "applied", changeId);

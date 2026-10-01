@@ -45,6 +45,7 @@ export const AGENT_MCP_TOOL_NAMES = new Set([
   "get_project",
   "get_project_workspace",
   "get_project_workflow",
+  "validate_design_contract",
   "get_agent_orchestration",
   "claim_coordination_lease",
   "heartbeat_coordination_lease",

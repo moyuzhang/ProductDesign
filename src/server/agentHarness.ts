@@ -1,5 +1,10 @@
+import { buildDesignTurnContext } from "./designTurnContext.js";
+import { CodexDesignRuntime, DESIGN_CODEX_CONFIG, assertDesignEffectiveConfig, assertDesignThreadPolicy, designCodexArgs } from "./codexDesignRuntime.js";
+import { tmpdir } from "node:os";
+import { codexDesignProblem, DESIGN_AGENT_MCP_TOOLS, assertDesignTool } from "./designAgentPolicy.js";
+import { codexCommand, chatgptCodexHome, chatgptCodexEnv } from "./codexRuntime.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { McpServer } from "@modelcontextprotocol/server";
@@ -17,7 +22,6 @@ import type {
 import { nowIso, type Store } from "./db.js";
 import { LocalMcpClient, MUTATING_AGENT_MCP_TOOLS, mcpResultText, type AgentMcpResult, type AgentMcpTool } from "./localMcpClient.js";
 import { isDeepSeekProfile, llmEndpoint, openAiChatReasoningOptions } from "./llmProfiles.js";
-import { ensureManagedProjectDirectory } from "./projectFiles.js";
 import type { AgentEntityChangedValue } from "../shared/types.js";
 import type { AgentUiEventBus } from "./agentUiEvents.js";
 
@@ -101,7 +105,7 @@ function boundedText(value: unknown, maxLength: number): string {
 }
 
 export function approvalPolicyForMode(mode: AgentControlMode): "never" | "on-request" {
-  return mode === "project-autonomous" ? "never" : "on-request";
+  return "on-request";
 }
 
 export function approvalResponseForMethod(method: string, approved: boolean): { decision: string } {
@@ -140,34 +144,18 @@ function providerId(profile: LlmProfile): string {
   return `pcs_${profile.id.replace(/[^a-zA-Z0-9_]/g, "_")}`;
 }
 
-function codexCommand(): { executable: string; prefix: string[] } {
-  const configured = process.env.PCS_CODEX_BIN?.trim();
-  if (configured) return { executable: configured, prefix: [] };
-  if (process.platform !== "win32") return { executable: "codex", prefix: [] };
-  const localAppData = process.env.LOCALAPPDATA;
-  if (localAppData) {
-    const root = join(localAppData, "OpenAI", "Codex", "bin");
-    if (existsSync(root)) {
-      const candidates = readdirSync(root, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => join(root, entry.name, "codex.exe"))
-        .filter(existsSync)
-        .sort()
-        .reverse();
-      if (candidates[0]) return { executable: candidates[0], prefix: [] };
-    }
-  }
-  return { executable: process.env.ComSpec || "cmd.exe", prefix: ["/d", "/s", "/c", "codex"] };
-}
 
 export function agentProfileProblem(profile: LlmProfile | undefined): string | undefined {
   if (!profile) return "LLM 配置不存在";
   if (!profile.enabled) return `LLM 配置“${profile.name}”已停用`;
+  if (profile.authMode === "chatgpt") return profile.protocol === "openai-responses" ? codexDesignProblem() : "ChatGPT 登录仅支持 Codex Responses 会话";
   if (!profile.credentialConfigured) return `凭据 ${profile.apiKeyEnv} 尚未配置（或未填写 API 密钥），服务端无法启动会话`;
-  return undefined;
+  return profile.protocol === "openai-responses" ? codexDesignProblem() : undefined;
 }
 
 export class CodexHarness {
+  private closing = false;
+  private closePromise?: Promise<void>;
   private readonly activeRuns = new Map<string, ActiveAgentRun>();
   private readonly pendingApprovals = new Map<string, PendingApprovalHandle>();
 
@@ -176,7 +164,17 @@ export class CodexHarness {
     private readonly dataDir: string,
     private readonly mcpFactory?: () => McpServer,
     private readonly agentUiEvents?: AgentUiEventBus,
+    private readonly designRuntime: Pick<CodexDesignRuntime, "ensure"> = new CodexDesignRuntime(),
   ) {}
+
+  async ensureDesignRuntime(): Promise<void> { await this.designRuntime.ensure(); }
+
+  hasActiveChatGptRuns(): boolean {
+    return [...this.activeRuns.keys()].some((id) => {
+      const session = this.store.getAgentSession(id);
+      return session && this.store.getLlmProfile(session.profileId)?.authMode === "chatgpt";
+    });
+  }
 
   isRunning(sessionId: string): boolean {
     return this.activeRuns.has(sessionId);
@@ -219,6 +217,7 @@ export class CodexHarness {
   }
 
   async runTurn(sessionId: string, assistantMessageId: string, prompt: string): Promise<RunResult> {
+    if (this.closing) throw new Error("Agent 服务已关闭，无法启动新任务");
     const session = this.store.getAgentSession(sessionId);
     if (!session) throw new Error("Agent 会话不存在");
     if (this.isRunning(sessionId)) throw new Error("当前会话已有运行中的消息");
@@ -239,26 +238,32 @@ export class CodexHarness {
       controller.abort(new Error(`Agent 任务运行超过 ${turnLimitMs}ms，已停止当前会话`));
     }, turnLimitMs);
 
+    let codexMcp: LocalMcpClient | undefined;
+    let designWorkspace: string | undefined;
     try {
       if (profile.protocol !== "openai-responses") {
         return await this.runDirectTurn(session, profile, assistantMessageId, prompt, controller.signal);
       }
+      await this.designRuntime.ensure();
+      controller.signal.throwIfAborted();
       if (!this.mcpFactory) throw new Error("ProductDesign MCP 工具桥接尚未初始化");
 
-      const mcp = await LocalMcpClient.connect(this.mcpFactory);
-      const agentTools = await mcp.listAgentTools();
-      const workflowContext = await this.loadWorkflowContext(session.projectId, mcp);
+      const mcp = codexMcp = await LocalMcpClient.connect(this.mcpFactory);
+      const agentTools = (await mcp.listAgentTools()).filter((tool) => DESIGN_AGENT_MCP_TOOLS.has(tool.name));
+      const workflowContext = await this.loadWorkflowContext(session.projectId, mcp, session.id);
       controller.signal.throwIfAborted();
       const toolByName = new Map(agentTools.map((tool) => [tool.name, tool]));
 
-    const cwd = ensureManagedProjectDirectory(this.dataDir, project);
+    const cwd = designWorkspace = mkdtempSync(join(tmpdir(), "productdesign-design-"));
+    writeFileSync(join(cwd, "DESIGN_SCOPE.txt"), "本临时目录仅用于产品设计上下文。目标项目源码不在此工作区。禁止执行命令、写源文件或自行批准。通过提供的项目范围设计工具读取权威资料、保存草稿并等待用户确认。", { mode: 0o600 });
     const command = codexCommand();
-    const codexHome = join(this.dataDir, "codex-harness");
+    const subscription = profile.authMode === "chatgpt";
+    const codexHome = subscription ? chatgptCodexHome(this.dataDir) : join(this.dataDir, "codex-harness");
     mkdirSync(codexHome, { recursive: true });
-    const storedKey = this.store.resolveLlmKey(profile);
-    const childEnv: Record<string, string | undefined> = { ...process.env, CODEX_HOME: codexHome };
+    const storedKey = subscription ? undefined : this.store.resolveLlmKey(profile);
+    const childEnv: Record<string, string | undefined> = subscription ? chatgptCodexEnv(codexHome) : { ...process.env, CODEX_HOME: codexHome };
     if (storedKey) childEnv[profile.apiKeyEnv] = storedKey;
-    const args = [...command.prefix, "app-server", "--listen", "stdio://"];
+    const args = [...command.prefix, "app-server", "--strict-config", ...designCodexArgs(), "--listen", "stdio://"];
     const child = spawn(command.executable, args, {
       cwd: codexHome,
       env: childEnv,
@@ -280,8 +285,17 @@ export class CodexHarness {
     let finishTurn: ((turn: Record<string, unknown>) => void) | undefined;
     let failTurn: ((error: Error) => void) | undefined;
     const turnDone = new Promise<Record<string, unknown>>((resolve, reject) => { finishTurn = resolve; failTurn = reject; });
+    // RPC setup can fail before turnDone is awaited. Always observe its rejection.
+    void turnDone.catch(() => {});
+    let transportFailure: Error | undefined;
+    const failPending = (error: Error): void => {
+      transportFailure ??= error;
+      failTurn?.(error);
+      for (const waiter of pending.values()) waiter.reject(error);
+      pending.clear();
+    };
     const abortChild = (): void => {
-      failTurn?.(abortReason(controller.signal, "Agent 任务已取消"));
+      failPending(abortReason(controller.signal, "Agent 任务已取消"));
       if (child.exitCode === null) child.kill();
     };
     controller.signal.addEventListener("abort", abortChild, { once: true });
@@ -291,15 +305,30 @@ export class CodexHarness {
       if (child.stdin.writable) child.stdin.write(`${JSON.stringify(message)}\n`);
     };
     const request = (method: string, params: Record<string, unknown>): Promise<unknown> => {
+      controller.signal.throwIfAborted();
+      if (transportFailure) throw transportFailure;
       const id = nextRequestId++;
-      send({ jsonrpc: "2.0", id, method, params });
-      return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        send({ jsonrpc: "2.0", id, method, params });
+      });
     };
     const persistOutput = (force = false): void => {
       const now = Date.now();
-      if (!force && output.length < 64 && now - lastPersistAt < 300) return;
+      // Persist at most once per 300ms, regardless of accumulated text size.
+      // Completion explicitly flushes the complete, ordered output.
+      if (!force && now - lastPersistAt < 300) return;
       lastPersistAt = now;
       this.store.updateAgentMessage(assistantMessageId, { content: output, status: "running" });
+    };
+    const persistStreamOutput = (force = false): void => {
+      try {
+        persistOutput(force);
+      } catch (cause) {
+        // readline callbacks run outside runTurn's async try/catch. Fail this
+        // run so its existing failure persistence and resource cleanup execute.
+        failPending(cause instanceof Error ? cause : new Error(String(cause)));
+      }
     };
     const answerServerRequest = async (message: JsonRpcMessage): Promise<void> => {
       if (message.id === undefined || !message.method) return;
@@ -328,19 +357,8 @@ export class CodexHarness {
         return;
       }
       if (APPROVAL_METHODS.has(message.method)) {
-        if (session.controlMode !== "ask") {
-          approvalDenied += 1;
-          send({ jsonrpc: "2.0", id: message.id, result: approvalResponseForMethod(message.method, false) });
-          return;
-        }
-        const approved = await this.waitForApproval(
-          session,
-          message.method,
-          message.params ?? {},
-          profile.timeoutMs,
-          (accepted) => send({ jsonrpc: "2.0", id: message.id, result: approvalResponseForMethod(message.method!, accepted) }),
-        );
-        if (!approved) approvalDenied += 1;
+        approvalDenied += 1;
+        send({ jsonrpc: "2.0", id: message.id, result: approvalResponseForMethod(message.method, false) });
         return;
       }
       if (message.method === "item/tool/requestUserInput") {
@@ -350,8 +368,10 @@ export class CodexHarness {
       send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "ProductDesign 工作台尚未支持该交互请求" } });
     };
 
+    const serverRequests = new Set<Promise<void>>();
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => {
+      if (transportFailure) return;
       let message: JsonRpcMessage;
       try { message = JSON.parse(line) as JsonRpcMessage; } catch { return; }
       if (message.id !== undefined && ("result" in message || message.error)) {
@@ -363,15 +383,17 @@ export class CodexHarness {
         return;
       }
       if (message.id !== undefined && message.method) {
-        void answerServerRequest(message).catch((error: Error) => {
+        const handled = answerServerRequest(message).catch((error: Error) => {
           send({ jsonrpc: "2.0", id: message.id, error: { code: -32603, message: error.message } });
         });
+        serverRequests.add(handled);
+        void handled.finally(() => serverRequests.delete(handled));
         return;
       }
       if (message.method === "item/agentMessage/delta") {
         const delta = typeof message.params?.delta === "string" ? message.params.delta : "";
         output += delta;
-        persistOutput();
+        persistStreamOutput();
         return;
       }
       if (message.method === "item/completed") {
@@ -379,7 +401,7 @@ export class CodexHarness {
         if (item?.type !== "agentMessage" || typeof item.text !== "string" || !item.text) return;
         if (!output) output = item.text;
         else if (item.text.startsWith(output)) output = item.text;
-        persistOutput(true);
+        persistStreamOutput(true);
         return;
       }
       if (message.method === "turn/completed") {
@@ -397,9 +419,10 @@ export class CodexHarness {
       }
     });
     child.stderr.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString("utf8")}`.slice(-4000); });
-    child.on("error", (error) => failTurn?.(error));
+    child.stdin.on("error", (error) => failPending(error));
+    child.on("error", (error) => failPending(error));
     child.on("exit", (code) => {
-      if (!completedTurn) failTurn?.(new Error(stderr.trim() || `Codex app-server 已退出（code ${code ?? "unknown"}）`));
+      failPending(new Error(stderr.trim() || `Codex app-server 已退出（code ${code ?? "unknown"}）`));
     });
 
     try {
@@ -409,8 +432,15 @@ export class CodexHarness {
       });
       send({ jsonrpc: "2.0", method: "initialized" });
 
-      const pid = providerId(profile);
-      const config = {
+      if (subscription) {
+        const account = await request("account/read", { refreshToken: false }) as { account?: { type?: string } };
+        if (account.account?.type !== "chatgpt") throw new Error("请先在模型设置中完成 ChatGPT 登录");
+        const catalog = await request("model/list", { limit: 100, includeHidden: false }) as { data?: Array<{ model?: string }> };
+        if (!catalog.data?.some((item) => item.model === session.model)) throw new Error("当前 ChatGPT 账户未提供所选模型，请刷新模型列表后选择");
+      }
+      assertDesignEffectiveConfig(await request("config/read", { cwd, includeLayers: false }));
+      const pid = subscription ? "openai" : providerId(profile);
+      const config = subscription ? { model_provider: "openai", model: session.model, forced_login_method: "chatgpt" } : {
         model_provider: pid,
         model: session.model,
         model_providers: {
@@ -426,9 +456,9 @@ export class CodexHarness {
         model: session.model,
         modelProvider: pid,
         cwd,
-        approvalPolicy: approvalPolicyForMode(session.controlMode),
-        sandbox: "workspace-write",
-        config,
+        approvalPolicy: "never",
+        sandbox: "read-only",
+        config: { ...config, ...DESIGN_CODEX_CONFIG },
         dynamicTools: agentTools.map((tool) => ({
           type: "function",
           name: tool.name,
@@ -443,12 +473,14 @@ export class CodexHarness {
       if (session.codexThreadId) {
         try {
           threadResult = await request("thread/resume", { threadId: session.codexThreadId, ...threadParams }) as Record<string, unknown>;
-        } catch {
-          threadResult = await request("thread/start", { ...threadParams, ephemeral: false }) as Record<string, unknown>;
+        } catch (cause) {
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          throw new Error(`无法恢复原 Codex 会话，已停止以保留上下文；请重试或明确创建新会话。原因：${detail}`, { cause });
         }
       } else {
         threadResult = await request("thread/start", { ...threadParams, ephemeral: false }) as Record<string, unknown>;
       }
+      assertDesignThreadPolicy(threadResult);
       const thread = threadResult.thread as { id?: string } | undefined;
       const threadId = thread?.id;
       if (!threadId) throw new Error("Codex app-server 未返回 thread id");
@@ -456,12 +488,15 @@ export class CodexHarness {
 
       const turnResult = await request("turn/start", {
         threadId,
+        approvalPolicy: "never",
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
         input: [{ type: "text", text: prompt, text_elements: [] }],
       }) as Record<string, unknown>;
       const turn = turnResult.turn as { id?: string } | undefined;
       expectedTurnId = turn?.id ?? "";
       if (!expectedTurnId) throw new Error("Codex app-server 未返回 turn id");
       const finalTurn = completedTurn ?? await turnDone;
+      if (transportFailure) throw transportFailure;
       const status = typeof finalTurn.status === "string" ? finalTurn.status : "failed";
       if (status !== "completed") {
         const error = finalTurn.error as { message?: string } | undefined;
@@ -491,7 +526,7 @@ export class CodexHarness {
         child.kill();
         await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 1500))]);
       }
-      await mcp.close();
+      await Promise.allSettled(serverRequests);
     }
     } catch (error) {
       const current = this.store.getAgentSession(sessionId);
@@ -503,20 +538,35 @@ export class CodexHarness {
       throw error;
     } finally {
       clearTimeout(turnTimeout);
-      activeRun.complete();
-      if (this.activeRuns.get(sessionId) === activeRun) this.activeRuns.delete(sessionId);
+      try {
+        await codexMcp?.close();
+      } finally {
+        try {
+          if (designWorkspace) rmSync(designWorkspace, { recursive: true, force: true });
+        } catch {
+          console.warn("[pcs] 设计临时目录暂未清理；任务已停止，请稍后清理系统临时目录");
+        } finally {
+          activeRun.complete();
+          if (this.activeRuns.get(sessionId) === activeRun) this.activeRuns.delete(sessionId);
+        }
+      }
     }
   }
 
-  close(): void {
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    const runs = [...this.activeRuns.values()];
     for (const sessionId of new Set([...this.pendingApprovals.values()].map((item) => item.sessionId))) {
       this.expireSessionApprovals(sessionId);
     }
-    for (const activeRun of this.activeRuns.values()) {
+    for (const activeRun of runs) {
       activeRun.controller.abort(new Error("Agent 服务已关闭"));
       if (activeRun.child?.exitCode === null) activeRun.child.kill();
     }
-    this.activeRuns.clear();
+    // Runs own their persistence and cleanup. Keep the store alive until they finish.
+    this.closePromise = Promise.all(runs.map((run) => run.completed)).then(() => {});
+    return this.closePromise;
   }
 
   private waitForApproval(
@@ -590,8 +640,8 @@ export class CodexHarness {
         if (completed[index].role === "user") { latestUser = index; break; }
       }
       if (latestUser >= 0) completed[latestUser] = { role: "user", content: prompt };
-      const tools = await mcp.listAgentTools();
-      const workflowContext = await this.loadWorkflowContext(session.projectId, mcp);
+      const tools = (await mcp.listAgentTools()).filter((tool) => DESIGN_AGENT_MCP_TOOLS.has(tool.name));
+      const workflowContext = await this.loadWorkflowContext(session.projectId, mcp, session.id);
       signal.throwIfAborted();
       const output = profile.protocol === "anthropic-messages"
         ? await this.runAnthropicToolLoop(session, profile, apiKey, completed, tools, mcp, assistantMessageId, signal, workflowContext)
@@ -781,11 +831,13 @@ export class CodexHarness {
   }
 
   private async executeProjectMcpTool(session: AgentSession, tool: AgentMcpTool, rawArgs: Record<string, unknown>, mcp: LocalMcpClient): Promise<string> {
+    assertDesignTool(tool.name, rawArgs);
     const args = { ...rawArgs };
     const properties = (tool.inputSchema.properties ?? {}) as Record<string, unknown>;
     if ("projectRef" in properties) args.projectRef = session.projectId;
     if ("projectId" in properties) args.projectId = session.projectId;
     if ("actor" in properties) args.actor = `agent:${session.id}`;
+    if ("author" in properties) args.author = `agent:${session.id}`;
     if ("sessionId" in properties) args.sessionId = session.id;
     if ("clientId" in properties) args.clientId = "productdesign-agent-harness";
     if ("model" in properties) args.model = session.model;
@@ -797,8 +849,16 @@ export class CodexHarness {
         ? this.openDiagram(session, args)
         : await mcp.callTool(tool.name, args);
     let text = mcpResultText(result);
-    if (MUTATING_AGENT_MCP_TOOLS.has(tool.name)) {
-      if (!result.isError) this.publishMutationEvent(session, tool.name, args, mcpResultText(result));
+    if (MUTATING_AGENT_MCP_TOOLS.has(tool.name) && !result.isError) {
+      this.publishMutationEvent(session, tool.name, args, mcpResultText(result));
+      try {
+        const checked = await mcp.callTool("validate_design_contract", { projectRef: session.projectId, includeSchemas: false });
+        text = checked.isError
+          ? `${text}\n\n[设计已保存；后续检查返回错误，不要重复写入。请单独重新读取设计检查结果。]\n${mcpResultText(checked, 8_000)}`
+          : `${text}\n\n[保存后的服务端设计检查；未评估不等于通过]\n${mcpResultText(checked, 8_000)}`;
+      } catch {
+        text = `${text}\n\n[设计已保存；后续检查暂不可用，不要重复写入。请单独重新读取设计检查结果。]`;
+      }
     }
     if (shouldRefreshAgentWorkflow(tool.name, result, text)) {
       const workflowAfter = await mcp.callTool("get_project_workflow", { projectRef: session.projectId, includeNodes: false, offset: 0, limit: 20 });
@@ -807,9 +867,10 @@ export class CodexHarness {
     return result.isError ? `[MCP 工具返回错误]\n${text}` : text;
   }
 
-  private async loadWorkflowContext(projectId: string, mcp: LocalMcpClient): Promise<string> {
+  private async loadWorkflowContext(projectId: string, mcp: LocalMcpClient, sessionId: string): Promise<string> {
     const result = await mcp.callTool("get_project_workflow", { projectRef: projectId, includeNodes: false, offset: 0, limit: 20 });
-    return mcpResultText(result, 8_000);
+    const designCheck = await mcp.callTool("validate_design_contract", { projectRef: projectId, includeSchemas: false });
+    return `${mcpResultText(result, 8_000)}\n\n[结构化设计检查；unassessed 不等于通过]\n${mcpResultText(designCheck, 8_000)}\n\n[本轮实时设计依据；已批准与草稿分离]\n${JSON.stringify(buildDesignTurnContext(this.store, projectId, this.activeRuns.get(sessionId)?.pageContext ?? null))}`;
   }
 
   private openDiagram(session: AgentSession, args: Record<string, unknown>): AgentMcpResult {
@@ -932,9 +993,11 @@ export class CodexHarness {
     return [
       "你是 ProductDesign 项目工作台中的设计 Agent，不是普通聊天机器人。",
       `当前会话唯一项目 ID: ${session.projectId}。不得访问或修改其他项目。`,
-      "你的职责包括项目分析、系统画布、功能节点、数据库模型、系统文档、开发计划与测试证据。文档属于项目，画布、节点、计划、数据库模型和证据通过 DocumentReference 引用固定版本；需要事实时先调用工具，不能凭空声称已完成。",
-      "会话初始化时已注入一次项目 workflow 快照；任务包或该快照是当前上下文真源。不要为每个工具动作重复读取项目、节点或租约。仅在终态流转、LEASE_LOST/TASK_REVISION_DRIFT/POLICY_VERSION_STALE/WORK_ORDER_CONTEXT_INVALID 或明确需要确认修订时刷新 workflow。",
+      "你的职责是需求澄清、功能拆分、方案权衡、流程和数据模型设计、一致性检查。禁止代码开发、命令执行、修改源文件、部署、编造测试证据或自行批准。当前工具允许读取设计资料、编辑受控设计画布和数据模型，以及创建待确认的文档草稿；不得代替用户完成批准或验收。文档属于项目，画布、节点、计划、数据库模型和证据通过 DocumentReference 引用固定版本；需要事实时先调用工具，不能凭空声称已完成。",
+      "每一轮都重新读取服务端 workflow、当前批准资料、待确认草稿、相关节点、决定与结构化设计检查。旧对话和模型摘要不是最新批准依据。不要为每个工具动作重复读取项目、节点或租约。仅在终态流转、LEASE_LOST/TASK_REVISION_DRIFT/POLICY_VERSION_STALE/WORK_ORDER_CONTEXT_INVALID 或明确需要确认修订时刷新 workflow。",
       "修改画布或数据库模型前先读取当前实体和 updatedAt，写入时携带 expectedUpdatedAt。所有写入必须使用提供的 MCP 工具。",
+      "设计推进顺序是：先区分已确认事实和待澄清假设；关键缺口只问必要问题；给出可比较的方案与代价；按选定方向形成设计草稿；核对覆盖、接口和依赖；针对失败项局部修订。未得到用户确认，不把建议写成已批准决定。",
+      "复用当前已批准的需求基线，先澄清缺口并呈现方案权衡；改动设计后调用 validate_design_contract 核对逐条覆盖、权威 ID/版本、接口和阶段依赖。不把模型自述当作已覆盖；未评估或部分覆盖必须明确报告，不能宣告完成。",
       "如果工作流阻塞，明确说明缺失项和解除条件。不要调用删除、备份恢复、外部数据库部署、LLM 配置或 Agent 会话工具。",
       "用简洁中文报告真实完成结果，并列出创建或更新的实体名称；工具失败时不要伪造成功。",
       workflowContext ? `会话初始化 workflow 快照：\n${workflowContext}` : "",

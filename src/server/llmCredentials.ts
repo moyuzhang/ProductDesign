@@ -28,10 +28,12 @@ export class LlmCredentialVault {
   }
 
   resolve(profile: LlmProfile): string | undefined {
+    if (profile.authMode === "chatgpt") return undefined;
     return this.read(profile.id) ?? (process.env[profile.apiKeyEnv]?.trim() || undefined);
   }
 
   describe(profile: LlmProfile): LlmProfile {
+    if (profile.authMode === "chatgpt") return { ...profile, credentialConfigured: false, credentialMasked: "", credentialSource: "missing" };
     const stored = this.read(profile.id);
     const environment = process.env[profile.apiKeyEnv]?.trim();
     const credential = stored || environment || "";

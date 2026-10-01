@@ -1,3 +1,4 @@
+import { RETRY_APPROVAL_ACTION, agentTaskRetryApprovalTasks } from "./agentTaskRetry.js";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -621,6 +622,8 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
     }
   }
 
+  queues.approval.push(...agentTaskRetryApprovalTasks(store, projectId, EXECUTABLE_QUEUES.flatMap((queue) => queues[queue])));
+
   const priorityRank = { P0: 0, P1: 1, P2: 2, P3: 3 } as const;
   // 设计缺口会阻断已有施工，自动领取时优先于仍可按 taskId 精确领取的文档审批。
   const approvalActionRank = (item: AgentOrchestrationTask) => item.actionCode === "request_design_change"
@@ -647,7 +650,9 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
     workflowPolicyVersion: PROJECT_WORKFLOW_POLICY.version,
     agentSecurityPolicyVersion: AGENT_POLICY_VERSION,
     project,
-    workingDirectory: inspectAgentWorkingDirectory(project.repositoryPath),
+    workingDirectory: project.externalRepositoryId
+      ? { repositoryPath: "", configured: true, absolute: false, exists: false, directory: false, ready: false, issue: "外部源码：领取时提供 externalWorkspace 绑定", location: "external", verification: "runner-attestation" }
+      : inspectAgentWorkingDirectory(project.repositoryPath),
     workflow,
     recommendedAgents: agentBlueprints(store, includePrompts),
     queues,
@@ -655,7 +660,9 @@ export function buildAgentOrchestration(store: Store, projectId: string, include
     bootstrapPrompt: includePrompts
       ? [
         `你是外部通用 Agent 编排器。连接 ProductDesign 项目 ${project.code}（${project.id}）。`,
-        `设计任务使用托管项目目录 ${managedProjectPath(store.dataDir, projectId)}；开发任务的目标代码目录是 ${project.repositoryPath || "（未配置）"}，必须由用户在该目录手动启动。`,
+        project.externalRepositoryId
+          ? `源码由外部 Harness 管理（仓库身份 ${project.externalRepositoryId}）；开发领取必须绑定已认证 Worker 和 externalWorkspace，服务不检查外部目录。`
+          : `设计任务使用托管项目目录 ${managedProjectPath(store.dataDir, projectId)}；开发任务的目标代码目录是 ${project.repositoryPath || "（未配置）"}，必须由用户在该目录手动启动。`,
         "ProductDesign 只提供编排蓝图和任务包，不启动外部进程，也不替外部 Agent 编写目标项目代码。",
         `编排器或会话初始化时读取一次 get_agent_orchestration；队列长度仅代表待办数（designer=${counts.design}，builder=${counts.development}，auditor=${counts.audit}），绝不能按任务数创建 Agent。Worker 领取任务后以任务包为上下文真源，不再重复读取全局编排。`,
         "只按 leaseSummary.activeSlots 与 leaseSummary.roleSlots 创建有限 Worker；每个外部进程使用唯一且稳定的 workerId，同一 workerId/sessionId 一次只领取一个任务。",
@@ -718,16 +725,27 @@ export function buildAgentTaskPackage(
   if (!orchestration) throw new AgentTaskPackageError(404, "PROJECT_NOT_FOUND", "项目不存在");
   validateAgentTaskPackageSelector(store, orchestration, selector);
   const { queue, task } = selectTask(orchestration, selector);
-  const managedDirectory = inspectAgentWorkingDirectory(managedProjectPath(store.dataDir, projectId));
-  const workingDirectory = queue === "development" ? orchestration.workingDirectory
+  const externalWorkspace = selector.lease?.externalWorkspace;
+  if (externalWorkspace && externalWorkspace.repositoryId !== orchestration.project.externalRepositoryId)
+    throw new AgentTaskPackageError(409, "EXTERNAL_REPOSITORY_MISMATCH", "任务租约的外部仓库绑定与项目不一致");
+  if (queue === "development" && orchestration.project.externalRepositoryId && !externalWorkspace)
+    throw new AgentTaskPackageError(409, "EXTERNAL_WORKSPACE_REQUIRED", "外部开发任务必须先领取并绑定工作区");
+  const externalDirectory: AgentWorkingDirectory | undefined = externalWorkspace ? {
+    repositoryPath: externalWorkspace.workspacePath, configured: true, absolute: true,
+    exists: false, directory: false, ready: true, issue: "", location: "external", verification: "runner-attestation",
+  } : undefined;
+  const managedDirectory = externalDirectory ?? inspectAgentWorkingDirectory(managedProjectPath(store.dataDir, projectId));
+  const workingDirectory = externalDirectory ?? (queue === "development" ? orchestration.workingDirectory
     : managedDirectory.ready || isProjectBriefTask(task.actionCode) || task.actionCode === "add_function_node"
-      ? managedDirectory : orchestration.workingDirectory;
+      ? managedDirectory : orchestration.workingDirectory);
   if (!workingDirectory.ready) {
     throw new AgentTaskPackageError(409, "WORKING_DIRECTORY_NOT_READY", workingDirectory.issue);
   }
   const role = ROLE_BY_QUEUE[queue];
   const configuredBlueprint = orchestration.recommendedAgents.find((item) => item.key === role);
-  const roleBlueprint = configuredBlueprint && task.actionCode === "add_function_node"
+  const roleBlueprint = configuredBlueprint && task.actionCode === RETRY_APPROVAL_ACTION
+    ? { ...configuredBlueprint, allowedMcpTools: canonicalAgentTools(["get_project_workflow", "get_agent_orchestration", "list_agent_task_leases", "get_agent_task_capacity", "start_agent_task", "heartbeat_agent_task", "complete_agent_task", "fail_agent_task", "release_agent_task"]) }
+    : configuredBlueprint && task.actionCode === "add_function_node"
     ? { ...configuredBlueprint, allowedMcpTools: canonicalAgentTools([
       "get_project_workflow", "get_project_workspace", "get_diagram", "get_design_doc", "validate_diagram",
       "start_agent_task", "heartbeat_agent_task", "mutate_diagram", "complete_agent_task", "fail_agent_task", "release_agent_task",
@@ -939,7 +957,9 @@ export function buildAgentTaskPackage(
       `租约到期：${selector.lease.leaseExpiresAt}；工作期间每 ${selector.lease.heartbeatSeconds} 秒调用 heartbeat_agent_task 续租。`,
       "开始任何目标项目修改前调用 start_agent_task；Builder 并发时必须提交独立 workspacePath、workspaceBranch 和 baselineRevision。所有计划流转必须携带 leaseToken 和唯一 idempotencyKey。",
       "若收到 LEASE_LOST、TASK_ALREADY_CLAIMED 或租约过期，立即停止写入，不得继续抢占任务。",
-      task.actionCode === "add_function_node"
+      task.actionCode === RETRY_APPROVAL_ACTION
+        ? "核查失败工单、原因及修复措施；使用 complete_agent_task(resultDigest=独立审核结论) 仅批准一次额外尝试。必须携带完整 workOrderId、taskKey、taskRevision、workerId、role 与幂等键；不得改全局上限。"
+      : task.actionCode === "add_function_node"
         ? "在当前主画布一次原子新增首批模块或功能节点，然后以 complete_agent_task(resultDigest=拆分结论) 完工。"
       : isProjectBriefTask(task.actionCode)
         ? "项目简报任务以 complete_agent_task 提交固定文档修订、独立审计证据或 Main Agent 结论；不得调用计划流转替代。"
@@ -992,6 +1012,7 @@ export function buildAgentTaskPackage(
       code: orchestration.project.code,
       name: orchestration.project.name,
       repositoryPath: orchestration.project.repositoryPath,
+      externalRepositoryId: orchestration.project.externalRepositoryId,
     },
     workingDirectory,
     workflow: {
@@ -1014,9 +1035,12 @@ export function buildAgentTaskPackage(
     ...(selector.lease ? { lease: selector.lease } : {}),
     launch: {
       manualStartRequired: true,
+      ...(externalWorkspace ? { executionOwner: "external-harness" as const, sourceVerification: "runner-attestation" as const } : {}),
       workingDirectory: workingDirectory.repositoryPath,
       instructions: [
-        `由用户手动在 ${workingDirectory.repositoryPath} 打开 Codex、Trae 或终端会话。`,
+        externalWorkspace
+          ? `外部 Harness 在已绑定工作区 ${externalWorkspace.workspaceId} 执行并管理子 Agent；服务不启动进程或读取源码。基线是 Runner 声明，仍需独立证据审计。`
+          : `由用户手动在 ${workingDirectory.repositoryPath} 打开 Codex、Trae 或终端会话。`,
         "把本任务包中的 launch.prompt 完整交给外部 Agent。",
         "外部 Agent 直接使用任务包中的项目、节点、计划、文档和租约上下文；仅按 prompt 中的刷新条件读取最新 workflow。",
       ],

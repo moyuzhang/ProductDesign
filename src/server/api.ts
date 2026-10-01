@@ -1,6 +1,16 @@
+import { externalWorkspaceSchema } from "./externalWorkspace.js";
+import { agentRunFailureLogFields } from "./agentRunDiagnostics.js";
+import type { CodexDesignRuntime } from "./codexDesignRuntime.js";
+import { designContractSchema, requirementsBaselineSchema } from "../shared/designContract.js";
+import { DesignContractError, validateProjectDesignContract } from "./designContractValidation.js";
+import { registerAgentTaskRetryApi } from "./agentTaskRetryApi.js";
+import { DesignChangeCorrectionError, listDesignChangeRecoveries } from "./designChangeCorrection.js";
+import type { CodexAccount } from "./codexAccount.js";
+import { assertLocalCodexRequest } from "./codexLocalAccess.js";
+import type { EventStreams } from "./eventStreams.js";
 import { claimTaskPackage } from "./claimTaskPackage.js";
 import { z } from "zod";
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { mkdirSync, statSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
@@ -62,7 +72,7 @@ import {
 } from "../shared/databaseSchemas.js";
 import { collectGitEvidence } from "./collectors.js";
 import { createBackupFile, loadBackupFile, storageRetentionSummary } from "./backups.js";
-import { PrototypeDraftConflictError, PrototypeDraftCorruptError, FreeformDraftConflictError, FreeformDocumentCorruptError, FreeformAssetRejectedError, Store, nowIso } from "./db.js";
+import { ProjectRepositoryError, PrototypeDraftConflictError, PrototypeDraftCorruptError, FreeformDraftConflictError, FreeformDocumentCorruptError, FreeformAssetRejectedError, Store, nowIso } from "./db.js";
 import {
   type ServiceResult,
   type WhiteboardAuditContext,
@@ -190,6 +200,7 @@ const nodeKindSchema = z.enum(NODE_KINDS);
 const planKindSchema = z.enum(PLAN_KINDS);
 const llmProfileFields = {
   name: z.string().trim().min(1).max(120),
+  authMode: z.enum(["api-key", "chatgpt"]).default("api-key"),
   provider: z.string().trim().min(1).max(120),
   protocol: z.enum(LLM_PROTOCOLS),
   baseUrl: z.string().trim().url().max(1000),
@@ -354,6 +365,9 @@ export interface ApiOptions {
   dataDir: string;
   harness: CodexHarness;
   agentUiEvents: AgentUiEventBus;
+  eventStreams: EventStreams;
+  codexAccount: CodexAccount;
+  codexRuntime: CodexDesignRuntime;
   trustedInternal?: boolean;
 }
 
@@ -383,7 +397,7 @@ function audit(
 }
 
 function projectCreatedPayload(p: Project): Record<string, unknown> {
-  return { id: p.id, code: p.code, name: p.name, stage: p.stage, health: p.health };
+  return { id: p.id, code: p.code, name: p.name, stage: p.stage, health: p.health, repositoryPath: p.repositoryPath, externalRepositoryId: p.externalRepositoryId ?? "" };
 }
 
 function databaseModelSummary(model: DatabaseModel): Record<string, unknown> {
@@ -484,6 +498,7 @@ function validateNodeDatabaseBindingTarget(
 
 export function registerApi(app: FastifyInstance, options: ApiOptions): void {
   const { store, dataDir, harness, agentUiEvents } = options;
+  registerAgentTaskRetryApi(app, store);
 
   const sendSecurityError = (reply: FastifyReply, cause: unknown) => {
     if (cause instanceof AgentSecurityError) return reply.code(cause.statusCode).send({ code: cause.code, message: cause.message });
@@ -604,7 +619,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const heartbeat = setInterval(() => {
       if (!reply.raw.destroyed) reply.raw.write(": keep-alive\n\n");
     }, 15_000);
-    request.raw.once("close", () => {
+    options.eventStreams.track(reply.raw, () => {
       clearInterval(heartbeat);
       unsubscribe();
     });
@@ -614,10 +629,42 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
 
   // ---------- LLM profiles ----------
 
+  // Personal workstation only. Never expose subscription login or use via remote APIs.
+  const assertChatGptProfile = async (request: FastifyRequest, profile: { authMode?: string; protocol: string; provider: string; models: string[]; apiKey?: string }) => {
+    if (profile.authMode !== "chatgpt") return;
+    assertLocalCodexRequest(request);
+    if (profile.protocol !== "openai-responses" || profile.provider !== "openai" || profile.apiKey) throw httpError(400, "ChatGPT 登录必须使用 OpenAI Responses，且不能提交 API Key");
+    const { models } = await options.codexAccount.models();
+    if (profile.models.some((model) => !models.some((item) => item.model === model))) throw httpError(400, "所选模型不在当前 ChatGPT 账户的可用模型列表中");
+  };
+  const assertNoSubscriptionRun = () => {
+    if (harness.hasActiveChatGptRuns()) throw httpError(409, "请等待或停止 ChatGPT 会话后再更改登录状态");
+  };
+  app.addHook("preValidation", async (request, reply) => {
+    if (!request.url.split("?")[0].startsWith("/api/codex/")) return;
+    assertLocalCodexRequest(request);
+    reply.header("cache-control", "no-store");
+  });
+  app.get("/api/codex/runtime", async () => options.codexRuntime.status());
+  app.post("/api/codex/runtime/check", async () => options.codexRuntime.check());
+  app.get("/api/codex/account", async () => options.codexAccount.status());
+  app.get("/api/codex/models", async () => options.codexAccount.models());
+  app.post("/api/codex/login", async (request) => {
+    assertNoSubscriptionRun();
+    const { type } = parse(z.object({ type: z.enum(["chatgpt", "chatgptDeviceCode"]) }).strict(), request.body);
+    return options.codexAccount.start(type);
+  });
+  app.post("/api/codex/login/cancel", async (request) => {
+    const { loginId } = parse(z.object({ loginId: z.string().min(1).max(200) }).strict(), request.body);
+    return options.codexAccount.cancel(loginId);
+  });
+  app.post("/api/codex/logout", async () => { assertNoSubscriptionRun(); return options.codexAccount.logout(); });
+
   app.get("/api/llm-profiles", async () => store.listLlmProfiles());
 
   app.post("/api/llm-profiles", async (request, reply) => {
     const body = parse(z.object(llmProfileFields), request.body);
+    await assertChatGptProfile(request, body);
     if (!body.models.includes(body.defaultModel)) return reply.code(400).send({ message: "默认模型必须包含在模型列表中" });
     if (store.listLlmProfiles().some((item) => item.name.toLocaleLowerCase() === body.name.toLocaleLowerCase())) {
       return reply.code(409).send({ message: "已存在同名 LLM 配置" });
@@ -636,6 +683,9 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     if (!before) return reply.code(404).send({ message: "LLM 配置不存在" });
     const patch = parsePatch(z.object(llmProfileFields).partial(), request.body);
     const next = { ...before, ...patch, models: patch.models ? [...new Set(patch.models)] : before.models };
+    if (before.authMode === "chatgpt") assertLocalCodexRequest(request);
+    if ((patch.authMode ?? before.authMode) !== before.authMode) throw httpError(409, "请创建独立配置来切换认证方式，避免现有会话丢失上下文");
+    await assertChatGptProfile(request, next);
     if (!next.models.includes(next.defaultModel)) return reply.code(400).send({ message: "默认模型必须包含在模型列表中" });
     if (store.listLlmProfiles().some((item) => item.id !== id && item.name.toLocaleLowerCase() === next.name.toLocaleLowerCase())) {
       return reply.code(409).send({ message: "已存在同名 LLM 配置" });
@@ -664,7 +714,18 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id } = request.params as { id: string };
     const profile = store.getLlmProfile(id);
     if (!profile) return reply.code(404).send({ message: "LLM 配置不存在" });
-    const checked = await checkLlmProfile(profile, store.resolveLlmKey(profile));
+    let checked;
+    if (profile.authMode === "chatgpt") {
+      assertLocalCodexRequest(request);
+      const startedAt = Date.now();
+      try {
+        const { models } = await options.codexAccount.models();
+        const ok = models.some((item) => item.model === profile.defaultModel);
+        checked = { ok, status: ok ? "connected" : "request_failed", message: ok ? "ChatGPT 登录有效，目录包含所选模型（未验证实际推理权限或额度）" : "所选模型不可用，请刷新模型列表", latencyMs: Date.now() - startedAt, checkedAt: nowIso() };
+      } catch {
+        checked = { ok: false, status: "missing_credential", message: "ChatGPT 登录或模型检查失败，请检查 Codex 登录状态", latencyMs: Date.now() - startedAt, checkedAt: nowIso() };
+      }
+    } else checked = await checkLlmProfile(profile, store.resolveLlmKey(profile));
     audit(store, request.body as ActorHint, {
       projectId: null, entityType: "llmProfile", entityId: id,
       action: "test_connection", before: null, after: { ok: checked.ok, status: checked.status, latencyMs: checked.latencyMs },
@@ -706,6 +767,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     if (!store.getProject(body.projectId)) throw httpError(400, "项目不存在");
     const profile = store.getLlmProfile(body.profileId);
     if (!profile) throw httpError(400, "LLM 配置不存在");
+    if (profile.authMode === "chatgpt") assertLocalCodexRequest(request);
     if (!profile.models.includes(body.model)) throw httpError(400, "所选模型不在该 LLM 配置的模型列表中");
     const session = store.insertAgentSession(body);
     const workspace = store.getAgentWorkspace(body.projectId)!;
@@ -735,6 +797,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       const profile = store.getLlmProfile(profileId);
       if (!profile) throw httpError(400, "LLM 配置不存在");
       model = patch.model ?? (patch.profileId ? profile.defaultModel : before.model);
+      if (profile.authMode === "chatgpt") assertLocalCodexRequest(request);
       if (!profile.models.includes(model)) throw httpError(400, "所选模型不在该 LLM 配置的模型列表中");
     }
     const changedRuntime = profileId !== before.profileId || model !== before.model;
@@ -826,8 +889,13 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     }
     if (pageContext) assertAgentPageContextScope(store, session.projectId, pageContext);
     const profile = store.getLlmProfile(session.profileId);
+    if (profile?.authMode === "chatgpt") {
+      assertLocalCodexRequest(request);
+      if ((await options.codexAccount.status()).status !== "signed-in") throw httpError(409, "请先完成 ChatGPT 登录");
+    }
     const profileProblem = agentProfileProblem(profile);
     if (profileProblem) throw httpError(409, profileProblem);
+    if (profile?.protocol === "openai-responses") await harness.ensureDesignRuntime();
     const userMessage = store.insertAgentMessage({
       sessionId: id, projectId: session.projectId, role: "user", content: body.content,
       status: "completed", pageContext,
@@ -841,7 +909,11 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const contextPrompt = pageContext
       ? `${body.content}\n\n[AG-UI STATE_SNAPSHOT：当前前端上下文]\n${JSON.stringify(pageContext, null, 2)}\n注意：entityRefs 仅用于定位，权威数据必须通过 MCP 读取；visibleContent 是当前前端可见内容，可能包含未保存草稿；draft 标记未保存状态，二者都不得当作已持久化事实。`
       : body.content;
-    void harness.runTurn(id, assistantMessage.id, contextPrompt).catch(() => { /* 失败状态由 harness 持久化 */ });
+    void harness.runTurn(id, assistantMessage.id, contextPrompt).catch((error: unknown) => {
+      // Persistence itself can fail: keep a diagnostic even when the failed
+      // session/message state could not be written to the database.
+      request.log.error(agentRunFailureLogFields(error, id), "Agent turn failed");
+    });
     audit(store, request.body as ActorHint, {
       projectId: session.projectId, entityType: "agentMessage", entityId: userMessage.id,
       action: "send", before: null, after: { sessionId: id, pageContextIncluded: Boolean(pageContext), contextId: pageContext?.contextId },
@@ -939,7 +1011,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         securityTarget: "rest:/api/projects/:id/design-changes",
       });
     } catch (cause) {
-      if (cause instanceof DesignChangeError || cause instanceof AgentSecurityError) {
+      if (cause instanceof DesignChangeError || cause instanceof AgentSecurityError || cause instanceof DesignChangeIntentError || cause instanceof DesignChangeCorrectionError) {
         return reply.code(cause.statusCode).send({ message: cause.message, code: cause.code });
       }
       throw cause;
@@ -960,6 +1032,8 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
   });
 
   const agentTaskPackageClaim = z.object({
+    externalWorkspace: externalWorkspaceSchema.optional(),
+    authSessionToken: z.string().min(32).max(300).optional(),
     role: z.enum(["designer", "builder", "auditor", "approver"]),
     agentId: z.string().trim().min(1).max(200),
     workerId: z.string().trim().min(1).max(300).optional(),
@@ -1019,6 +1093,22 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     return listAgentTaskLeases(store, id);
   });
 
+  app.get("/api/projects/:id/design-contract-validation", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在" });
+    const query = parse(z.object({ planId: z.string().min(1).optional() }).strict(), request.query);
+    if (query.planId && store.getPlan(query.planId)?.projectId !== id) return reply.code(404).send({ message: "计划不存在或不属于当前项目" });
+    return { ...validateProjectDesignContract(store, id, query.planId), artifactSchemas: {
+      baseline: z.toJSONSchema(requirementsBaselineSchema), contract: z.toJSONSchema(designContractSchema),
+    } };
+  });
+
+  app.get("/api/projects/:id/design-change-recoveries", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在" });
+    return listDesignChangeRecoveries(store, id);
+  });
+
   app.post("/api/projects/:id/design-change-intents", async (request, reply) => {
     const { id } = request.params as { id: string };
     try {
@@ -1026,6 +1116,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         diagramId: z.string().trim().min(1).max(300),
         nodeId: z.string().trim().min(1).max(300),
         rootPlanId: z.string().trim().min(1).max(300),
+        correctsChangeId: z.string().uuid().optional(),
         reason: z.string().trim().min(1).max(4000),
         changeSummary: z.string().trim().min(1).max(8000),
         expectedUpdatedAt: z.string().trim().min(1).max(100),
@@ -1034,7 +1125,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       }).strict(), request.body);
       return reply.code(202).send(submitDesignChangeIntent(store, { ...body, projectId: id }));
     } catch (cause) {
-      if (cause instanceof DesignChangeIntentError) {
+      if (cause instanceof DesignChangeIntentError || cause instanceof DesignChangeCorrectionError) {
         return reply.code(cause.statusCode).send({ message: cause.message, code: cause.code, details: cause.details });
       }
       throw cause;
@@ -1134,7 +1225,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       if (operation === "release") return releaseCoordinationLease(store, { ...base, reason: parse(z.object({ reason: z.string().trim().max(4000).optional() }), request.body).reason });
       if (operation === "advance") return advanceCoordinationStage(store, { ...base, stage: parse(z.object({ stage: z.enum(AGENT_COORDINATION_STAGES) }), request.body).stage });
       if (operation === "dispatch") {
-        const body = parse(z.object({ taskId: z.string().trim().min(1).max(1000), taskKey: z.string().trim().max(2000).optional(), role: z.enum(["designer", "builder", "auditor"]), agentId: z.string().trim().max(200).optional(), workerId: z.string().trim().max(300).optional(), poolId: z.string().trim().max(500).optional() }), request.body);
+        const body = parse(z.object({ idempotencyKey: z.string().trim().min(1).max(300).optional(), taskId: z.string().trim().min(1).max(1000), taskKey: z.string().trim().max(2000).optional(), role: z.enum(["designer", "builder", "auditor"]), agentId: z.string().trim().max(200).optional(), workerId: z.string().trim().max(300).optional(), poolId: z.string().trim().max(500).optional() }), request.body);
         return dispatchChildTask(store, { ...base, ...body });
       }
       if (operation === "reclaim") {
@@ -1142,7 +1233,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         return reclaimChildTask(store, { ...base, ...body });
       }
       if (operation === "reassign") {
-        const body = parse(z.object({ dispatchId: z.string().trim().min(1).max(300), role: z.enum(["designer", "builder", "auditor"]), agentId: z.string().trim().min(1).max(200), workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), reason: z.string().trim().max(4000).optional() }), request.body);
+        const body = parse(z.object({ idempotencyKey: z.string().trim().min(1).max(300).optional(), dispatchId: z.string().trim().min(1).max(300), role: z.enum(["designer", "builder", "auditor"]), agentId: z.string().trim().min(1).max(200), workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), reason: z.string().trim().max(4000).optional() }), request.body);
         return reassignChildTask(store, { ...base, ...body, taskId: "" });
       }
       return reply.code(404).send({ message: "未知的协调租约操作", code: "COORDINATION_OPERATION_NOT_FOUND" });
@@ -1152,7 +1243,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id, dispatchId } = request.params as { id: string; dispatchId: string };
     if (!store.getProject(id)) return reply.code(404).send({ message: "项目不存在", code: "PROJECT_NOT_FOUND" });
     try {
-      const body = parse(z.object({ agentId: z.string().trim().min(1).max(200), workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), sessionId: z.string().trim().max(300).optional(), runId: z.string().trim().max(300).optional(), capabilities: z.array(z.string().trim().min(1).max(100)).max(50).default([]), leaseSeconds: z.number().int().min(15).max(1800).default(1800), idempotencyKey: z.string().trim().min(1).max(300) }), request.body);
+      const body = parse(z.object({ externalWorkspace: externalWorkspaceSchema.optional(), authSessionToken: z.string().min(32).max(300).optional(), agentId: z.string().trim().min(1).max(200), workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), sessionId: z.string().trim().max(300).optional(), runId: z.string().trim().max(300).optional(), capabilities: z.array(z.string().trim().min(1).max(100)).max(50).default([]), leaseSeconds: z.number().int().min(15).max(1800).default(1800), idempotencyKey: z.string().trim().min(1).max(300) }), request.body);
       return reply.type("application/json").send(JSON.parse(claimDispatchedChildTask(store, { ...body, dispatchId, projectId: id })));
     } catch (cause) { return agentTaskPackageError(reply, cause); }
   });
@@ -1198,6 +1289,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         projectId: id, taskId: body.taskId, taskKey: body.taskKey,
         role: body.role, agentId: body.agentId, workerId: body.workerId,
         poolId: body.poolId, sessionId: body.sessionId, runId: body.runId,
+        externalWorkspace: body.externalWorkspace, authSessionToken: body.authSessionToken,
         capabilities: body.capabilities, leaseSeconds: body.leaseSeconds,
         idempotencyKey: body.idempotencyKey,
       }, { actor: body.agentId, source: "web", clientId: "productdesign-web" });
@@ -1322,6 +1414,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const patch = parsePatch(z.object({
       ...projectCore,
       repositoryPath: z.string().trim().max(2000),
+      externalRepositoryId: z.string().trim().max(500).regex(/^(?:[A-Za-z0-9][A-Za-z0-9._:/@-]*)?$/),
     }).partial(), request.body);
     if (patch.repositoryPath) {
       if (!isAbsolute(patch.repositoryPath)) throw httpError(400, "repositoryPath 必须是绝对目录");
@@ -1332,7 +1425,12 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         throw httpError(400, "repositoryPath 不存在或当前服务无权访问");
       }
     }
-    const project = store.updateProject(id, patch);
+    let project: Project | undefined;
+    try { project = store.updateProject(id, patch); }
+    catch (cause) {
+      if (cause instanceof ProjectRepositoryError) return reply.code(cause.statusCode).send({ code: cause.code, message: cause.message });
+      throw cause;
+    }
     if (project) ensureManagedProjectDirectory(dataDir, project);
     audit(store, request.body as ActorHint, {
       projectId: id, entityType: "project", entityId: id,
@@ -1644,6 +1742,7 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
         return next;
       }).immediate();
     } catch (cause) {
+      if (cause instanceof DesignContractError) return reply.code(cause.statusCode).send({ code: cause.code, message: cause.message, details: cause.details });
       recoverCoordinationLeaseAfterRejectedTransaction(store, before.projectId, cause);
       if (cause instanceof AgentTaskLeaseError || cause instanceof CoordinationLeaseError) return agentTaskPackageError(reply, cause);
       throw cause;

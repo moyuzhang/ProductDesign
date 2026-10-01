@@ -1,3 +1,4 @@
+import { listDesignChangeRecoveries } from "./designChangeCorrection.js";
 import type {
   DesignDoc,
   DesignStatus,
@@ -497,6 +498,7 @@ export function buildProjectWorkflow(store: Store, projectId: string, input: Wor
       : "项目所有交付节点均已完成开发、证据归档和验收。";
 
   return {
+    designChangeRecoveries: listDesignChangeRecoveries(store, projectId, data.plans, data.diagrams),
     policyVersion: PROJECT_WORKFLOW_POLICY.version,
     projectId,
     phase,

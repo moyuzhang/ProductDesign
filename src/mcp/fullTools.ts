@@ -1,3 +1,6 @@
+import { designContractSchema, requirementsBaselineSchema } from "../shared/designContract.js";
+import { DesignContractError, validateProjectDesignContract } from "../server/designContractValidation.js";
+import { DesignChangeCorrectionError } from "../server/designChangeCorrection.js";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import {
@@ -30,7 +33,7 @@ import { layoutDiagram } from "../shared/diagramLayout.js";
 import { assertNoIntroducedDiagramGroupOverlap } from "../shared/diagramGroups.js";
 import { createBackupFile, loadBackupFile } from "../server/backups.js";
 import { collectGitEvidence } from "../server/collectors.js";
-import { newId, nowIso, type Store } from "../server/db.js";
+import { newId, nowIso, ProjectRepositoryError, type Store } from "../server/db.js";
 import { validateDiagramDeliveryTransition, validateDocumentNodeBinding, validateDocumentReferenceTarget } from "../server/domain.js";
 import { ensureManagedProjectDirectory } from "../server/projectFiles.js";
 import { isInitialProjectBriefApproval } from "../server/projectBrief.js";
@@ -140,7 +143,7 @@ function recordAudit(
 }
 
 function projectSummary(project: Project): Record<string, unknown> {
-  return { id: project.id, code: project.code, name: project.name, stage: project.stage, health: project.health, progress: project.progress };
+  return { id: project.id, code: project.code, name: project.name, stage: project.stage, health: project.health, progress: project.progress, repositoryPath: project.repositoryPath, externalRepositoryId: project.externalRepositoryId ?? "" };
 }
 
 function diagramSummary(diagram: Diagram): Record<string, unknown> {
@@ -237,6 +240,20 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
 
   // 图层、组件与模板工具（设计第 7 节）：与 REST 端点共用 src/server/whiteboard.ts 服务层。
   registerWhiteboardTools(server, { store, dataDir });
+
+  server.registerTool("validate_design_contract", {
+    title: "检查需求覆盖和设计一致性",
+    description: "只读检查明确引用的结构化需求基线和设计合同。服务端核对实际计划/节点/版本、逐条验收标准覆盖、接口方法路径和分阶段依赖环。unassessed 表示没有结构化基线，绝不表示通过；valid 仅表示已声明结构一致，不代替用户批准或真实测试。可返回 artifactSchemas 供通过 create_design_doc 创建草稿；基线和合同必须独立批准后才能进入正式交付。",
+    inputSchema: { projectRef: z.string().min(1), planId: z.string().min(1).optional(), includeSchemas: z.boolean().default(true) },
+  }, ({ projectRef, planId, includeSchemas }) => {
+    const project = projectByRef(store, projectRef);
+    if (!project) return error("项目不存在");
+    if (planId && store.getPlan(planId)?.projectId !== project.id) return error("计划不存在或不属于当前项目");
+    const report = validateProjectDesignContract(store, project.id, planId);
+    return result({ ...report, ...(includeSchemas ? { artifactSchemas: {
+      baseline: z.toJSONSchema(requirementsBaselineSchema), contract: z.toJSONSchema(designContractSchema),
+    } } : {}) });
+  });
 
   server.registerTool("service_health", {
     title: "服务健康检查",
@@ -508,7 +525,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
 
   server.registerTool("update_project", {
     title: "完整更新项目",
-    description: "更新项目所有可编辑字段。",
+    description: "更新项目所有可编辑字段。externalRepositoryId 是外部 Harness 的不透明仓库标识，不会作为 URL 获取或本地路径扫描；空值保持本地兼容模式。活动租约期间不能更改仓库标识。",
     inputSchema: {
       projectRef: z.string().min(1),
       code: z.string().trim().min(1).max(64).optional(),
@@ -521,6 +538,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
       riskSummary: z.string().max(2000).optional(),
       blockerSummary: z.string().max(2000).optional(),
       nextStep: z.string().max(2000).optional(),
+      externalRepositoryId: z.string().trim().max(500).regex(/^(?:[A-Za-z0-9][A-Za-z0-9._:/@-]*)?$/).optional(),
       startAt: z.string().max(32).optional(),
       dueAt: z.string().max(32).optional(),
       actor: z.string().max(100).optional(),
@@ -530,7 +548,13 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
     if (!project) return error(`未找到项目: ${args.projectRef}`);
     const { projectRef: _projectRef, actor, ...patch } = args;
     if (patch.code && patch.code !== project.code) patch.code = store.uniqueProjectCode(patch.code);
-    const updated = store.updateProject(project.id, patch);
+    let updated: Project | undefined;
+    try {
+      updated = store.updateProject(project.id, patch);
+    } catch (cause) {
+      if (cause instanceof ProjectRepositoryError) return error(structuredError(cause));
+      throw cause;
+    }
     if (!updated) return error("项目更新失败");
     ensureManagedProjectDirectory(dataDir, updated);
     recordAudit(store, actor, { projectId: project.id, entityType: "project", entityId: project.id, action: "update", before: projectSummary(project), after: projectSummary(updated) });
@@ -764,6 +788,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
       }).immediate();
       return result(updated, "计划交付状态已流转");
     } catch (cause) {
+      if (cause instanceof DesignContractError) return error(JSON.stringify({ code: cause.code, message: cause.message, details: cause.details }));
       recoverCoordinationLeaseAfterRejectedTransaction(store, before.projectId, cause);
       if (cause instanceof AgentTaskLeaseError || cause instanceof AgentSecurityError || cause instanceof CoordinationLeaseError) return error(structuredError(cause));
       return error(cause instanceof Error ? cause.message : String(cause));
@@ -771,10 +796,10 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
   });
 
   server.registerTool("submit_design_change_intent", {
-    description: "为 accepted 根计划提交非授权设计变更意图。requestedBy 仅作 unverified_submission 审计声明；本工具只生成 pending 独立审批工单，不修改计划、文档、节点、证据或租约。",
+    description: "为 accepted 根计划提交非授权设计变更意图；更正尚未完成变更的需求影响分类时必须提供 correctsChangeId 并绑定其当前返工计划，随后需要全新独立审批。requestedBy 仅作 unverified_submission 审计声明；本工具只生成 pending 独立审批工单，不修改计划、文档、节点、证据或租约。",
     inputSchema: {
       projectRef: z.string().min(1), diagramId: z.string().min(1), nodeId: z.string().min(1),
-      rootPlanId: z.string().min(1), reason: z.string().min(1), changeSummary: z.string().min(1),
+      rootPlanId: z.string().min(1), correctsChangeId: z.string().uuid().optional(), reason: z.string().min(1), changeSummary: z.string().min(1),
       expectedUpdatedAt: z.string().min(1), idempotencyKey: z.string().min(1), requestedBy: z.string().max(300).optional(),
     },
   }, (input) => {
@@ -784,7 +809,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
       const { projectRef: _projectRef, ...intent } = input;
       return result(submitDesignChangeIntent(store, { ...intent, projectId: project.id }));
     } catch (cause) {
-      if (cause instanceof DesignChangeIntentError) return error(structuredError(cause));
+      if (cause instanceof DesignChangeIntentError || cause instanceof DesignChangeCorrectionError) return error(structuredError(cause));
       return error(cause instanceof Error ? cause.message : "提交设计变更意图失败");
     }
   });
@@ -831,7 +856,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
         securityAction: "mcp.dismiss_design_change_intent", securityTarget: "mcp:dismiss_design_change_intent",
       }));
     } catch (cause) {
-      if (cause instanceof DesignChangeError || cause instanceof AgentSecurityError) return error(structuredError(cause));
+      if (cause instanceof DesignChangeError || cause instanceof AgentSecurityError || cause instanceof DesignChangeIntentError || cause instanceof DesignChangeCorrectionError) return error(structuredError(cause));
       return error(cause instanceof Error ? cause.message : "驳回设计变更意图失败");
     }
   });

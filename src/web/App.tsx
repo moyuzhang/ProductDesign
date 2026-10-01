@@ -54,15 +54,15 @@ export function navigate(path: string): void {
 
 const NAV_ITEMS = [
   { hash: "#/", label: "总览", icon: LayoutDashboard },
-  { hash: "#/design", label: "设计中枢", icon: PenTool },
-  { hash: "#/canvas", label: "画布工作台", icon: Shapes },
-  { hash: "#/orchestration", label: "Agent 编排", icon: Workflow },
+  { hash: "#/projects", label: "项目管理", icon: FolderKanban },
+  { hash: "#/orchestration", label: "外部开发 / 工单", icon: Workflow },
   { hash: "#/governance", label: "治理决策", icon: Gavel },
   { hash: "#/llm", label: "LLM 配置", icon: Bot },
   { hash: "#/audit", label: "审计日志", icon: ScrollText },
   { hash: "#/backups", label: "备份", icon: DatabaseBackup },
   { hash: "#/guide", label: "系统说明", icon: BookOpenText },
-  { hash: "#/projects", label: "项目管理", icon: FolderKanban },
+  { hash: "#/design", label: "设计中枢", icon: PenTool },
+  { hash: "#/canvas", label: "画布工作台", icon: Shapes },
 ];
 
 export function App(): ReactElement {
@@ -98,7 +98,7 @@ function AppShell({ hash }: { hash: string }): ReactElement {
   } else if (projectDatabaseModelMatch) {
     page = <DatabaseWorkbenchView projectId={projectDatabaseModelMatch[1]} modelId={projectDatabaseModelMatch[2]} />;
   } else if (projectMatch) {
-    page = <ProjectDetailView projectId={projectMatch[1]} initialTab={projectQuery.get("tab") ?? undefined} />;
+    page = <ProjectDetailView key={projectMatch[1]} projectId={projectMatch[1]} initialTab={projectQuery.get("tab") ?? undefined} />;
   } else if (hash.startsWith("#/orchestration")) {
     page = <AgentOrchestrationView />;
   } else if (hash.startsWith("#/projects")) {
@@ -137,7 +137,7 @@ function AppShell({ hash }: { hash: string }): ReactElement {
           </div>
         </div>
         <div className="sidebar-context"><WorkspaceSwitcher /></div>
-        {NAV_ITEMS.map((item) => {
+        {NAV_ITEMS.filter((item) => !["#/design", "#/canvas"].includes(item.hash)).map((item) => {
           const active =
             item.hash === "#/"
               ? hash === "#" || hash === "#/" || Boolean(projectMatch)
@@ -156,6 +156,13 @@ function AppShell({ hash }: { hash: string }): ReactElement {
             </button>
           );
         })}
+        <details className="sidebar-tools" open={hash.startsWith("#/design") || hash.startsWith("#/canvas")}>
+          <summary>设计辅助工具</summary>
+          {NAV_ITEMS.filter((item) => ["#/design", "#/canvas"].includes(item.hash)).map((item) => {
+            const Icon = item.icon;
+            return <button key={item.hash} className={`nav-item ${hash.startsWith(item.hash) ? "active" : ""}`} onClick={() => navigate(item.hash)}><Icon />{item.label}</button>;
+          })}
+        </details>
         <div className="sidebar-footer">
           本地优先 · 数据存储于 data/control-surface.db
         </div>

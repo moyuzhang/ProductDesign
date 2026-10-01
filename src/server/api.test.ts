@@ -527,7 +527,7 @@ describe("REST API", () => {
               title: "Agent 工具测试简报",
               category: "需求文档",
               summary: "由兼容协议 Agent 通过 ProductDesign MCP 创建",
-              status: "已批准",
+              status: "草拟",
               version: "v1.0",
               author: "Test Agent",
               content: "# 测试简报\n\n验证 MCP 工具闭环。",

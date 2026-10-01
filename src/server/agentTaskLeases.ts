@@ -1,7 +1,10 @@
+import { externalWorkspaceSchema } from "./externalWorkspace.js";
+import { RETRY_APPROVAL_ACTION, agentTaskRetryApprovalDigest, approveAgentTaskRetry, consumeAgentTaskRetry, hasAgentTaskRetryAllowance } from "./agentTaskRetry.js";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import type {
+  ExternalWorkspaceBinding,
   AgentAuditScope,
   AgentBlueprintKey,
   AgentExecutableQueueKey,
@@ -105,6 +108,7 @@ export interface AgentTaskLease {
   workspacePath: string;
   workspaceBranch: string;
   baselineRevision: string;
+  externalWorkspace?: ExternalWorkspaceBinding;
   updatedAt: string;
 }
 
@@ -141,6 +145,7 @@ interface LeaseRow {
   workspace_path: string;
   workspace_branch: string;
   baseline_revision: string;
+  external_workspace_json: string;
   repair_snapshot_json: string;
   updated_at: string;
 }
@@ -265,6 +270,7 @@ function mapLease(row: LeaseRow): AgentTaskLease {
     workspacePath: row.workspace_path || "",
     workspaceBranch: row.workspace_branch || "",
     baselineRevision: row.baseline_revision || "",
+    ...(row.external_workspace_json ? { externalWorkspace: externalWorkspaceSchema.parse(JSON.parse(row.external_workspace_json)) } : {}),
     updatedAt: row.updated_at,
   };
 }
@@ -323,7 +329,8 @@ function withoutToken(lease: AgentTaskLease): Omit<AgentTaskLease, "leaseToken">
   return safe;
 }
 
-function revisionForTask(store: Store, task: AgentOrchestrationTask): string {
+export function revisionForTask(store: Store, task: AgentOrchestrationTask): string {
+  if (task.actionCode === RETRY_APPROVAL_ACTION) return `retry:${task.correlationId}`;
   if (task.actionCode === "add_function_node") {
     return `add_function_node:${task.documentRevisionIds[0]}:${task.diagramId}`;
   }
@@ -623,6 +630,7 @@ export function ensureAgentTaskLeaseSchema(store: Store): void {
   ensureLeaseColumn(store, "workspace_path", "TEXT NOT NULL DEFAULT ''");
   ensureLeaseColumn(store, "workspace_branch", "TEXT NOT NULL DEFAULT ''");
   ensureLeaseColumn(store, "baseline_revision", "TEXT NOT NULL DEFAULT ''");
+  ensureLeaseColumn(store, "external_workspace_json", "TEXT NOT NULL DEFAULT ''");
   ensureLeaseColumn(store, "repair_snapshot_json", "TEXT NOT NULL DEFAULT ''");
   ensureLeaseColumn(store, "coordination_dispatch_id", "TEXT NOT NULL DEFAULT ''");
   ensureTableColumn(store, "agent_runner_registrations", "worker_id", "TEXT NOT NULL DEFAULT ''");
@@ -895,6 +903,7 @@ function audit(store: Store, lease: AgentTaskLease, action: string, context: Age
       attempt: lease.attempt,
       leaseExpiresAt: lease.leaseExpiresAt,
       workScopes: lease.workScopes,
+      ...(lease.externalWorkspace ? { externalWorkspace: lease.externalWorkspace } : {}),
       workspacePath: lease.workspacePath,
       baselineRevision: lease.baselineRevision,
       ...(["submit_evidence_repair", "assess_evidence_repair_failure", "reset_evidence_repair_attempt", "request_design_change"].includes(lease.actionCode)
@@ -960,7 +969,7 @@ function claimableTasksForOrchestration(
     const conflictingLock = workScopes
       .flatMap((scope) => locksByScope.get(scope) ?? [])
       .find((lock) => lock.task_key !== taskKey);
-    const attemptsExhausted = Boolean(row && row.attempt >= capacity.maxAttempts && ["failed", "expired"].includes(row.status));
+    const attemptsExhausted = Boolean(row && row.attempt >= capacity.maxAttempts && ["failed", "expired"].includes(row.status) && !hasAgentTaskRetryAllowance(store, row));
     const backingOff = Boolean(row?.retry_available_at && row.retry_available_at > now && ["failed", "expired"].includes(row.status));
     const projectFull = totalActive >= capacity.maxActive;
     const roleFull = (roleActive.get(role) ?? 0) >= roleCapacity(capacity, role);
@@ -1282,6 +1291,8 @@ export function releaseAgentTaskLeasesForDesignChange(
 }
 
 export interface ClaimAgentTaskInput {
+  externalWorkspace?: ExternalWorkspaceBinding;
+  authSessionToken?: string;
   projectId: string;
   taskId?: string;
   taskKey?: string;
@@ -1327,16 +1338,40 @@ function approvalGroupFingerprint(tasks: ClaimableAgentTask[]): string {
     [task.taskKey, task.workScopes, task.assignee, task.poolId]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))))).digest("hex");
 }
 
+/** External execution never inherits the legacy unauthenticated local claim path. */
+export function assertExternalWorkspaceClaim(store: Store, input: Pick<ClaimAgentTaskInput,
+  "projectId" | "agentId" | "workerId" | "role" | "authSessionToken" | "externalWorkspace">): void {
+  const project = store.getProject(input.projectId);
+  if (!project?.externalRepositoryId && !input.externalWorkspace) return;
+  if (!input.authSessionToken) throw new AgentTaskLeaseError(401, "AUTH_REQUIRED", "外部工作区领取必须提供已认证 Agent 会话");
+  const principal = resolveAuthPrincipal(store, input.authSessionToken);
+  if (principal.agentId !== input.agentId || principal.workerId !== input.workerId)
+    throw new AgentTaskLeaseError(403, "PRINCIPAL_SPOOF_REJECTED", "外部工作区必须绑定已认证的 Agent 和 Worker");
+  if (!principal.allowedProjects.includes(input.projectId) || !principal.allowedRoles.includes(input.role))
+    throw new AgentTaskLeaseError(403, "PERMISSION_DENIED", "认证会话不允许当前项目或角色");
+  if (input.externalWorkspace) {
+    const parsed = externalWorkspaceSchema.safeParse(input.externalWorkspace);
+    if (!parsed.success) throw new AgentTaskLeaseError(400, "EXTERNAL_WORKSPACE_INVALID", "外部工作区身份、绝对路径、分支和完整 Git 基线 SHA 必须有效");
+    if (parsed.data.repositoryId !== project?.externalRepositoryId)
+      throw new AgentTaskLeaseError(409, "EXTERNAL_REPOSITORY_MISMATCH", "工作区不属于项目配置的外部仓库");
+  }
+}
+
 export function claimAgentTask(
   store: Store,
   input: ClaimAgentTaskInput,
   context: AgentTaskLeaseContext = {},
   orchestration?: AgentOrchestration,
 ): AgentTaskLease {
+  assertExternalWorkspaceClaim(store, input);
   ensureAgentTaskLeaseSchema(store);
   assertLocalAgentIdentityAudience(store, input.agentId, input.workerId ?? "");
   return store.db.transaction(() => {
-    const hash = requestHash(input);
+    // Recheck source and principal after taking the writer lock; another service
+    // connection may have changed configuration or revoked auth before admission.
+    assertExternalWorkspaceClaim(store, input);
+    const { authSessionToken: _auth, ...businessInput } = input;
+    const hash = requestHash(businessInput);
     const cached = cachedResponse<AgentTaskLease>(store, "claim_group", input.idempotencyKey, hash);
     if (cached) {
       const current = store.db.prepare("SELECT * FROM agent_task_leases WHERE id=? AND lease_token=?")
@@ -1393,7 +1428,8 @@ function claimSingleAgentTask(
   if (!workerId) throw new AgentTaskLeaseError(400, "WORKER_ID_REQUIRED", "workerId 不能为空");
   expireStaleAgentTasks(store, input.projectId);
   const leaseSeconds = normalizeLeaseSeconds(input.leaseSeconds);
-  const hash = requestHash({ ...input, workerId, leaseSeconds });
+  const { authSessionToken: _auth, ...businessInput } = input;
+  const hash = requestHash({ ...businessInput, workerId, leaseSeconds });
   const operation = "claim";
   return store.db.transaction(() => {
     const cached = cachedResponse<AgentTaskLease>(store, operation, input.idempotencyKey, hash);
@@ -1552,11 +1588,25 @@ function claimSingleAgentTask(
       throw new AgentTaskLeaseError(409, "RESOURCE_SCOPE_LOCKED", `资源范围已由 Worker ${locked.worker_id} 锁定至 ${locked.expires_at}`);
     }
     const project = store.getProject(input.projectId);
+    const externalWorkspace = input.externalWorkspace ? externalWorkspaceSchema.parse(input.externalWorkspace) : undefined;
+    if (project?.externalRepositoryId && task.queue === "development" && !externalWorkspace)
+      throw new AgentTaskLeaseError(409, "EXTERNAL_WORKSPACE_REQUIRED", "外部开发任务必须在领取时绑定工作区、分支和完整基线 SHA");
+    if (project?.externalRepositoryId && task.actionCode === "submit_evidence_repair")
+      throw new AgentTaskLeaseError(409, "EXTERNAL_REPAIR_VERIFIER_REQUIRED", "外部证据修复尚无可信仓库验证器；不能以 Runner 声明替代受控 Git HEAD 校验");
+    if (externalWorkspace) {
+      const conflict = store.db.prepare(`SELECT id FROM agent_task_leases WHERE project_id=?
+        AND status IN ('claimed','running') AND lease_expires_at>? AND external_workspace_json<>''
+        AND (? = '' OR approval_group_id <> ?)
+        AND json_extract(external_workspace_json, '$.workspaceId')=?`).get(
+        input.projectId, now, reservedGroupId, reservedGroupId, externalWorkspace.workspaceId);
+      if (conflict) throw new AgentTaskLeaseError(409, "WORKSPACE_ALREADY_RESERVED", "外部工作区已被活动租约占用");
+    }
+    const previousAttempt = store.db.prepare("SELECT * FROM agent_task_leases WHERE project_id=? AND task_key=?").get(input.projectId, task.taskKey) as LeaseRow | undefined;
     const workOrderId = randomUUID();
     const recommended = recommendedWorkspace(project?.repositoryPath ?? "", input.projectId, workerId, task.taskKey);
     // A terminal reservation is immutable history. A legal reclaim gets a distinct reservation identity,
     // while keeping the stable recommended path and branch for the same worker/task pairing.
-    const workspace = { ...recommended, key: `${recommended.key}:${workOrderId}` };
+    const workspace = { ...recommended, ...(externalWorkspace ? { path: externalWorkspace.workspacePath, branch: externalWorkspace.workspaceBranch } : {}), key: `${recommended.key}:${workOrderId}` };
     const leaseToken = randomUUID();
     const leaseExpiresAt = isoAfter(leaseSeconds);
     const row = store.db.prepare(`
@@ -1565,12 +1615,12 @@ function claimSingleAgentTask(
         lease_token, agent_id, worker_id, pool_id, session_id, run_id, lease_expires_at, attempt,
         result_digest, last_error, claimed_at, started_at, heartbeat_at, completed_at, retry_available_at,
         work_scopes_json, workspace_key, workspace_recommended_path, workspace_path,
-        workspace_branch, baseline_revision, repair_snapshot_json, updated_at
+        workspace_branch, baseline_revision, external_workspace_json, repair_snapshot_json, updated_at
       ) VALUES (
         @reservedGroupId, @workOrderId, @taskKey, @taskId, @taskRevision, @projectId, @queue, @role, @actionCode, 'claimed', @coordinationDispatchId,
         @leaseToken, @agentId, @workerId, @poolId, @sessionId, @runId, @leaseExpiresAt, 1,
         '', '', @now, '', @now, '', '', @workScopesJson, @workspaceKey, @workspaceRecommendedPath,
-        '', @workspaceBranch, '', '', @now
+        @workspacePath, @workspaceBranch, @baselineRevision, @externalWorkspaceJson, '', @now
       )
       ON CONFLICT(task_key) DO UPDATE SET
         approval_group_id=excluded.approval_group_id, id=excluded.id, task_id=excluded.task_id, task_revision=excluded.task_revision, project_id=excluded.project_id,
@@ -1582,8 +1632,8 @@ function claimSingleAgentTask(
         claimed_at=excluded.claimed_at, started_at='', heartbeat_at=excluded.heartbeat_at,
         completed_at='', retry_available_at='', work_scopes_json=excluded.work_scopes_json,
         workspace_key=excluded.workspace_key, workspace_recommended_path=excluded.workspace_recommended_path,
-        workspace_path='', workspace_branch=excluded.workspace_branch,
-        baseline_revision='', repair_snapshot_json='', updated_at=excluded.updated_at
+        workspace_path=excluded.workspace_path, workspace_branch=excluded.workspace_branch,
+        baseline_revision=excluded.baseline_revision, external_workspace_json=excluded.external_workspace_json, repair_snapshot_json='', updated_at=excluded.updated_at
       WHERE agent_task_leases.status IN ('failed', 'released', 'expired')
          OR (agent_task_leases.status IN ('claimed', 'running') AND agent_task_leases.lease_expires_at <= @now)
       RETURNING *
@@ -1609,6 +1659,9 @@ function claimSingleAgentTask(
       workspaceKey: workspace.key,
       workspaceRecommendedPath: workspace.path,
       workspaceBranch: workspace.branch,
+      workspacePath: externalWorkspace?.workspacePath ?? "",
+      baselineRevision: externalWorkspace?.baselineRevision ?? "",
+      externalWorkspaceJson: externalWorkspace ? JSON.stringify(externalWorkspace) : "",
       now,
     }) as LeaseRow | undefined;
     if (!row) {
@@ -1619,6 +1672,7 @@ function claimSingleAgentTask(
       throw new AgentTaskLeaseError(409, "TASK_ALREADY_CLAIMED", `任务已由 ${existing.agent_id} 领取，租约到期时间 ${existing.lease_expires_at}`);
     }
     if (["approve_node_requirement", "approve_node_document"].includes(row.action_code)) assertIndependentApprover(store, row);
+    consumeAgentTaskRetry(store, previousAttempt, workOrderId);
     const lease = mapLease(row);
     for (const scope of workScopes) {
       store.db.prepare(`
@@ -1631,8 +1685,8 @@ function claimSingleAgentTask(
       INSERT INTO agent_task_workspace_reservations (
         workspace_key, project_id, task_key, lease_token, worker_id, recommended_path,
         workspace_path, branch_name, baseline_revision, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, '', ?, '', 'reserved', ?, ?)
-    `).run(workspace.key, input.projectId, task.taskKey, leaseToken, workerId, workspace.path, workspace.branch, now, now);
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+    `).run(workspace.key, input.projectId, task.taskKey, leaseToken, workerId, workspace.path, externalWorkspace?.workspacePath ?? '', workspace.branch, externalWorkspace?.baselineRevision ?? '', now, now);
     upsertRunnerRegistration(store, {
       projectId: input.projectId,
       agentId: input.agentId,
@@ -1642,6 +1696,7 @@ function claimSingleAgentTask(
       role: input.role,
       capabilities: input.capabilities ?? [],
       repositoryPath: project?.repositoryPath ?? "",
+      workspacePath: externalWorkspace?.workspacePath,
     });
     cacheResponse(store, operation, input.idempotencyKey, hash, lease, now);
     audit(store, lease, "claim", context, null);
@@ -2012,6 +2067,7 @@ export function taskPackageLease(lease: AgentTaskLease): NonNullable<AgentTaskPa
     leaseExpiresAt: lease.leaseExpiresAt,
     heartbeatSeconds: AGENT_TASK_HEARTBEAT_SECONDS,
     requiredForAgentWrites: true,
+    ...(lease.externalWorkspace ? { externalWorkspace: lease.externalWorkspace } : {}),
     workScopes: lease.workScopes,
     workspace: {
       key: lease.workspaceKey,
@@ -2253,6 +2309,16 @@ function controlSingleLease(
         gapError = `design_gap_dismissed:${gap.id}:${gapInput.error.trim()}`;
       }
     }
+    const externalWorkspace = currentRow.external_workspace_json
+      ? externalWorkspaceSchema.parse(JSON.parse(currentRow.external_workspace_json)) : undefined;
+    if (externalWorkspace) {
+      if (store.getProject(currentRow.project_id)?.externalRepositoryId !== externalWorkspace.repositoryId)
+        throw new AgentTaskLeaseError(409, "EXTERNAL_REPOSITORY_MISMATCH", "项目外部仓库绑定已变化；请释放租约并重新领取");
+      for (const field of ["workspacePath", "workspaceBranch", "baselineRevision"] as const) {
+        if (input[field] !== undefined && input[field]?.trim() !== externalWorkspace[field])
+          throw new AgentTaskLeaseError(409, "EXTERNAL_WORKSPACE_IMMUTABLE", "外部工作区与基线已在领取时固定；更换需释放并重新领取");
+      }
+    }
     const workspacePath = input.workspacePath?.trim() || currentRow.workspace_path || "";
     const workspaceBranch = input.workspaceBranch?.trim() || currentRow.workspace_branch || "";
     let baselineRevision = input.baselineRevision?.trim() || currentRow.baseline_revision || "";
@@ -2330,7 +2396,7 @@ function controlSingleLease(
       }
       baselineRevision = controlledHead;
     }
-    if (operation === "start" && currentRow.role === "builder" && currentRow.action_code !== "submit_evidence_repair") {
+    if (operation === "start" && currentRow.role === "builder" && !externalWorkspace && currentRow.action_code !== "submit_evidence_repair") {
       const planId = currentRow.task_id.slice(currentRow.task_id.indexOf(":") + 1);
       const plan = store.getPlan(planId);
       const declaredBaseline = input.baselineRevision?.trim() || currentRow.baseline_revision || plan?.implementationRevision?.trim() || "";
@@ -2365,13 +2431,30 @@ function controlSingleLease(
       if (otherBuilders.length > 0 && repositoryPath && normalizedWorkspace === repositoryPath.toLocaleLowerCase()) {
         throw new AgentTaskLeaseError(409, "SHARED_WORKSPACE_FORBIDDEN", "并发施工不能使用项目共享 repositoryPath；请使用独立 Git worktree 或等价隔离目录");
       }
-      if (workspacePath && otherBuilders.some((item) => item.workspace_path
+      if (!externalWorkspace && workspacePath && otherBuilders.some((item) => item.workspace_path
         && item.workspace_path.toLocaleLowerCase() === normalizedWorkspace)) {
         throw new AgentTaskLeaseError(409, "WORKSPACE_ALREADY_RESERVED", "该工作区已由另一个 Builder 使用");
       }
     }
     let projectBriefDigest: string | null = null;
     if (operation === "complete") {
+      if (currentRow.action_code === RETRY_APPROVAL_ACTION) {
+        if (isAgentSecurityEnforced(store, currentRow.agent_id)) {
+          try {
+            if (!input.authSessionToken) throw new AgentTaskLeaseError(401, "AUTH_REQUIRED", "重试审批需要认证会话");
+            const principal = resolveAuthPrincipal(store, input.authSessionToken);
+            if (principal.agentId !== currentRow.agent_id || principal.workerId !== currentRow.worker_id)
+              throw new AgentTaskLeaseError(403, "PRINCIPAL_SPOOF_REJECTED", "认证会话与重试审批身份不一致");
+            assertAgentWorkOrderContext(store, { ...input, role: "approver", projectId: currentRow.project_id,
+              connectionId: principal.connectionId, action: context.securityAction ?? "mcp.complete_agent_task",
+              target: context.securityTarget ?? "mcp:complete_agent_task", bodyDigest: agentTaskRetryApprovalDigest(input) });
+          } catch (cause) {
+            if (cause instanceof AgentSecurityError) throw new AgentTaskLeaseError(cause.statusCode, cause.code, cause.message);
+            throw cause;
+          }
+        }
+        approveAgentTaskRetry(store, mapLease(currentRow), input as CompleteInput);
+      }
       if (currentRow.action_code === "add_function_node") {
         const completion = input as CompleteInput;
         const scopes = mapLease(currentRow).workScopes;
@@ -2618,7 +2701,10 @@ function controlSingleLease(
       `).run({ now, projectId: lease.projectId, workerId: lease.workerId });
     }
     if (row.coordination_dispatch_id && store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_child_task_dispatches'").get()) {
-      const dispatchStatus = operation === "start" ? "running" : operation === "complete" ? "completed" : operation === "release" || operation === "fail" ? "reclaimed" : "claimed";
+      // Project the resulting lease state: heartbeats must not demote running
+      // children, and formal design-gap releases must not leave active dispatches.
+      const dispatchStatus = lease.status === "running" ? "running" : lease.status === "completed" ? "completed"
+        : lease.status === "released" || lease.status === "failed" ? "reclaimed" : "claimed";
       store.db.prepare("UPDATE agent_child_task_dispatches SET status=?, updated_at=? WHERE dispatch_id=? AND status IN ('dispatched','claimed','running')")
         .run(dispatchStatus, now, row.coordination_dispatch_id);
       if (operation === "complete") {

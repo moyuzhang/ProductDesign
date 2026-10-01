@@ -53,6 +53,7 @@ import {
 } from "../../shared/types";
 import { displayAssignment, normalizeRoleAssignments, roleAssignmentErrors } from "../../shared/planRoles";
 import { api } from "../api";
+import { DesignChangeRecoveryPanel } from "./DesignChangeRecoveryPanel";
 import { navigate } from "../App";
 import { Badge, EmptyState, ErrorBanner, Field, Modal, Spinner, formatDateTime } from "../ui";
 import { agentVisibleContent, useAgentUiBridge } from "./agentUiBridge";
@@ -476,6 +477,7 @@ export function NodeDetailView(props: { diagramId: string; nodeId: string; initi
       </div>
 
       {error ? <ErrorBanner message={error} /> : null}
+      <DesignChangeRecoveryPanel projectId={diagram.projectId} diagramId={diagram.id} nodeId={draft.id} />
 
       <section className="node-detail-hero" data-kind={diagram.type === "flow" ? FLOW_NODE_META[flowTypeOf(draft)].label : NODE_KIND_LABELS[draft.kind]}>
         <div className="node-detail-kind">{diagram.type === "flow" ? FLOW_NODE_META[flowTypeOf(draft)].label : NODE_KIND_LABELS[draft.kind]} · NODE DOSSIER</div>

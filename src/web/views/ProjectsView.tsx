@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import { Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import {
   HEALTH_LEVELS,
@@ -33,22 +33,26 @@ export function ProjectsView(): ReactElement {
   const [health, setHealth] = useState("");
   const [configOnly, setConfigOnly] = useState(() => new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("configured") === "no");
   const [createOpen, setCreateOpen] = useState(false);
+  const requestId = useRef(0);
+  const reloadLatest = useRef<() => void>(() => {});
 
   const reload = useCallback(() => {
+    const currentRequest = ++requestId.current;
     setLoading(true);
     api.pageProjects({ q: q || undefined, stage: stage || undefined, health: health || undefined, configured: configOnly ? "no" : "all", offset, limit })
-      .then((page) => { setProjects(page.items); setTotal(page.total); setError(""); })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
+      .then((page) => { if (currentRequest === requestId.current) { setProjects(page.items); setTotal(page.total); setError(""); } })
+      .catch((e) => { if (currentRequest === requestId.current) { setProjects([]); setTotal(0); setError(e.message); } })
+      .finally(() => { if (currentRequest === requestId.current) setLoading(false); });
   }, [q, stage, health, configOnly, offset]);
 
-  useEffect(() => { reload(); }, [reload]);
+  reloadLatest.current = reload;
+  useEffect(() => { reload(); return () => { requestId.current += 1; }; }, [reload]);
 
   return (
     <div>
       <div className="page-header">
         <h1>项目管理</h1>
-        <div className="sub">管理你所有项目的阶段、健康度、风险与下一步</div>
+        <div className="sub">从目标出发，生成、审阅并确认产品设计</div>
       </div>
 
       <div className="toolbar">
@@ -88,6 +92,8 @@ export function ProjectsView(): ReactElement {
 
       {loading ? (
         <Spinner />
+      ) : error && projects.length === 0 ? (
+        <EmptyState text="项目列表暂不可用，请使用刷新重试。" />
       ) : projects.length === 0 && !q && !stage && !health && !configOnly ? (
         <EmptyState text="还没有项目。点击「新建项目」，项目文件将由服务统一托管。" />
       ) : projects.length === 0 ? (
@@ -131,7 +137,7 @@ export function ProjectsView(): ReactElement {
                     title="删除项目"
                     onClick={() => {
                       if (window.confirm(`确认删除项目「${p.name}」？其工作节点、计划、证据将一并删除。`)) {
-                        api.deleteProject(p.id).then(reload).catch((err) => setError(err.message));
+                        api.deleteProject(p.id).then(() => reloadLatest.current()).catch((err) => setError(err.message));
                       }
                     }}
                   >
@@ -145,12 +151,12 @@ export function ProjectsView(): ReactElement {
       )}
       {!loading ? <Pagination offset={offset} limit={limit} total={total} onChange={setOffset} /> : null}
 
-      {createOpen ? <CreateProjectModal onClose={() => setCreateOpen(false)} onCreated={reload} /> : null}
+      {createOpen ? <CreateProjectModal onClose={() => setCreateOpen(false)} onCreated={(project) => navigate(`#/projects/${project.id}?tab=workflow`)} /> : null}
     </div>
   );
 }
 
-function CreateProjectModal(props: { onClose: () => void; onCreated: () => void }): ReactElement {
+function CreateProjectModal(props: { onClose: () => void; onCreated: (project: Project) => void }): ReactElement {
   const [form, setForm] = useState({
     code: "",
     name: "",
@@ -165,29 +171,33 @@ function CreateProjectModal(props: { onClose: () => void; onCreated: () => void 
   const set = (key: keyof typeof form) => (e: { target: { value: string } }) =>
     setForm((f) => ({ ...f, [key]: e.target.value }));
 
+  const submitting = useRef(false);
   const submit = () => {
+    if (submitting.current) return;
+    submitting.current = true;
     setBusy(true);
     setError("");
     api.createProject(form)
-      .then(() => { props.onCreated(); props.onClose(); })
+      .then((project) => { props.onClose(); props.onCreated(project); })
       .catch((e) => setError(e.message))
-      .finally(() => setBusy(false));
+      .finally(() => { submitting.current = false; setBusy(false); });
   };
 
   return (
     <Modal
       title="新建项目"
-      onClose={props.onClose}
+      onClose={() => { if (!submitting.current) props.onClose(); }}
       footer={
         <>
-          <button className="btn" onClick={props.onClose}>取消</button>
+          <button className="btn" disabled={busy} onClick={props.onClose}>取消</button>
           <button className="btn btn-primary" disabled={busy || !form.name.trim() || !form.code.trim()} onClick={submit}>
-            创建
+            {busy ? "创建中…" : "创建并进入设计"}
           </button>
         </>
       }
     >
       {error ? <ErrorBanner message={error} /> : null}
+      <p className="cell-sub">先写清要解决的问题。创建后进入设计工作台；创建项目不会启动开发或自动确认设计。</p>
       <div className="form-grid">
         <Field label="项目编号（唯一）"><input type="text" value={form.code} onChange={set("code")} placeholder="如 ARRANGE_FIVE" /></Field>
         <Field label="项目名称"><input type="text" value={form.name} onChange={set("name")} placeholder="如 排列五助手" /></Field>
@@ -199,7 +209,7 @@ function CreateProjectModal(props: { onClose: () => void; onCreated: () => void 
         <Field label="文件存储"><input type="text" value="由服务托管于 data/projects/<项目ID>" readOnly /></Field>
         <Field label="开始日期"><input type="date" value={form.startAt} onChange={set("startAt")} /></Field>
         <Field label="截止日期"><input type="date" value={form.dueAt} onChange={set("dueAt")} /></Field>
-        <Field label="摘要" wide><textarea rows={3} value={form.summary} onChange={set("summary")} /></Field>
+        <Field label="项目目标" wide><textarea rows={3} value={form.summary} onChange={set("summary")} placeholder="为谁解决什么问题？希望交付什么？如何判断成功？" /></Field>
       </div>
     </Modal>
   );

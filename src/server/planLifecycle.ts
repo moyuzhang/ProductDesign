@@ -1,3 +1,4 @@
+import { assertPlanContractEvidence, assertPlanDesignContract, validateProjectDesignContract } from "./designContractValidation.js";
 import type { PlanItem } from "../shared/types.js";
 import { nowIso, type Store } from "./db.js";
 import { isActiveDeliveryPlan, isExecutableDeliveryPlan } from "./planPolicy.js";
@@ -111,7 +112,9 @@ function currentApprovedDesignRevisionIds(store: Store, plan: PlanItem): string[
   const planReferences = store.listDocumentReferences({ projectId: plan.projectId, targetType: "plan", targetId: plan.id });
   const references = [...nodeReferences, ...planReferences];
   const planReferenceIds = new Set(planReferences.map((reference) => reference.id));
-  return [...new Set(references.flatMap((reference) => {
+  const contract = validateProjectDesignContract(store, plan.projectId, plan.id);
+  const contractRevisionIds = contract.status === "valid" && contract.contractRef ? [contract.contractRef.revisionId] : [];
+  return [...new Set([...contractRevisionIds, ...references.flatMap((reference) => {
     const document = store.getDesignDoc(reference.documentId);
     const revision = store.getDocumentRevision(reference.documentRevisionId);
     return document
@@ -125,7 +128,7 @@ function currentApprovedDesignRevisionIds(store: Store, plan: PlanItem): string[
       && document.currentRevisionId === revision.id
       ? [revision.id]
       : [];
-  }))].sort();
+  })])].sort();
 }
 
 function validDesignAuditEvidence(store: Store, plan: PlanItem, resultStatus: "pass" | "fail"): boolean {
@@ -181,6 +184,17 @@ export function reconcilePlanDeliveryProjections(store: Store): number {
   return changedCount;
 }
 
+function assertNodeContractEvidence(store: Store, plan: PlanItem): void {
+  if (!plan.diagramId || !plan.diagramNodeId) return;
+  for (const sibling of store.listPlans(plan.projectId, plan.diagramId, plan.diagramNodeId).filter(isActiveDeliveryPlan)) {
+    assertPlanContractEvidence(store, sibling);
+    const report = validateProjectDesignContract(store, sibling.projectId, sibling.id);
+    if (report.contractRef && !sibling.designRevisionIds.includes(report.contractRef.revisionId)) {
+      throw Object.assign(new Error("节点验收中的关联计划合同基线已变化"), { statusCode: 409, code: "DESIGN_CONTRACT_BASELINE_CHANGED" });
+    }
+  }
+}
+
 export function transitionPlanLifecycle(store: Store, planId: string, input: PlanTransitionInput): PlanItem {
   const plan = store.getPlan(planId);
   if (!plan) throw Object.assign(new Error("计划项不存在"), { statusCode: 404 });
@@ -202,6 +216,14 @@ export function transitionPlanLifecycle(store: Store, planId: string, input: Pla
     throw Object.assign(new Error("施工计划缺少提交或批准痕迹，必须重新提交并经管理员批准后才能完成施工"), { statusCode: 409 });
   }
   assertPlanActionIdentity(plan, input.action, input.agentId);
+  if (["submit_plan", "pass_design_audit", "approve_plan", "start_development", "complete_development", "pass_audit", "approve_acceptance", "accept_node"].includes(input.action)) {
+    assertPlanDesignContract(store, plan);
+    const report = validateProjectDesignContract(store, plan.projectId, plan.id);
+    if (input.action !== "submit_plan" && report.contractRef && !plan.designRevisionIds.includes(report.contractRef.revisionId)) {
+      throw Object.assign(new Error("结构化设计合同已变化，必须重新提交设计基线并独立审计"), { statusCode: 409, code: "DESIGN_CONTRACT_BASELINE_CHANGED" });
+    }
+  }
+  if (["pass_audit", "approve_acceptance", "accept_node"].includes(input.action)) assertPlanContractEvidence(store, plan);
   if (input.action === "assess_evidence_repair_failure") {
     if (!input.repairDisposition) {
       throw Object.assign(new Error("证据修复失败评估必须明确 repairDisposition=reset 或 design_change"), { statusCode: 400 });
@@ -222,6 +244,7 @@ export function transitionPlanLifecycle(store: Store, planId: string, input: Pla
   let patch: Partial<PlanItem>;
   switch (input.action) {
     case "accept_node": {
+      assertNodeContractEvidence(store, plan);
       const diagram = plan.diagramId ? store.getDiagram(plan.diagramId) : undefined;
       const node = diagram?.nodes.find((item) => item.id === plan.diagramNodeId);
       if (!diagram || !node || !input.agentId?.trim()) {
@@ -415,6 +438,12 @@ export function transitionPlanLifecycle(store: Store, planId: string, input: Pla
       break;
   }
   const persist = () => {
+    if (input.action === "accept_node") assertNodeContractEvidence(store, plan);
+    if (input.action === "approve_acceptance") {
+      assertPlanContractEvidence(store, plan);
+      const report = validateProjectDesignContract(store, plan.projectId, plan.id);
+      if (report.contractRef && !plan.designRevisionIds.includes(report.contractRef.revisionId)) throw Object.assign(new Error("验收事务中的合同基线已变化"), { statusCode: 409, code: "DESIGN_CONTRACT_BASELINE_CHANGED" });
+    }
     const updated = store.updatePlan(plan.id, patch)!;
     if (input.action === "approve_acceptance") {
       const superseded: string[] = [];
@@ -447,5 +476,5 @@ export function transitionPlanLifecycle(store: Store, planId: string, input: Pla
     syncBoundNode(store, updated, input.action, input.reason);
     return updated;
   };
-  return input.action === "approve_acceptance" ? store.db.transaction(persist).immediate() : persist();
+  return ["approve_acceptance", "accept_node"].includes(input.action) ? store.db.transaction(persist).immediate() : persist();
 }

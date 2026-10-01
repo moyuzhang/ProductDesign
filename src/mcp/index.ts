@@ -1,3 +1,5 @@
+import { externalWorkspaceSchema } from "../server/externalWorkspace.js";
+import { agentTaskRetryApprovalDigest } from "../server/agentTaskRetry.js";
 import { claimTaskPackage } from "../server/claimTaskPackage.js";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
@@ -148,7 +150,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     { instructions: `${AGENT_POLICY_INSTRUCTIONS}\npolicyVersion=${AGENT_POLICY_VERSION}${localSession
       ? `\nHost-authorized stdio Main Agent: project=${localProject!.id}, workerId=${localSession.workerId}, role=approver. Authentication is injected by the host; all work-order, independent audit and human-only gates remain required. Authorization expires at ${localSession.expiresAt}. Restart the stdio connection to renew.` : ""}` },
   );
-  if (localSession) server.onclose = () => closeLocalAgentSession(store, localSession.credentialId);
+  if (localSession) server.server.onclose = () => closeLocalAgentSession(store, localSession.credentialId);
   const rawRegisterTool = server.registerTool.bind(server) as (...args: any[]) => any;
   (server as any).registerTool = (name: string, config: any, handler: (input: Record<string, unknown>, ...rest: unknown[]) => unknown) => {
     const risk = classifyMcpTool(name);
@@ -186,6 +188,10 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
       const now = new Date().toISOString();
       const lease = store.db.prepare("SELECT * FROM agent_task_leases WHERE id=? AND lease_token=?")
         .get(input.workOrderId, input.leaseToken) as Record<string, string> | undefined;
+      if (lease?.action_code === "approve_agent_task_retry"
+        && !["start_agent_task", "heartbeat_agent_task", "complete_agent_task", "fail_agent_task", "release_agent_task"].includes(name)) {
+        throw new AgentSecurityError(409, "ACTION_MISMATCH", "重试审批工单仅可审核并批准该次重试");
+      }
       if (lease?.approval_group_id && !["start_agent_task", "heartbeat_agent_task", "release_agent_task", "fail_agent_task", "complete_agent_task"].includes(name)) {
         throw new AgentSecurityError(409, "ACTION_MISMATCH", "范围审批组只能用于对应设计变更和租约管理");
       }
@@ -446,7 +452,11 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
           const args = { ...input, ...(!childDispatch ? { agentId: localSession.agentId, workerId: localSession.workerId, role: "approver" } : {}),
             authSessionToken: localSession.authSessionToken };
           if (typeof input.workOrderId === "string") {
-            const bodyDigest = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+            const retryApproval = name === "complete_agent_task" && Boolean(store.db.prepare(
+              "SELECT 1 FROM agent_task_leases WHERE id=? AND action_code='approve_agent_task_retry'"
+            ).get(input.workOrderId));
+            const bodyDigest = retryApproval ? agentTaskRetryApprovalDigest(input as never)
+              : createHash("sha256").update(JSON.stringify(input)).digest("hex");
             const planAction = name === "transition_plan_delivery" && typeof input.planId === "string";
             Object.assign(args, { policyAckToken: localPolicy!.policyAckToken, connectionId: localSession.connectionId,
               bodyDigest, nonceId: issueOneTimeNonce(store, { policyAckToken: localPolicy!.policyAckToken,
@@ -635,6 +645,8 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     title: "领取外部 Agent 任务包",
     description: "原子领取当前或指定的设计、编码、设计审计或实现审计任务，返回带项目、节点、计划、文档、workflow 摘要、deliveryTrack、auditScope、生产者身份和租约的机器可读交付包。领取后以任务包为上下文真源，不要重复读取全局项目或编排；仅在终态动作或租约/修订错误后刷新 workflow。同一任务修订只能被一个 Agent 持有；生产 Worker 不得自审。",
     inputSchema: {
+      externalWorkspace: externalWorkspaceSchema.optional(),
+      authSessionToken: z.string().min(32).max(300).optional(),
       projectRef: z.string().min(1).describe("项目 code 或 id"),
       role: z.enum(["designer", "builder", "auditor", "approver"]).describe("领取角色"),
       agentId: z.string().trim().min(1).max(200).describe("计划角色身份；必须与受派身份一致"),
@@ -648,16 +660,16 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
       leaseSeconds: z.number().int().min(15).max(1800).default(1800),
       idempotencyKey: z.string().trim().min(1).max(300).describe("客户端生成的幂等键；重试必须复用同一个值"),
     },
-  }, ({ projectRef, role, agentId, workerId, poolId, taskId, taskKey, sessionId, runId, capabilities, leaseSeconds, idempotencyKey }) => {
+  }, ({ externalWorkspace, authSessionToken, projectRef, role, agentId, workerId, poolId, taskId, taskKey, sessionId, runId, capabilities, leaseSeconds, idempotencyKey }) => {
     const project = byRef(store, projectRef);
     if (!project) return { ...toolText(`PROJECT_NOT_FOUND: 未找到项目: ${projectRef}`), isError: true };
     try {
       return toolText(claimTaskPackage(store, {
-        projectId: project.id, taskId, taskKey, role, agentId, workerId,
+        externalWorkspace, authSessionToken, projectId: project.id, taskId, taskKey, role, agentId, workerId,
         poolId, sessionId, runId, capabilities, leaseSeconds, idempotencyKey,
       }, { actor: agentId, source: "mcp", clientId: "productdesign-mcp" }));
     } catch (cause) {
-      if (cause instanceof AgentTaskPackageError || cause instanceof AgentTaskLeaseError) {
+      if (cause instanceof AgentTaskPackageError || cause instanceof AgentTaskLeaseError || cause instanceof AgentSecurityError) {
         return { ...toolText(structuredError(cause)), isError: true };
       }
       throw cause;
@@ -668,6 +680,8 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     title: "由 Worker 池领取下一任务",
     description: "推荐入口。外部 Worker 不选择 taskId，由服务端按层级、优先级、容量、项目阻塞状态和资源范围锁原子派发一个可执行任务，并返回完整任务包作为上下文真源；领取后无需重复读取项目、节点或租约。同一设计缺口的范围审批会原子领取完整审批组，占一个槽位；返回 approvalGroupId 和 scopeApprovals，设计变更提交时携带全部范围租约，续租和释放任一成员会作用于整组。",
     inputSchema: {
+      externalWorkspace: externalWorkspaceSchema.optional(),
+      authSessionToken: z.string().min(32).max(300).optional(),
       projectRef: z.string().min(1).describe("项目 code 或 id"),
       role: z.enum(["designer", "builder", "auditor", "approver"]).describe("Worker 角色"),
       agentId: z.string().trim().min(1).max(200).describe("计划角色身份"),
@@ -679,16 +693,16 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
       leaseSeconds: z.number().int().min(15).max(1800).default(1800),
       idempotencyKey: z.string().trim().min(1).max(300),
     },
-  }, ({ projectRef, role, agentId, workerId, poolId, sessionId, runId, capabilities, leaseSeconds, idempotencyKey }) => {
+  }, ({ externalWorkspace, authSessionToken, projectRef, role, agentId, workerId, poolId, sessionId, runId, capabilities, leaseSeconds, idempotencyKey }) => {
     const project = byRef(store, projectRef);
     if (!project) return { ...toolText(`PROJECT_NOT_FOUND: 未找到项目: ${projectRef}`), isError: true };
     try {
       return toolText(claimTaskPackage(store, {
-        projectId: project.id, role, agentId, workerId, poolId,
+        externalWorkspace, authSessionToken, projectId: project.id, role, agentId, workerId, poolId,
         sessionId, runId, capabilities, leaseSeconds, idempotencyKey,
       }, { actor: `worker:${workerId}`, source: "mcp", clientId: "productdesign-mcp" }));
     } catch (cause) {
-      if (cause instanceof AgentTaskPackageError || cause instanceof AgentTaskLeaseError) {
+      if (cause instanceof AgentTaskPackageError || cause instanceof AgentTaskLeaseError || cause instanceof AgentSecurityError) {
         return { ...toolText(structuredError(cause)), isError: true };
       }
       throw cause;
@@ -733,9 +747,9 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
   });
   server.registerTool("dispatch_child_task", {
     title: "Main Agent 派发子任务",
-    description: "Main Agent 按当前阶段派发精确 Designer、Builder 或 Auditor 任务；响应不包含子 Agent leaseToken。",
+    description: "Main Agent 按当前阶段派发精确 Designer、Builder 或 Auditor 任务；响应不包含子 Agent leaseToken。可选 idempotencyKey 按操作/项目/父租约隔离，重试仅返回仍有效的当前派发。",
     inputSchema: {
-      ...coordinationParentSchema, taskId: z.string().trim().min(1).max(1000), taskKey: z.string().trim().min(1).max(2000).optional(),
+      ...coordinationParentSchema, idempotencyKey: z.string().trim().min(1).max(300).optional(), taskId: z.string().trim().min(1).max(1000), taskKey: z.string().trim().min(1).max(2000).optional(),
       role: z.enum(["designer", "builder", "auditor"]), agentId: z.string().trim().max(200).optional(),
       workerId: z.string().trim().max(300).optional(), poolId: z.string().trim().max(500).optional(),
     },
@@ -749,6 +763,8 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     title: "子 Agent 领取已派发任务包",
     description: "子 Agent 只能凭 Main Agent 生成的一次性 dispatchId 领取精确任务包和自己的子 leaseToken；不得自选任务。",
     inputSchema: {
+      externalWorkspace: externalWorkspaceSchema.optional(),
+      authSessionToken: z.string().min(32).max(300).optional(),
       projectRef: z.string().min(1), dispatchId: z.string().trim().min(1).max(300), agentId: z.string().trim().min(1).max(200),
       workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), sessionId: z.string().trim().max(300).optional(),
       runId: z.string().trim().max(300).optional(), capabilities: z.array(z.string().trim().min(1).max(100)).max(50).default([]),
@@ -758,7 +774,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     const project = byRef(store, projectRef);
     if (!project) return { ...toolText(`PROJECT_NOT_FOUND: 未找到项目: ${projectRef}`), isError: true };
     try { return toolText(claimDispatchedChildTask(store, { ...input, projectId: project.id })); }
-    catch (cause) { if (cause instanceof CoordinationLeaseError || cause instanceof AgentTaskLeaseError) return { ...toolText(structuredError(cause)), isError: true }; throw cause; }
+    catch (cause) { if (cause instanceof CoordinationLeaseError || cause instanceof AgentTaskLeaseError || cause instanceof AgentSecurityError) return { ...toolText(structuredError(cause)), isError: true }; throw cause; }
   });
   const parentAction = (name: string, title: string, description: string, schema: Record<string, z.ZodTypeAny>, run: (input: any) => unknown) => server.registerTool(name, { title, description, inputSchema: { ...coordinationParentSchema, ...schema } }, (input: any) => {
     const project = byRef(store, input.projectRef);
@@ -767,8 +783,8 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
     catch (cause) { if (cause instanceof CoordinationLeaseError) return { ...toolText(structuredError(cause)), isError: true }; throw cause; }
   });
   parentAction("reclaim_child_task", "Main Agent 回收子任务", "Main Agent 回收子任务并使旧子租约失效。", { dispatchId: z.string().trim().min(1).max(300), reason: z.string().trim().max(4000).optional() }, (input) => reclaimChildTask(store, input));
-  parentAction("reassign_child_task", "Main Agent 重派子任务", "Main Agent 回收旧子租约后，按新的精确身份重派任务。", {
-    dispatchId: z.string().trim().min(1).max(300), role: z.enum(["designer", "builder", "auditor"]), taskId: z.string().trim().max(1000).optional(),
+  parentAction("reassign_child_task", "Main Agent 重派子任务", "Main Agent 回收旧子租约后，按新的精确身份重派任务。可选 idempotencyKey 可安全重试同一次改派，失效替代派发不可重放。", {
+    idempotencyKey: z.string().trim().min(1).max(300).optional(), dispatchId: z.string().trim().min(1).max(300), role: z.enum(["designer", "builder", "auditor"]), taskId: z.string().trim().max(1000).optional(),
     agentId: z.string().trim().min(1).max(200), workerId: z.string().trim().min(1).max(300), poolId: z.string().trim().max(500).optional(), reason: z.string().trim().max(4000).optional(),
   }, (input) => reassignChildTask(store, input));
   parentAction("pause_coordination_lease", "暂停父协调租约", "暂停父租约并级联回收所有活动子租约。", {}, (input) => pauseCoordinationLease(store, input));
@@ -971,7 +987,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
   leaseTool("heartbeat_agent_task", "续租 Agent 任务", "Agent 执行期间定期续租；租约丢失后必须停止写入。", {
     leaseSeconds: z.number().int().min(15).max(1800).default(1800),
   }, (input, context) => heartbeatAgentTask(store, input as never, context));
-  leaseTool("complete_agent_task", "完成 Agent 任务", "关闭已完成的任务租约；approve_node_document 会在精确工单修订下原子批准当前文档并固定节点引用，计划流转通常会自动完成其它租约。", {
+  leaseTool("complete_agent_task", "完成 Agent 任务", "关闭已完成的任务租约；approve_node_document 原子批准当前文档；approve_agent_task_retry 只批准一次精确失败尝试恢复，需完整工单上下文、独立审核 resultDigest。已登记恢复审批身份需 authSessionToken、policyAckToken、nonceId；nonce bodyDigest=SHA256(JSON.stringify({workOrderId,resultDigest:resultDigest.trim(),idempotencyKey}))。计划流转通常自动完成其它租约。", {
     resultDigest: z.string().max(4000).optional(),
     documentRevisionId: z.string().max(300).optional(), implementationRevision: z.string().max(300).optional(),
     evidenceId: z.string().max(300).optional(), testCommand: z.string().max(2000).optional(),
@@ -1516,4 +1532,3 @@ if (isDirectRun) {
     process.exit(1);
   }
 }
-
