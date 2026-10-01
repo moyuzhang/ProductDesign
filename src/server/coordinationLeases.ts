@@ -224,8 +224,6 @@ export function ensureCoordinationLeaseSchema(store: Store): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_active_project
-      ON agent_coordination_leases(project_id) WHERE status IN ('active', 'paused');
     CREATE TABLE IF NOT EXISTS agent_coordination_idempotency (
       operation TEXT NOT NULL,
       idempotency_key TEXT NOT NULL,
@@ -294,6 +292,32 @@ export function ensureCoordinationLeaseSchema(store: Store): void {
         VALUES (?,?,'system','legacy_unbound_security_migration','controlled','success',?)`)
         .run(randomUUID(), timestamp, JSON.stringify({ coordinationLeaseId: row.id, projectId: row.project_id }));
     }
+    // Migrate the former project singleton without discarding authenticated
+    // leases. Inconsistent historical state must fail closed atomically.
+    const inconsistent = store.db.prepare(`
+      SELECT project_id FROM agent_coordination_leases WHERE status IN ('active','paused')
+      GROUP BY project_id HAVING COUNT(*) > 1 AND SUM(CASE WHEN target_plan_id='' THEN 1 ELSE 0 END) > 0
+      UNION ALL
+      SELECT project_id FROM agent_coordination_leases WHERE status IN ('active','paused') AND target_plan_id<>''
+      GROUP BY project_id, target_plan_id HAVING COUNT(*) > 1
+      UNION ALL
+      SELECT project_id FROM agent_coordination_leases WHERE status IN ('active','paused')
+      GROUP BY project_id, lower(trim(worker_id)) HAVING COUNT(*) > 1
+      LIMIT 1
+    `).get();
+    if (inconsistent) throw new CoordinationLeaseError(409, "COORDINATION_SCHEMA_CONFLICT", "活动协调租约存在目标或 Worker 冲突；迁移已回滚，需先核对历史状态");
+    store.db.exec(`
+      DROP INDEX IF EXISTS idx_coordination_active_project;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_active_plan
+        ON agent_coordination_leases(project_id, target_plan_id)
+        WHERE status IN ('active','paused') AND target_plan_id<>'';
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_active_worker
+        ON agent_coordination_leases(project_id, lower(trim(worker_id)))
+        WHERE status IN ('active','paused');
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_active_no_plan
+        ON agent_coordination_leases(project_id)
+        WHERE status IN ('active','paused') AND target_plan_id='';
+    `);
   }).immediate();
 }
 
@@ -495,12 +519,18 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
       upsertCoordinationRunner(store, current.project_id, current.main_agent_id, current.worker_id, current.id, "online");
       return mapLease(current);
     }
-    const existing = store.db.prepare("SELECT * FROM agent_coordination_leases WHERE project_id=? AND status IN ('active','paused')")
-      .get(input.projectId) as CoordinationLeaseRow | undefined;
+    // Exact plan parents may run independently only with distinct workers.
+    // No-plan design coordination intentionally retains project exclusivity.
+    const existing = store.db.prepare(`SELECT * FROM agent_coordination_leases
+      WHERE project_id=? AND status IN ('active','paused')
+        AND (lower(trim(worker_id))=lower(trim(?)) OR target_plan_id=? OR target_plan_id='' OR ?='')
+      ORDER BY CASE WHEN lower(trim(worker_id))=lower(trim(?)) THEN 0 ELSE 1 END, created_at
+      LIMIT 1`)
+      .get(input.projectId, input.workerId, targetPlanId, targetPlanId, input.workerId) as CoordinationLeaseRow | undefined;
     if (existing) {
       if (!bindingValid(store, existing) || existing.claim_credential_id !== binding.credentialId
         || existing.claim_auth_session_hash !== binding.sessionHash || existing.claim_revocation_version !== binding.revocationVersion)
-        throw new CoordinationLeaseError(409, "COORDINATION_LEASE_BUSY", "项目已有其他认证会话的父协调租约");
+        throw new CoordinationLeaseError(409, "COORDINATION_LEASE_BUSY", "目标或 Worker 已有其他认证会话的父协调租约");
       if (existing.main_agent_id === input.mainAgentId && existing.worker_id === input.workerId) {
         if (existing.target_plan_id || existing.target_task_key) {
           if (existing.target_plan_id !== targetPlanId || existing.target_task_key !== targetTaskKey || existing.target_task_revision !== targetTaskRevision) {
@@ -516,7 +546,7 @@ export function claimCoordinationLease(store: Store, input: ClaimCoordinationLea
         upsertCoordinationRunner(store, existing.project_id, existing.main_agent_id, existing.worker_id, existing.id, "online");
         return mapLease(store.db.prepare("SELECT * FROM agent_coordination_leases WHERE id=?").get(existing.id) as CoordinationLeaseRow);
       }
-      throw new CoordinationLeaseError(409, "COORDINATION_LEASE_BUSY", "项目已有有效父协调租约");
+      throw new CoordinationLeaseError(409, "COORDINATION_LEASE_BUSY", "目标或 Worker 已有有效父协调租约");
     }
     if (!targetPlanId) {
       const task = listClaimableAgentTasks(store, input.projectId).find((candidate) => candidate.taskKey === targetTaskKey);

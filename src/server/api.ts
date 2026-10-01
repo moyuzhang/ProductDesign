@@ -1690,9 +1690,13 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       leaseToken: z.string().trim().max(300).optional(),
       idempotencyKey: z.string().trim().max(300).optional(),
       reason: z.string().max(4000).optional(),
+      documentRevisionId: z.string().trim().max(300).optional(),
       implementationRevision: z.string().max(200).optional(),
       evidenceId: z.string().trim().max(300).optional(),
       testCommand: z.string().max(2000).optional(),
+      verdict: z.enum(["pass", "fail"]).optional(),
+      reworkConditions: z.string().max(4000).optional(),
+      authSessionToken: z.string().min(32).max(300).optional(),
       repairDisposition: z.enum(["reset", "design_change"]).optional(),
       correlationId: z.string().max(300).optional(),
       clientId: z.string().max(300).optional(),
@@ -1738,6 +1742,12 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
           evidenceId: body.evidenceId,
           testCommand: body.testCommand,
           implementationRevision: body.implementationRevision,
+          documentRevisionId: body.documentRevisionId,
+          verdict: body.verdict, reworkConditions: body.reworkConditions,
+          workOrderId: body.workOrderId, taskKey: body.taskKey, taskRevision: body.taskRevision,
+          workerId: body.workerId, role: body.role, authSessionToken: body.authSessionToken,
+          policyAckToken: body.policyAckToken, nonceId: body.nonceId,
+          bodyDigest: body.bodyDigest, connectionId: body.connectionId,
         }, { actor: body.actor, source: "web", clientId: body.clientId, sessionId: body.sessionId, model: body.model });
         return next;
       }).immediate();

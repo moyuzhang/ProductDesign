@@ -739,9 +739,13 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
       leaseToken: z.string().trim().max(300).optional(),
       idempotencyKey: z.string().trim().max(300).optional(),
       reason: z.string().max(4000).optional(),
+      documentRevisionId: z.string().trim().max(300).optional(),
       implementationRevision: z.string().max(200).optional(),
       evidenceId: z.string().trim().max(300).optional(),
       testCommand: z.string().max(2000).optional(),
+      verdict: z.enum(["pass", "fail"]).optional(),
+      reworkConditions: z.string().max(4000).optional(),
+      authSessionToken: z.string().min(32).max(300).optional(),
       repairDisposition: z.enum(["reset", "design_change"]).optional(),
       correlationId: z.string().max(300).optional(), clientId: z.string().max(300).optional(),
       sessionId: z.string().max(300).optional(), model: z.string().max(300).optional(),
@@ -751,7 +755,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
       nonceId: z.string().max(300).optional(), bodyDigest: z.string().max(128).optional(), connectionId: z.string().max(300).optional(),
       coordinationLeaseId: z.string().trim().max(300).optional(), coordinationLeaseToken: z.string().trim().max(300).optional(),
     },
-  }, ({ planId, action, actor, agentId, leaseToken, idempotencyKey, reason, implementationRevision, evidenceId, testCommand, repairDisposition, correlationId, clientId, sessionId, model,
+  }, ({ planId, action, actor, agentId, leaseToken, idempotencyKey, reason, documentRevisionId, implementationRevision, evidenceId, testCommand, verdict, reworkConditions, authSessionToken, repairDisposition, correlationId, clientId, sessionId, model,
     policyAckToken, workOrderId, taskKey, taskRevision, workerId, role, nonceId, bodyDigest, connectionId, coordinationLeaseId, coordinationLeaseToken }) => {
     const before = store.getPlan(planId);
     if (!before) return error(`未找到计划项: ${planId}`);
@@ -776,7 +780,9 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
         if (!coordination) advanceAgentTaskLeaseForPlanAction(store, lease, {
           action, agentId, idempotencyKey,
           resultDigest: implementationRevision || reason || `${action}:${planId}`,
-          evidenceId, testCommand, implementationRevision,
+          evidenceId, testCommand, implementationRevision, documentRevisionId, verdict, reworkConditions,
+          workOrderId, taskKey, taskRevision, workerId, role, authSessionToken,
+          policyAckToken, nonceId, bodyDigest, connectionId,
         }, context);
         recordAudit(store, actor, {
           projectId: before.projectId, entityType: "plan", entityId: planId, action,
