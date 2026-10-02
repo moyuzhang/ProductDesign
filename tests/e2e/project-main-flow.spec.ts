@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { DesignContractReport } from "../../src/shared/designContract";
 
 test.use({ launchOptions: { executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH }, viewport: { width: 1440, height: 960 } });
 
@@ -6,15 +7,31 @@ test.use({ launchOptions: { executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH
 const project = { id: "flow-fixture", name: "交付主流程测试", code: "FLOW_FIXTURE", summary: "验证目标到交付的入口", nextStep: "", riskSummary: "", blockerSummary: "", stage: "设计", health: "正常", progress: 0, riskLevel: "P2", startAt: "", dueAt: "", updatedAt: "2026-09-30T00:00:00Z", unconfigured: true };
 const workflow = { policyVersion: "1", phase: "discovery", phaseLabel: "了解项目", status: "blocked", summary: "请先确认项目目标与简报", nextAction: { title: "确认项目简报", description: "补齐目标和验收标准", href: "#/projects/flow-fixture?tab=documents" }, nodes: [], layerGate: { totalLayers: 0 } };
 
+const contractReport = {
+  status: "unassessed",
+  scope: "declared-structured-requirements-only",
+  issues: [], coverage: [], plans: [], cycles: [],
+} satisfies DesignContractReport;
+
+// Fail on asynchronous render errors as well as missing UI assertions.
+let pageErrors: string[];
+test.beforeEach(async ({ page }) => {
+  pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+});
+test.afterEach(() => expect(pageErrors).toEqual([]));
+
 test("new projects open the real next-step surface; tools and browser history remain accessible", async ({ page }) => {
   let created = false;
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
+    if (url.pathname.endsWith("/agent-events")) return route.fulfill({ status: 204, body: "" });
     let body: unknown = [];
     if (url.pathname === "/api/projects" && route.request().method() === "POST") { created = true; body = project; }
     else if (url.pathname === "/api/projects") body = url.searchParams.has("offset") ? { items: created ? [project] : [], total: created ? 1 : 0 } : created ? [project] : [];
     else if (url.pathname.endsWith("/workspace")) body = { project, mainDiagram: null, metrics: { functionalNodes: 0, completedNodes: 0, acceptedNodes: 0, pendingAcceptanceNodes: 0, completedPlans: 0, plans: 0, documents: 0, evidence: 0, missingEvidenceNodes: 0 } };
     else if (url.pathname.endsWith("/workflow")) body = workflow;
+    else if (url.pathname.endsWith("/design-contract-validation")) body = contractReport;
     else if (url.searchParams.has("offset")) body = { items: [], total: 0 };
     await route.fulfill({ json: body });
   });
@@ -48,15 +65,21 @@ test("workflow failure is retryable and absence of an action is not presented as
     const url = new URL(route.request().url());
     if (url.pathname.endsWith("/workflow")) {
       reads += 1;
-      if (reads === 1) return route.fulfill({ status: 503, json: { error: "流程服务暂不可用" } });
+      if (reads === 1) return route.fulfill({ status: 503, json: { message: "流程服务暂不可用" } });
       return route.fulfill({ json: { ...workflow, nextAction: null } });
     }
-    const body = url.pathname.endsWith("/workspace") ? { project, mainDiagram: null, metrics: {} } : url.searchParams.has("offset") ? { items: [], total: 0 } : [project];
+    if (url.pathname.endsWith("/agent-events")) return route.fulfill({ status: 204, body: "" });
+    const body = url.pathname.endsWith("/workspace") ? { project, mainDiagram: null, metrics: {} }
+      : url.pathname.endsWith("/design-contract-validation") ? contractReport
+      : url.searchParams.has("offset") ? { items: [], total: 0 }
+      : url.pathname === "/api/projects" ? [project] : [];
     await route.fulfill({ json: body });
   });
   await page.goto("/#/projects/flow-fixture");
   await page.getByText("外部开发交付（由连接的 harness 执行）", { exact: true }).click();
+  await expect(page.getByText("流程服务暂不可用（HTTP 503）", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "重试加载流程" }).click();
+  await expect.poll(() => reads).toBe(2);
   await expect(page.getByText("当前没有可执行的下一步。请刷新流程并检查缺失门禁；这不代表已完成。", { exact: true })).toBeVisible();
   await expect(page.getByText("所有交付节点均已验收", { exact: true })).toHaveCount(0);
 });

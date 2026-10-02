@@ -323,6 +323,28 @@ export interface AuditEvent {
   createdAt: string;
 }
 
+export interface BackupProtectionIssue {
+  assetId: string;
+  projectId: string;
+  reason: "missing" | "corrupt";
+  expectedSha256: string;
+  expectedByteSize: number;
+  actualSha256: string | null;
+  actualByteSize: number | null;
+}
+
+export interface BackupProtectionChallenge {
+  sourceFingerprint: string;
+  targetFingerprint: string;
+  issues: BackupProtectionIssue[];
+}
+
+export interface BackupProtectionConfirmation {
+  sourceFingerprint: string;
+  targetFingerprint: string;
+  acknowledgement: "PARTIAL_PROTECTION_IS_NOT_RESTORABLE";
+}
+
 export interface Backup {
   id: string;
   label: string;

@@ -14,20 +14,45 @@ interface ProjectWorkspaceResponse {
 
 test.use({ channel: "chrome", viewport: { width: 1440, height: 960 } });
 
+const fixtureProjects: ProjectSummary[] = [];
+test.beforeEach(async ({ request }) => {
+  for (const suffix of ["A", "B"]) {
+    const response = await request.post("/api/projects", { data: { code: `SWITCH-${Date.now()}-${suffix}`, name: `Synthetic workspace ${suffix}`, stage: "探索" } });
+    expect(response.ok()).toBeTruthy();
+    const project = await response.json() as ProjectSummary;
+    fixtureProjects.push(project);
+    expect((await request.get(`/api/projects/${project.id}/workflow`)).ok()).toBeTruthy();
+  }
+});
+test.afterEach(async ({ request }) => {
+  const cleanupErrors: string[] = [];
+  for (const project of fixtureProjects.splice(0)) {
+    try {
+      const state = await request.get(`/api/projects/${project.id}/workflow`);
+      if (!state.ok()) cleanupErrors.push(`Read owned workflow ${project.id}: HTTP ${state.status()}`);
+    } catch (error) { cleanupErrors.push(`Read owned workflow ${project.id}: ${String(error)}`); }
+    try {
+      const removed = await request.delete(`/api/projects/${project.id}`);
+      if (!removed.ok()) cleanupErrors.push(`Delete owned project ${project.id}: HTTP ${removed.status()}`);
+    } catch (error) { cleanupErrors.push(`Delete owned project ${project.id}: ${String(error)}`); }
+  }
+  expect(cleanupErrors, "Synthetic workspace fixture cleanup failed").toEqual([]);
+});
+
 test("global project context stays visible and switches routes atomically", async ({ page, request }) => {
   const projectsResponse = await request.get("/api/projects");
   expect(projectsResponse.ok()).toBeTruthy();
   const projects = await projectsResponse.json() as ProjectSummary[];
   expect(projects.length).toBeGreaterThan(0);
 
-  const source = projects.find((project) => project.code === "PRODUCTDESIGN") ?? projects[0];
+  const source = fixtureProjects[0];
   const sourceWorkspaceResponse = await request.get(`/api/projects/${source.id}/workspace`);
   expect(sourceWorkspaceResponse.ok()).toBeTruthy();
   const sourceWorkspace = await sourceWorkspaceResponse.json() as ProjectWorkspaceResponse;
   expect(sourceWorkspace.mainDiagram?.id).toBeTruthy();
 
   let targetWorkspace: ProjectWorkspaceResponse | undefined;
-  for (const candidate of projects.filter((project) => project.id !== source.id).slice(0, 20)) {
+  for (const candidate of fixtureProjects.filter((project) => project.id !== source.id)) {
     const response = await request.get(`/api/projects/${candidate.id}/workspace`);
     if (!response.ok()) continue;
     const workspace = await response.json() as ProjectWorkspaceResponse;
@@ -50,7 +75,7 @@ test("global project context stays visible and switches routes atomically", asyn
   await expect(page.locator(".ws-menu")).toBeVisible();
   await expect(page.locator(".ws-menu-foot")).toContainText(`${projects.length} 个项目`);
   await page.locator(".ws-search input").fill(targetWorkspace!.project.code);
-  const targetRow = page.locator(".ws-item-row", { hasText: targetWorkspace!.project.code });
+  const targetRow = page.locator(".ws-item-row", { hasText: targetWorkspace!.project.name });
   await expect(targetRow).toHaveCount(1);
   await page.screenshot({ path: "artifacts/regression/workspace-search.png", fullPage: true });
   await targetRow.locator(".ws-item").click();
@@ -61,7 +86,7 @@ test("global project context stays visible and switches routes atomically", asyn
   await expect(page.locator(".ws-context-copy strong")).toHaveText(source.name);
   await page.keyboard.press("Control+K");
   await page.locator(".ws-search input").fill(targetWorkspace!.project.code);
-  await page.locator(".ws-item-row", { hasText: targetWorkspace!.project.code }).locator(".ws-item").click();
+  await page.locator(".ws-item-row", { hasText: targetWorkspace!.project.name }).locator(".ws-item").click();
   await expect.poll(() => page.url()).toContain(`#/canvas/${targetWorkspace!.mainDiagram!.id}`);
   await expect(page.locator(".ws-context-copy strong")).toHaveText(targetWorkspace!.project.name);
 
@@ -73,8 +98,7 @@ test("global project context stays visible and switches routes atomically", asyn
 });
 
 test("project context remains accessible on a mobile viewport", async ({ page, request }) => {
-  const projects = await (await request.get("/api/projects")).json() as ProjectSummary[];
-  const project = projects.find((item) => item.code === "PRODUCTDESIGN") ?? projects[0];
+  const project = fixtureProjects[0];
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`/#/projects/${project.id}`);

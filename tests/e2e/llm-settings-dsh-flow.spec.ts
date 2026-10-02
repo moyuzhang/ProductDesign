@@ -1,6 +1,8 @@
 import { createServer, type Server } from "node:http";
 import { expect, test } from "@playwright/test";
 
+// This is a loopback fake-model integration test, not real provider/model acceptance.
+// The synthetic key is only sent to the local test HTTP server.
 const createdProfileIds = new Set<string>();
 const createdProjectIds = new Set<string>();
 const createdSessionIds = new Set<string>();
@@ -84,18 +86,31 @@ test.afterAll(async () => {
 });
 
 test.afterEach(async ({ request }) => {
-  for (const id of createdSessionIds) await request.delete(`/api/agent-sessions/${id}`).catch(() => undefined);
-  for (const id of createdProjectIds) await request.delete(`/api/projects/${id}`).catch(() => undefined);
-  for (const id of createdProfileIds) await request.delete(`/api/llm-profiles/${id}`).catch(() => undefined);
-  createdSessionIds.clear();
-  createdProjectIds.clear();
-  createdProfileIds.clear();
+  const cleanupErrors: string[] = [];
+  for (const projectId of createdProjectIds) {
+    try {
+      const workspace = await request.get(`/api/projects/${projectId}/agent-workspace`);
+      if (workspace.ok()) for (const session of (await workspace.json()).sessions) createdSessionIds.add(session.id);
+      else cleanupErrors.push(`Read owned workspace ${projectId}: HTTP ${workspace.status()}`);
+    } catch (error) { cleanupErrors.push(`Read owned workspace ${projectId}: ${String(error)}`); }
+  }
+  for (const [resource, ids] of [["agent-sessions", createdSessionIds], ["projects", createdProjectIds], ["llm-profiles", createdProfileIds]] as const) {
+    for (const id of ids) {
+      try {
+        const removed = await request.delete(`/api/${resource}/${id}`);
+        if (!removed.ok()) cleanupErrors.push(`Delete owned ${resource}/${id}: HTTP ${removed.status()}`);
+      } catch (error) { cleanupErrors.push(`Delete owned ${resource}/${id}: ${String(error)}`); }
+    }
+    ids.clear();
+  }
   upstreamPaths.length = 0;
   upstreamBodies.length = 0;
   mutationTarget = null;
+  // Playwright retains any test-body error alongside this aggregate teardown assertion.
+  expect(cleanupErrors, "Synthetic LLM fixture cleanup failed").toEqual([]);
 });
 
-test("DSH-style API key flow reaches openai-chat and the Agent workbench", async ({ page, request }) => {
+test("fake-upstream API configuration runs restricted design tools and persists their output", async ({ page, request }) => {
   const profileName = `E2E Compatible Chat ${Date.now()}`;
   await page.goto("/#/llm");
 
@@ -166,7 +181,7 @@ test("DSH-style API key flow reaches openai-chat and the Agent workbench", async
   await page.goto(`/#/canvas/${mainDiagram.id}`);
   await page.reload();
   await expect(page.getByRole("textbox", { name: "回车保存，Esc 取消" })).toHaveValue("系统主画布");
-  const selectedNodeButton = page.getByRole("button", { name: /待 Agent 修改的节点/ });
+  const selectedNodeButton = page.locator(`[data-node-id="${selectedNode.id}"][role="button"]`);
   await expect(selectedNodeButton).toBeVisible();
   await selectedNodeButton.focus();
   await page.getByRole("button", { name: "打开项目 Agent 工作台" }).click();
@@ -174,25 +189,32 @@ test("DSH-style API key flow reaches openai-chat and the Agent workbench", async
   await expect(dock).toBeVisible();
   await dock.getByLabel("项目工作台").selectOption(project.id);
   await dock.locator(".agent-runtime-selects select").first().selectOption(saved.id);
+  const sessionResponse = page.waitForResponse((response) => response.url().endsWith("/api/agent-sessions") && response.request().method() === "POST");
   await dock.getByTitle("新建会话").click();
+  const session = await (await sessionResponse).json() as { id: string; controlMode: string; model: string; profileId: string };
+  createdSessionIds.add(session.id);
+  expect(session).toMatchObject({ controlMode: "restricted", model: "browser-chat-model", profileId: saved.id });
   const narrowedProfile = await request.patch(`/api/llm-profiles/${saved.id}`, {
     data: { models: ["replacement-model"], defaultModel: "replacement-model" },
   });
   expect(narrowedProfile.ok()).toBeTruthy();
-  const controlMode = dock.getByLabel("Agent 控制模式");
-  await expect(controlMode).toHaveValue("restricted");
-  await controlMode.selectOption("project-autonomous");
-  await expect(controlMode).toHaveValue("project-autonomous");
-  await expect(dock.locator(".agent-control-note")).toContainText("受管项目目录");
+  await expect(dock.getByLabel("Agent 控制模式")).toHaveCount(0);
+  await expect(dock.getByText("仅产品设计", { exact: true })).toBeVisible();
+  await expect(dock.locator(".agent-control-note").last()).toContainText("不执行命令、不写目标项目源码");
   await expect(dock.locator(".agent-composer-tools button")).toContainText("已关联当前页 · 1 项选中");
-  const composer = dock.getByPlaceholder("向项目 Agent 说明目标，Enter 发送，Shift+Enter 换行");
+  const composer = dock.getByPlaceholder("描述设计目标或修改意见，Enter 发送，Shift+Enter 换行");
   await expect(composer).toBeEnabled();
   await composer.fill("请修改我在画布中选中的节点");
   await dock.getByRole("button", { name: "发送" }).click();
   await expect(dock.locator(".agent-message.assistant.completed")).toContainText("Chrome 中的兼容对话已完成", { timeout: 10_000 });
   await expect.poll(() => upstreamPaths.filter((path) => path === "/v1/chat/completions").length).toBeGreaterThanOrEqual(3);
-  await expect(page.getByRole("button", { name: /Agent 已更新选中节点/ })).toBeVisible({ timeout: 10_000 });
+  await expect(selectedNodeButton).toHaveAttribute("aria-label", /Agent 已更新选中节点/, { timeout: 10_000 });
   const agentRequest = upstreamBodies.find((body) => Array.isArray(body.tools));
+  const exposedTools = (agentRequest?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name);
+  expect(exposedTools).toEqual(expect.arrayContaining(["create_design_doc", "mutate_diagram"]));
+  expect(exposedTools).not.toContain("transition_plan_delivery");
+  expect(exposedTools).not.toContain("create_evidence");
+  expect(agentRequest?.model).toBe("browser-chat-model");
   const agentMessages = agentRequest?.messages as Array<{ role?: string; content?: string }> | undefined;
   const agentUserPrompt = agentMessages?.find((message) => message.role === "user")?.content ?? "";
   expect(agentUserPrompt).toContain(selectedNode.id);
@@ -200,12 +222,17 @@ test("DSH-style API key flow reaches openai-chat and the Agent workbench", async
 
   const docs = await request.get(`/api/design-docs?projectId=${project.id}`);
   expect(await docs.json()).toEqual(expect.arrayContaining([
-    expect.objectContaining({ title: "Chrome Agent 设计分析", projectId: project.id }),
+    expect.objectContaining({ title: "Chrome Agent 设计分析", projectId: project.id, status: "草拟" }),
   ]));
 
   const workspace = await request.get(`/api/projects/${project.id}/agent-workspace`);
   const snapshot = await workspace.json() as { sessions: Array<{ id: string; controlMode: string }> };
-  expect(snapshot.sessions.some((item) => item.controlMode === "project-autonomous")).toBe(true);
+  expect(snapshot.sessions).toContainEqual(expect.objectContaining({ id: session.id, controlMode: "restricted", profileId: saved.id, model: "browser-chat-model" }));
+  const storedDiagram = await request.get(`/api/diagrams/${mainDiagram.id}`);
+  expect((await storedDiagram.json()).nodes).toContainEqual(expect.objectContaining({ id: selectedNode.id, label: "Agent 已更新选中节点" }));
+  const storedMessages = await request.get(`/api/agent-sessions/${session.id}/messages`);
+  expect(await storedMessages.json()).toContainEqual(expect.objectContaining({ role: "assistant", status: "completed", content: "Chrome 中的兼容对话已完成" }));
+  expect((await request.get(`/api/projects/${project.id}/workflow`)).ok()).toBeTruthy();
   for (const session of snapshot.sessions) createdSessionIds.add(session.id);
   await page.screenshot({ path: "artifacts/regression/agent-context-sync.png", fullPage: true });
 });

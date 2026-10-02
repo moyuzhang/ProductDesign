@@ -28,6 +28,8 @@ import type {
   AgentTaskCapacity,
   AuditEvent,
   Backup,
+  BackupProtectionChallenge,
+  BackupProtectionConfirmation,
   DatabaseCodeResult,
   DatabaseCodeTarget,
   DatabaseConnectionCheck,
@@ -67,6 +69,43 @@ import type {
   StorageRetentionSummary,
   WorkNode,
 } from "../shared/types.js";
+
+export class BackupProtectionRequiredError extends Error {
+  constructor(message: string, readonly protection: BackupProtectionChallenge) {
+    super(message);
+    this.name = "BackupProtectionRequiredError";
+  }
+}
+
+function isBackupProtectionChallenge(value: unknown): value is BackupProtectionChallenge {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<BackupProtectionChallenge>;
+  const hash = (item: unknown) => typeof item === "string" && /^[a-f0-9]{64}$/.test(item);
+  return hash(candidate.sourceFingerprint) && hash(candidate.targetFingerprint)
+    && Array.isArray(candidate.issues) && candidate.issues.every((issue) => issue && typeof issue === "object"
+      && typeof issue.assetId === "string" && typeof issue.projectId === "string"
+      && (issue.reason === "missing" || issue.reason === "corrupt") && hash(issue.expectedSha256)
+      && Number.isSafeInteger(issue.expectedByteSize) && issue.expectedByteSize >= 0
+      && (issue.actualSha256 === null || hash(issue.actualSha256))
+      && (issue.actualByteSize === null || (Number.isSafeInteger(issue.actualByteSize) && issue.actualByteSize >= 0)));
+}
+
+async function restoreBackup(id: string, confirmation: string, protectionConfirmation?: BackupProtectionConfirmation) {
+  const response = await fetch(`/api/backups/${encodeURIComponent(id)}/restore`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-productdesign-local-auth": "1" },
+    body: JSON.stringify({ confirmation, ...(protectionConfirmation ? { protectionConfirmation } : {}) }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as { code?: string; message?: string; protection?: unknown } | null;
+    const message = `${typeof payload?.message === "string" ? payload.message : response.statusText || "请求失败"}（HTTP ${response.status}）`;
+    if (response.status === 409 && payload?.code === "BACKUP_PROTECTION_CONFIRMATION_REQUIRED" && isBackupProtectionChallenge(payload.protection)) {
+      throw new BackupProtectionRequiredError(message, payload.protection);
+    }
+    throw new Error(message);
+  }
+  return response.json() as Promise<{ ok: boolean; backup: Backup; restored: Record<string, number>; protectionBackup: Backup; partialProtection: boolean; warnings?: string[] }>;
+}
 
 export interface DashboardData {
   totals: { projects: number; activeProjects: number; attention: number; unconfigured: number; overduePlans: number };
@@ -446,8 +485,7 @@ export const api = {
     request<Paginated<Backup>>("GET", `/api/backups${qs({ ...filter, limit: filter.limit ?? 20, offset: filter.offset ?? 0 })}`),
   createBackup: (label: string, reason: string) =>
     request<Backup>("POST", "/api/backups", { label, reason }),
-  restoreBackup: (id: string, confirmation: string) =>
-    request<{ ok: boolean; backup: Backup; restored: Record<string, number> }>("POST", `/api/backups/${id}/restore`, { confirmation }),
+  restoreBackup,
 };
 
 export interface CodexRuntimeStatus {
