@@ -1,12 +1,10 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./historical-fixtures";
 
-const projectId = "93775248-c4e3-4697-8ef9-41d5dd1b8a21";
-const diagramId = "7283a719-5955-4d1d-9659-fcaaa2f10053";
-const nodeId = "2be2c3da-fd26-4dff-a877-2bb7431ab7d0";
+test.use({ launchOptions: { executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH } });
 
-test.use({ channel: "chrome" });
-
-test("silently opens the Agent-requested canvas in the originating page", async ({ page }) => {
+test("silently opens the Agent-requested canvas in the originating page", async ({ page, historicalProject }) => {
+  const { projectId, diagramId, nodeId } = historicalProject;
+  // Deliberate SSE simulation: this verifies browser navigation, not a real Agent run.
   await page.addInitScript(() => {
     Object.defineProperty(globalThis.crypto, "randomUUID", {
       configurable: true,

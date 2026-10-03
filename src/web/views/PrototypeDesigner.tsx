@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -741,7 +742,7 @@ export function PrototypeDesigner(props: { diagramId: string; title: string; onC
       </main>
       <aside className="prototype-inspector" aria-label="属性">
         <div className="prototype-panel-heading"><span>属性</span>{selected ? <small>{LABELS[selected.kind]}</small> : selectedIds.length > 1 ? <small>{selectedIds.length} 项</small> : <small>页面</small>}</div>
-        {preview ? <div className="prototype-inspector-empty">预览模式只允许页面导航和缩放，不会修改草稿。</div> : selected ? <>
+        {preview ? <div className="prototype-inspector-empty">预览模式只允许页面导航和缩放，不会修改草稿。</div> : selected ? <Fragment key={`${currentScreen?.id}:${selected.id}`}>
           <CommitField label="内容 / 替代文本" value={selected.text} onCommit={(value) => { if (value.length > 2000) return "最多 2000 字"; updateSelected({ text: value }); }} />
           <div className="prototype-field-grid">
             {(["x", "y", "w", "h"] as const).map((key) => <CommitField key={key} label={key.toUpperCase()} type="number" value={selected[key]} min={key === "w" || key === "h" ? 1 : -100000} max={key === "w" || key === "h" ? 4096 : 100000} onCommit={(value) => {
@@ -787,14 +788,14 @@ export function PrototypeDesigner(props: { diagramId: string; title: string; onC
             <label>图片适应<select value={selected.imageFit ?? "contain"} onChange={(event) => updateSelected({ imageFit: event.target.value as "contain" | "cover" })}><option value="contain">完整显示</option><option value="cover">裁切铺满</option></select></label>
           </> : null}
           <button className="btn btn-danger btn-sm prototype-delete" onClick={deleteSelected}>删除组件</button>
-        </> : selectedIds.length > 1 ? <>
+        </Fragment> : selectedIds.length > 1 ? <>
           <div className="prototype-selection-summary">已选择 {editableSelectedIds.length} 个可编辑组件</div>
           <div className="prototype-align-grid">
             <button onClick={() => align("left")}>左对齐</button><button onClick={() => align("hcenter")}>水平居中</button><button onClick={() => align("right")}>右对齐</button>
             <button onClick={() => align("top")}>顶对齐</button><button onClick={() => align("vcenter")}>垂直居中</button><button onClick={() => align("bottom")}>底对齐</button>
           </div>
           <button className="btn btn-danger btn-sm prototype-delete" onClick={deleteSelected}>删除所选</button>
-        </> : currentScreen ? <>
+        </> : currentScreen ? <Fragment key={`page:${currentScreen.id}`}>
           <CommitField label="页面名称" value={currentScreen.name} onCommit={(value) => {
             const name = value.trim(); if (!name || name.length > 200) return "请输入 1—200 字"; updateScreen({ name });
           }} />
@@ -810,7 +811,7 @@ export function PrototypeDesigner(props: { diagramId: string; title: string; onC
             if (value !== "transparent" && !/^#[0-9a-fA-F]{6}$/.test(value)) return "#RRGGBB 或 transparent"; updateScreen({ background: value });
           }} />
           <div className="prototype-inspector-empty">未选择组件时编辑页面画板。缩放只改变视图，不写入草稿。</div>
-        </> : <div className="prototype-inspector-empty">暂无页面</div>}
+        </Fragment> : <div className="prototype-inspector-empty">暂无页面</div>}
       </aside>
     </div>
   </div>;

@@ -1,7 +1,7 @@
 import { migrateDesignChangeLineage } from "./designChangeLineage.js";
 import Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { LlmCredentialVault } from "./llmCredentials.js";
 import type {
@@ -2665,9 +2665,28 @@ export class Store {
     ).run(backup);
   }
 
-  restoreBusinessSnapshot(snapshot: unknown): { projects: number; workNodes: number; plans: number; evidence: number; governance: number; designDocs: number; documentRevisions: number; documentReferences: number; diagrams: number; diagramRevisions: number; databaseModels: number; nodeDatabaseBindings: number } {
+  /** Design sidecars are separate from Diagram JSON and must survive business restore. */
+  snapshotDesignArtifacts() {
+    const projects = this.listProjects();
+    return {
+      prototypeDrafts: Object.fromEntries(projects.map((project) => [project.id,
+        this.db.prepare("SELECT * FROM prototype_drafts WHERE project_id = ?").all(project.id) as PrototypeDraftRow[]])),
+      freeformDocuments: Object.fromEntries(projects.map((project) => [project.id,
+        this.db.prepare("SELECT * FROM diagram_freeform_documents WHERE project_id = ?").all(project.id) as FreeformDocumentRow[]])),
+      diagramTemplates: Object.fromEntries(projects.map((project) => [project.id,
+        this.db.prepare("SELECT * FROM diagram_templates WHERE project_id = ?").all(project.id) as DiagramTemplateRow[]])),
+    };
+  }
+
+  /** Read-only preflight shared by every restore entry point. */
+  validateBusinessSnapshot(snapshot: unknown): void {
+    this.prepareBusinessSnapshot(snapshot);
+  }
+
+  private prepareBusinessSnapshot(snapshot: unknown) {
     if (!snapshot || typeof snapshot !== "object") throw new Error("备份内容不是有效对象");
     const data = snapshot as Record<string, unknown>;
+    if (data.protectionManifest !== undefined) throw new Error("此文件是不可直接恢复的部分保护快照，请选择完整业务备份");
     if (!Array.isArray(data.projects) || !Array.isArray(data.governance)) throw new Error("备份缺少 projects 或 governance 数据");
     const grouped = (key: string): unknown[] => {
       const value = data[key];
@@ -2710,7 +2729,62 @@ export class Store {
     const databaseModels = data.databaseModels ? grouped("databaseModels") as DatabaseModel[] : [];
     const nodeDatabaseBindings = data.nodeDatabaseBindings ? grouped("nodeDatabaseBindings") as NodeDatabaseBinding[] : [];
 
+    // Older snapshots never contained sidecars: absent fields mean no recoverable content.
+    const prototypeDrafts = (data.prototypeDrafts === undefined ? [] : grouped("prototypeDrafts")) as PrototypeDraftRow[];
+    const freeformDocuments = (data.freeformDocuments === undefined ? [] : grouped("freeformDocuments")) as FreeformDocumentRow[];
+    const diagramTemplates = (data.diagramTemplates === undefined ? [] : grouped("diagramTemplates")) as DiagramTemplateRow[];
+    const freeformAssets = (data.freeformAssets === undefined ? [] : grouped("freeformAssets")) as Array<Omit<FreeformAsset, "storagePath"> & { contentBase64: string }>;
+    const projectIds = new Set(projects.map((project) => project.id));
+    const diagramProjects = new Map(diagrams.map((diagram) => [diagram.id, diagram.projectId]));
+    const strings = (row: object, keys: string[]) => {
+      if (!row || keys.some((key) => typeof (row as Record<string, unknown>)[key] !== "string")) {
+        throw new Error("备份中的设计资料格式无效");
+      }
+    };
+    for (const row of [...prototypeDrafts, ...freeformDocuments]) {
+      strings(row, ["diagram_id", "project_id", "payload", "updated_at"]);
+      if (!projectIds.has(row.project_id) || diagramProjects.get(row.diagram_id) !== row.project_id) throw new Error("备份中的设计资料归属无效");
+    }
+    for (const row of prototypeDrafts) normalizePrototypePayload(JSON.parse(row.payload));
+    for (const row of freeformDocuments) {
+      if (row.schema_version !== FREEFORM_SCHEMA_VERSION) throw new Error("备份中的自由画布版本不支持");
+      normalizeFreeformDocument(JSON.parse(row.payload), row.diagram_id);
+    }
+    for (const row of diagramTemplates) {
+      strings(row, ["id", "project_id", "scope", "name", "schema_version", "content", "thumbnail_meta", "created_by", "created_at", "updated_at"]);
+      if (!projectIds.has(row.project_id!) || row.scope !== "project" || (row.revoked_at !== null && typeof row.revoked_at !== "string")) throw new Error("备份中的项目模板归属无效");
+      for (const json of [row.content, row.thumbnail_meta]) {
+        const value = JSON.parse(json);
+        if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("备份中的项目模板内容无效");
+      }
+    }
+    const assetContents = freeformAssets.map((asset) => {
+      strings(asset, ["id", "projectId", "mime", "sha256", "createdAt", "contentBase64"]);
+      if (!projectIds.has(asset.projectId) || ![asset.byteSize, asset.width, asset.height].every((value) => Number.isSafeInteger(value) && value >= 0)) throw new Error("备份中的素材元数据无效");
+      const bytes = Buffer.from(asset.contentBase64, "base64");
+      if (bytes.toString("base64") !== asset.contentBase64 || bytes.length !== asset.byteSize
+        || createHash("sha256").update(bytes).digest("hex") !== asset.sha256) throw new Error("备份中的素材内容不完整");
+      return bytes;
+    });
+    return { projects, workNodes, plans, restoredEvidence, governance, designDocs, documentRevisions, documentReferences, diagrams, diagramRevisions, databaseModels, nodeDatabaseBindings, prototypeDrafts, freeformDocuments, diagramTemplates, freeformAssets, assetContents };
+  }
+
+  restoreBusinessSnapshot(snapshot: unknown, onStagedAssetDirectory?: (path: string) => void): { projects: number; workNodes: number; plans: number; evidence: number; governance: number; designDocs: number; documentRevisions: number; documentReferences: number; diagrams: number; diagramRevisions: number; databaseModels: number; nodeDatabaseBindings: number; prototypeDrafts: number; freeformDocuments: number; diagramTemplates: number; freeformAssets: number } {
+    const { projects, workNodes, plans, restoredEvidence, governance, designDocs, documentRevisions, documentReferences, diagrams, diagramRevisions, databaseModels, nodeDatabaseBindings, prototypeDrafts, freeformDocuments, diagramTemplates, freeformAssets, assetContents } = this.prepareBusinessSnapshot(snapshot);
+    let stagedAssetDirectory: string | undefined;
     const restore = this.db.transaction(() => {
+      if (freeformAssets.length) {
+        const root = join(this.dataDir, "freeform-assets");
+        mkdirSync(root, { recursive: true });
+        stagedAssetDirectory = mkdtempSync(join(root, "restore-"));
+        onStagedAssetDirectory?.(stagedAssetDirectory);
+      }
+      // Never overwrite existing assets: failed restores can remove only their own new files.
+      const assetPaths = assetContents.map((bytes, index) => {
+        const path = join(stagedAssetDirectory!, `${index}.bin`);
+        writeFileSync(path, bytes, { flag: "wx" });
+        return path;
+      });
       this.db.prepare("DELETE FROM diagram_revisions").run();
       this.db.prepare("DELETE FROM document_references").run();
       this.db.prepare("DELETE FROM document_revisions").run();
@@ -2739,11 +2813,24 @@ export class Store {
          VALUES (@id, @diagramId, @beforeJson, @afterJson, @actor, @undone, @createdAt)`,
       );
       for (const revision of diagramRevisions) insertDiagramRevision.run(revision);
+      const insertPrototype = this.db.prepare("INSERT INTO prototype_drafts (diagram_id, project_id, payload, updated_at) VALUES (@diagram_id, @project_id, @payload, @updated_at)");
+      for (const row of prototypeDrafts) insertPrototype.run(row);
+      const insertFreeform = this.db.prepare("INSERT INTO diagram_freeform_documents (diagram_id, project_id, schema_version, payload, updated_at) VALUES (@diagram_id, @project_id, @schema_version, @payload, @updated_at)");
+      for (const row of freeformDocuments) insertFreeform.run(row);
+      const insertTemplate = this.db.prepare(`INSERT INTO diagram_templates (id, project_id, scope, name, schema_version, content, thumbnail_meta, created_by, created_at, updated_at, revoked_at)
+        VALUES (@id, @project_id, @scope, @name, @schema_version, @content, @thumbnail_meta, @created_by, @created_at, @updated_at, @revoked_at)`);
+      for (const row of diagramTemplates) insertTemplate.run(row);
+      freeformAssets.forEach((asset, index) => this.insertFreeformAsset({ ...asset, storagePath: assetPaths[index] }));
       for (const model of databaseModels) this.insertDatabaseModel(model);
       for (const binding of nodeDatabaseBindings) this.insertNodeDatabaseBinding(binding);
       for (const project of projects) this.ensureProjectMainDiagram(project);
     });
-    restore();
+    try {
+      restore();
+    } catch (error) {
+      if (stagedAssetDirectory) rmSync(stagedAssetDirectory, { recursive: true, force: true });
+      throw error;
+    }
     return {
       projects: projects.length,
       workNodes: workNodes.length,
@@ -2757,6 +2844,10 @@ export class Store {
       diagramRevisions: diagramRevisions.length,
       databaseModels: databaseModels.length,
       nodeDatabaseBindings: nodeDatabaseBindings.length,
+      prototypeDrafts: prototypeDrafts.length,
+      freeformDocuments: freeformDocuments.length,
+      diagramTemplates: diagramTemplates.length,
+      freeformAssets: freeformAssets.length,
     };
   }
 

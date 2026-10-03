@@ -271,6 +271,8 @@ function Editor({ projectId, modelId, surface }: { projectId?: string; modelId: 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [hint, setHint] = useState("");
+  const [deploymentWarning, setDeploymentWarning] = useState("");
+  useEffect(() => setDeploymentWarning(""), [modelId]);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 38, y: 38 });
   const [tableQuery, setTableQuery] = useState("");
@@ -668,6 +670,7 @@ function Editor({ projectId, modelId, surface }: { projectId?: string; modelId: 
       } else {
         const result = await api.applyDatabaseDeploy(model.id, engineeringConnection, confirmation);
         setHint(`已执行 ${result.executedStatements} 条建表语句`);
+        setDeploymentWarning(result.warnings?.join("；") ?? "");
       }
       setEngineeringMode(null); setTimeout(() => setHint(""), 2200);
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
@@ -705,6 +708,7 @@ function Editor({ projectId, modelId, surface }: { projectId?: string; modelId: 
         <button className="btn btn-primary" onClick={() => void save()} disabled={!dirty || busy}><Save /> {dirty ? "保存模型" : "已保存"}</button>
       </div>
       {error ? <div className="db-inline-error"><span>{error}</span><button onClick={() => setError("")}><X /></button></div> : null}
+      {deploymentWarning ? <div className="db-inline-error" role="status"><span>{deploymentWarning}</span><button aria-label="关闭部署提示" onClick={() => setDeploymentWarning("")}><X /></button></div> : null}
       <div className="db-editor-shell">
         {navigatorOpen ? <aside
           ref={navigatorRef}

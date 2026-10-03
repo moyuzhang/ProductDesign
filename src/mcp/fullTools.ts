@@ -1,3 +1,4 @@
+import { rmSync } from "node:fs";
 import { designContractSchema, requirementsBaselineSchema } from "../shared/designContract.js";
 import { DesignContractError, validateProjectDesignContract } from "../server/designContractValidation.js";
 import { DesignChangeCorrectionError } from "../server/designChangeCorrection.js";
@@ -35,7 +36,7 @@ import { createBackupFile, loadBackupFile } from "../server/backups.js";
 import { collectGitEvidence } from "../server/collectors.js";
 import { newId, nowIso, ProjectRepositoryError, type Store } from "../server/db.js";
 import { validateDiagramDeliveryTransition, validateDocumentNodeBinding, validateDocumentReferenceTarget } from "../server/domain.js";
-import { ensureManagedProjectDirectory } from "../server/projectFiles.js";
+import { beginRestoreProjectFiles, ensureManagedProjectDirectory } from "../server/projectFiles.js";
 import { isInitialProjectBriefApproval } from "../server/projectBrief.js";
 import { hasRequirementChangeMarker } from "../server/nodeRequirementRevision.js";
 import { checkLlmProfile, llmProfileSummary } from "../server/llmProfiles.js";
@@ -739,9 +740,13 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
       leaseToken: z.string().trim().max(300).optional(),
       idempotencyKey: z.string().trim().max(300).optional(),
       reason: z.string().max(4000).optional(),
+      documentRevisionId: z.string().trim().max(300).optional(),
       implementationRevision: z.string().max(200).optional(),
       evidenceId: z.string().trim().max(300).optional(),
       testCommand: z.string().max(2000).optional(),
+      verdict: z.enum(["pass", "fail"]).optional(),
+      reworkConditions: z.string().max(4000).optional(),
+      authSessionToken: z.string().min(32).max(300).optional(),
       repairDisposition: z.enum(["reset", "design_change"]).optional(),
       correlationId: z.string().max(300).optional(), clientId: z.string().max(300).optional(),
       sessionId: z.string().max(300).optional(), model: z.string().max(300).optional(),
@@ -751,7 +756,7 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
       nonceId: z.string().max(300).optional(), bodyDigest: z.string().max(128).optional(), connectionId: z.string().max(300).optional(),
       coordinationLeaseId: z.string().trim().max(300).optional(), coordinationLeaseToken: z.string().trim().max(300).optional(),
     },
-  }, ({ planId, action, actor, agentId, leaseToken, idempotencyKey, reason, implementationRevision, evidenceId, testCommand, repairDisposition, correlationId, clientId, sessionId, model,
+  }, ({ planId, action, actor, agentId, leaseToken, idempotencyKey, reason, documentRevisionId, implementationRevision, evidenceId, testCommand, verdict, reworkConditions, authSessionToken, repairDisposition, correlationId, clientId, sessionId, model,
     policyAckToken, workOrderId, taskKey, taskRevision, workerId, role, nonceId, bodyDigest, connectionId, coordinationLeaseId, coordinationLeaseToken }) => {
     const before = store.getPlan(planId);
     if (!before) return error(`未找到计划项: ${planId}`);
@@ -776,7 +781,9 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
         if (!coordination) advanceAgentTaskLeaseForPlanAction(store, lease, {
           action, agentId, idempotencyKey,
           resultDigest: implementationRevision || reason || `${action}:${planId}`,
-          evidenceId, testCommand, implementationRevision,
+          evidenceId, testCommand, implementationRevision, documentRevisionId, verdict, reworkConditions,
+          workOrderId, taskKey, taskRevision, workerId, role, authSessionToken,
+          policyAckToken, nonceId, bodyDigest, connectionId,
         }, context);
         recordAudit(store, actor, {
           projectId: before.projectId, entityType: "plan", entityId: planId, action,
@@ -1361,25 +1368,50 @@ export function registerFullTools(server: McpServer, options: FullToolOptions): 
 
   server.registerTool("create_backup", {
     title: "创建完整备份",
-    description: "把全部业务数据导出为 JSON 快照并登记备份记录。",
+    description: "导出项目业务资料及受控设计素材并登记备份；不含账户、凭据、Agent 会话或运行态。",
     inputSchema: { label: z.string().trim().min(1).max(120), reason: z.string().max(1000).default(""), actor: z.string().max(100).optional() },
   }, ({ label, reason, actor }) => result(createBackup(store, dataDir, label, reason, actor), "备份已创建"));
 
   server.registerTool("restore_backup", {
     title: "恢复完整备份",
-    description: "恢复指定 JSON 业务快照。恢复前自动创建安全备份，必须提供精确确认文本。",
+    description: "恢复指定完整 JSON 业务快照。必须提供精确确认文本；恢复前严格创建完整保护备份。当前素材缺失或损坏时本入口拒绝，请到 Web 备份页核对缺损并进行两阶段确认。不可直接恢复部分保护快照。",
     inputSchema: { backupId: z.string().min(1), confirmation: z.string(), actor: z.string().max(100).optional() },
   }, ({ backupId, confirmation, actor }) => {
     if (confirmation !== `RESTORE ${backupId}`) return error(`恢复前必须提供 confirmation=RESTORE ${backupId}`);
     const backup = store.listBackups().find((item) => item.id === backupId);
     if (!backup) return error(`未找到备份: ${backupId}`);
+    let protectionPath: string | undefined;
+    let stagedAssetDirectory: string | undefined;
+    let committed = false;
+    let projectFiles: ReturnType<typeof beginRestoreProjectFiles> | undefined;
     try {
       const snapshot = loadBackupFile(dataDir, backupId, backup.createdAt);
-      createBackup(store, dataDir, `恢复前自动备份 ${nowIso().slice(0, 19)}`, `恢复备份 ${backup.label} 前的安全快照`, actor);
-      const restored = store.restoreBusinessSnapshot(snapshot);
-      recordAudit(store, actor, { projectId: null, entityType: "backup", entityId: backupId, action: "restore", before: null, after: { label: backup.label, restored } });
-      return result({ ok: true, backup, restored }, "备份已恢复");
+      const restored = store.db.transaction(() => {
+        store.validateBusinessSnapshot(snapshot);
+        const protection = createBackupFile(store, dataDir, `恢复前自动备份 ${nowIso().slice(0, 19)}`, `恢复备份 ${backup.label} 前的安全快照`);
+        protectionPath = protection.path;
+        recordAudit(store, actor, { projectId: null, entityType: "backup", entityId: protection.id, action: "create", before: null, after: { label: protection.label, itemCount: protection.itemCount } });
+        projectFiles = beginRestoreProjectFiles(store, dataDir);
+        const restored = store.restoreBusinessSnapshot(snapshot, (path) => { stagedAssetDirectory = path; });
+        projectFiles.apply();
+        recordAudit(store, actor, { projectId: null, entityType: "backup", entityId: backupId, action: "restore", before: null, after: { label: backup.label, restored } });
+        return restored;
+      }).immediate();
+      committed = true;
+      const warnings: string[] = [];
+      try { projectFiles?.finish(); }
+      catch (archiveError) {
+        warnings.push(`业务数据及项目文件已恢复；恢复前文件保护归档整理失败，原件仍保留在 ${projectFiles?.stagingPath}。请检查后整理归档：${archiveError instanceof Error ? archiveError.message : String(archiveError)}`);
+      }
+      return result({ ok: true, backup, restored, ...(warnings.length ? { warnings } : {}) }, "备份已恢复");
     } catch (restoreError) {
+      if (!committed) {
+        const failures: unknown[] = [];
+        try { projectFiles?.rollback(); } catch (cleanupError) { failures.push(cleanupError); }
+        try { if (protectionPath) rmSync(protectionPath, { force: true }); } catch (cleanupError) { failures.push(cleanupError); }
+        try { if (stagedAssetDirectory) rmSync(stagedAssetDirectory, { recursive: true, force: true }); } catch (cleanupError) { failures.push(cleanupError); }
+        if (failures.length) throw new AggregateError([restoreError, ...failures], "恢复失败且文件回滚清理失败；请检查保留的恢复归档");
+      }
       return error(restoreError instanceof Error ? restoreError.message : String(restoreError));
     }
   });

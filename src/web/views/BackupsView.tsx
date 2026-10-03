@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import { HardDrive, Plus, RotateCcw, TriangleAlert } from "lucide-react";
-import type { Backup, StorageRetentionSummary } from "../../shared/types";
-import { api } from "../api";
+import type { Backup, BackupProtectionChallenge, StorageRetentionSummary } from "../../shared/types";
+import { api, BackupProtectionRequiredError } from "../api";
 import { navigate } from "../App";
 import { EmptyState, ErrorBanner, Field, Modal, Pagination, Spinner, formatDateTime } from "../ui";
 
@@ -11,6 +11,7 @@ export function BackupsView(): ReactElement {
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
   const [error, setError] = useState("");
+  const [restoreWarnings, setRestoreWarnings] = useState<string[]>([]);
   const [createOpen, setCreateOpen] = useState(false);
   const [restoreTarget, setRestoreTarget] = useState<Backup | null>(null);
   const [storage, setStorage] = useState<StorageRetentionSummary | null>(null);
@@ -37,7 +38,7 @@ export function BackupsView(): ReactElement {
       <div className="page-header">
         <h1>备份</h1>
         <div className="sub">
-          备份会把全部数据导出为 JSON 快照，保存在 <code className="mono">data/backups/</code> 目录下
+          备份会导出项目业务资料、画布历史、原型、自由画布、项目模板及受控素材；不含账户、凭据、Agent 会话或运行态。JSON 快照保存在 <code className="mono">data/backups/</code> 目录下
         </div>
       </div>
 
@@ -67,6 +68,9 @@ export function BackupsView(): ReactElement {
       ) : null}
 
       {error ? <ErrorBanner message={error} /> : null}
+      {restoreWarnings.length ? <section className="storage-card storage-warn" role="status" aria-live="polite">
+        <TriangleAlert /><div><strong>恢复已完成，请检查保护归档</strong>{restoreWarnings.map((warning, index) => <p key={index}>{warning}</p>)}</div>
+      </section> : null}
 
       {!backups ? (
         <Spinner />
@@ -98,31 +102,55 @@ export function BackupsView(): ReactElement {
           onCreated={() => { setCreateOpen(false); reload(); }}
         />
       ) : null}
-      {restoreTarget ? <RestoreBackupModal backup={restoreTarget} onClose={() => setRestoreTarget(null)} onRestored={() => { setRestoreTarget(null); setOffset(0); reload(); }} /> : null}
+      {restoreTarget ? <RestoreBackupModal backup={restoreTarget} onClose={() => setRestoreTarget(null)} onRestored={(warnings) => { setRestoreWarnings(warnings); setRestoreTarget(null); setOffset(0); reload(); }} /> : null}
     </div>
   );
 }
 
-function RestoreBackupModal(props: { backup: Backup; onClose: () => void; onRestored: () => void }): ReactElement {
+function RestoreBackupModal(props: { backup: Backup; onClose: () => void; onRestored: (warnings: string[]) => void }): ReactElement {
   const expected = `RESTORE ${props.backup.id}`;
   const [confirmation, setConfirmation] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [protection, setProtection] = useState<BackupProtectionChallenge | null>(null);
+  const [acknowledged, setAcknowledged] = useState(false);
+  const submitting = useRef(false);
+  const restore = async () => {
+    if (submitting.current || confirmation !== expected || (protection && !acknowledged)) return;
+    submitting.current = true; setBusy(true); setError("");
+    try {
+      const result = await api.restoreBackup(props.backup.id, confirmation, protection ? {
+        sourceFingerprint: protection.sourceFingerprint, targetFingerprint: protection.targetFingerprint,
+        acknowledgement: "PARTIAL_PROTECTION_IS_NOT_RESTORABLE",
+      } : undefined);
+      props.onRestored(result.warnings ?? []);
+    } catch (cause) {
+      // Every new challenge, including drift, requires a fresh explicit acknowledgement.
+      setProtection(cause instanceof BackupProtectionRequiredError ? cause.protection : null);
+      setAcknowledged(false);
+      setError(cause instanceof Error ? cause.message : "恢复失败");
+    } finally { submitting.current = false; setBusy(false); }
+  };
   return (
     <Modal
       title={`恢复备份：${props.backup.label}`}
-      onClose={props.onClose}
+      onClose={() => { if (!submitting.current) props.onClose(); }}
       footer={<>
-        <button className="btn" onClick={props.onClose}>取消</button>
-        <button className="btn btn-danger" disabled={busy || confirmation !== expected} onClick={() => {
-          setBusy(true); setError("");
-          api.restoreBackup(props.backup.id, confirmation).then(props.onRestored).catch((e) => setError(e.message)).finally(() => setBusy(false));
-        }}>确认恢复</button>
+        <button className="btn" disabled={busy} onClick={props.onClose}>取消</button>
+        <button className="btn btn-danger" disabled={busy || confirmation !== expected || Boolean(protection && !acknowledged)} onClick={() => void restore()}>确认恢复</button>
       </>}
     >
       {error ? <ErrorBanner message={error} /> : null}
-      <p className="cell-sub">恢复会替换当前项目、画布、计划、文档、证据和治理数据；系统会先自动创建一份恢复前快照。</p>
-      <Field label={`输入 ${expected} 以确认`}><input value={confirmation} onChange={(e) => setConfirmation(e.target.value)} /></Field>
+      <p className="cell-sub">恢复会替换当前项目、画布、计划、文档、证据和治理数据；系统会先保存当前资料。素材缺失或损坏时，需要额外确认只能生成部分保护快照。</p>
+      <Field label={`输入 ${expected} 以确认`}><input disabled={busy} value={confirmation} onChange={(e) => { setConfirmation(e.target.value); setAcknowledged(false); }} /></Field>
+      {protection ? <section aria-label="部分保护快照确认">
+        <h3>请核对当前资料的保护范围</h3>
+        <p>缺损素材的可读原始字节及业务资料会被保留，但部分保护快照不可直接恢复，不能用它一键回退本次恢复。</p>
+        {protection.issues.length ? <ul>{protection.issues.map((issue) => <li key={`${issue.projectId}:${issue.assetId}`}>
+          项目 {issue.projectId} · 素材 {issue.assetId}：{issue.reason === "missing" ? "文件缺失" : "文件损坏"}；预期 {issue.expectedByteSize} 字节，实际 {issue.actualByteSize ?? "无法读取"}。
+        </li>)}</ul> : <p>当前缺损清单已变化，未发现缺损；请重新核对当前资料与目标备份后确认。</p>}
+        <label><input type="checkbox" checked={acknowledged} disabled={busy} onChange={(e) => setAcknowledged(e.target.checked)} />我已核对缺损清单，理解部分保护快照不可直接恢复，仍确认替换当前业务资料</label>
+      </section> : null}
     </Modal>
   );
 }

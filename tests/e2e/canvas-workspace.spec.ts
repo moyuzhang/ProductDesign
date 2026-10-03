@@ -1,8 +1,8 @@
 import path from "node:path";
-import { expect, test, type Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
+import { expect, test } from "./historical-fixtures";
 
-const diagramId = "f362be99-5733-490d-af8e-b6fb82f70a0f";
-test.use({ channel: "chrome" });
+test.use({ launchOptions: { executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH } });
 
 function collectConsoleErrors(page: Page): string[] {
   const errors: string[] = [];
@@ -13,7 +13,8 @@ function collectConsoleErrors(page: Page): string[] {
   return errors;
 }
 
-test("keeps the inspector docked and exposes focused workspace controls at 1366×768", async ({ page }) => {
+test("keeps the inspector docked and exposes focused workspace controls at 1366×768", async ({ page, historicalProject }) => {
+  const { diagramId } = historicalProject;
   await page.setViewportSize({ width: 1366, height: 768 });
   const consoleErrors = collectConsoleErrors(page);
   await page.goto(`/#/canvas/${diagramId}`);
@@ -76,7 +77,8 @@ test("keeps the inspector docked and exposes focused workspace controls at 1366�
   expect(consoleErrors).toEqual([]);
 });
 
-test("docks the element library and keeps navigation clear of Agent at 1600×1000", async ({ page }) => {
+test("docks the element library and keeps navigation clear of Agent at 1600×1000", async ({ page, historicalProject }) => {
+  const { diagramId } = historicalProject;
   await page.setViewportSize({ width: 1600, height: 1000 });
   const consoleErrors = collectConsoleErrors(page);
   await page.goto(`/#/canvas/${diagramId}`);
