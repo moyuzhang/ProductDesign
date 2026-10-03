@@ -1717,6 +1717,7 @@ export interface DatabaseDeployPreview {
 }
 
 export interface DatabaseDeployResult {
+  warnings?: string[];
   ok: boolean;
   target: string;
   executedStatements: number;
