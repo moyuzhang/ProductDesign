@@ -2,6 +2,31 @@ import { expect, test } from "@playwright/test";
 
 test.use({ channel: "chrome", viewport: { width: 1440, height: 960 } });
 
+let projectId = "";
+test.beforeEach(async ({ request }) => {
+  const response = await request.post("/api/projects", { data: { code: `FILTER-${Date.now()}`, name: "Synthetic canvas type filter" } });
+  expect(response.ok()).toBeTruthy();
+  projectId = (await response.json()).id;
+  expect((await request.get(`/api/projects/${projectId}/workflow`)).ok()).toBeTruthy();
+  const flow = await request.post("/api/diagrams", { data: { projectId, title: "Synthetic auxiliary flow", type: "flow", nodes: [], edges: [], groups: [] } });
+  expect(flow.ok()).toBeTruthy();
+});
+test.afterEach(async ({ request }) => {
+  const ownedProjectId = projectId;
+  projectId = "";
+  if (!ownedProjectId) return;
+  const cleanupErrors: string[] = [];
+  try {
+    const state = await request.get(`/api/projects/${ownedProjectId}/workflow`);
+    if (!state.ok()) cleanupErrors.push(`Read owned workflow: HTTP ${state.status()}`);
+  } catch (error) { cleanupErrors.push(`Read owned workflow: ${String(error)}`); }
+  try {
+    const removed = await request.delete(`/api/projects/${ownedProjectId}`);
+    if (!removed.ok()) cleanupErrors.push(`Delete owned project: HTTP ${removed.status()}`);
+  } catch (error) { cleanupErrors.push(`Delete owned project: ${String(error)}`); }
+  expect(cleanupErrors, "Synthetic canvas fixture cleanup failed").toEqual([]);
+});
+
 test("filters the paginated canvas list by diagram type", async ({ page }) => {
   await page.goto("/#/canvas");
   await expect(page.getByRole("heading", { name: "画布设计工作台" })).toBeVisible();

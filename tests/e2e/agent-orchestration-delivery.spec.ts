@@ -1,4 +1,5 @@
 import { expect, test, type APIRequestContext } from "@playwright/test";
+import { createGovernedProject } from "./helpers/governed-project";
 
 interface ProjectSummary {
   id: string;
@@ -61,7 +62,6 @@ interface PlanResponse {
   correlationId: string;
 }
 
-const productDesignCode = "PRODUCTDESIGN";
 const queueKeys: QueueKey[] = ["design", "development", "audit", "approval", "managerApproval"];
 
 test.use({ channel: "chrome", viewport: { width: 1440, height: 1100 } });
@@ -97,77 +97,53 @@ function queueFixture(project: ProjectSummary, queue: QueueKey): OrchestrationTa
   }));
 }
 
-test("integrated orchestration view generates a manual external-agent task package and hides synthetic root delivery state", async ({ page, request, context }) => {
-  const projects = await loadProjects(request);
-  const project = projects.find((item) => item.code === productDesignCode);
-  expect(project).toBeTruthy();
-
-  const orchestrationResponse = await request.get(`/api/projects/${project!.id}/agent-orchestration`);
-  expect(orchestrationResponse.ok()).toBeTruthy();
-  const orchestration = await orchestrationResponse.json() as AgentOrchestrationResponse;
-  const workspaceResponse = await request.get(`/api/projects/${project!.id}/workspace`);
-  expect(workspaceResponse.ok()).toBeTruthy();
-  const workspace = await workspaceResponse.json() as ProjectWorkspaceResponse;
-  expect(workspace.mainDiagram).toBeTruthy();
-
-  await page.addInitScript((projectId) => localStorage.setItem("pcs.workspace", projectId), project!.id);
-  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
-  await page.goto("/#/orchestration", { waitUntil: "domcontentloaded" });
-  await expect(page.locator(".orchestration-hero h1")).toHaveText(project!.name);
-  await expect(page.locator(".orchestration-pulse")).toContainText(`当前层${orchestration.workflow.layerGate.activeLayer ?? "-"}/${orchestration.workflow.layerGate.totalLayers}`);
-  await expect(page.locator(".orchestration-queue")).toHaveCount(4);
-  await expect(page.getByTestId("agent-working-directory")).toContainText(orchestration.workingDirectory.repositoryPath || "未配置 repositoryPath");
-
-  for (const key of queueKeys) {
-    const card = page.locator(`.queue-${key}`);
-    await expect(card.locator(".orchestration-queue-head strong")).toHaveText(String(orchestration.queues[key].length));
-    await expect(card.locator(".orchestration-task")).toHaveCount(Math.min(5, orchestration.queues[key].length));
-  }
-
-  await expect(page.locator(".orchestration-role-title strong", { hasText: /^设计 Agent$/ })).toBeVisible();
-  await expect(page.locator(".orchestration-role-title strong", { hasText: /^施工 Agent$/ })).toBeVisible();
-  await expect(page.locator(".orchestration-role-title strong", { hasText: /^审计 Agent$/ })).toBeVisible();
-  await expect(page.locator(".manager-card")).toContainText("HUMAN GATE");
-  if (orchestration.workingDirectory.ready && orchestration.queues.development.length > 0) {
-    const assignedTask = orchestration.queues.development[0];
-    expect(assignedTask.assignee?.agentId).toBeTruthy();
-    await expect(page.locator(".queue-development .orchestration-task").first()).toContainText(
-      assignedTask.assignee!.displayName || assignedTask.assignee!.agentId,
-    );
-    await expect(page.locator(".queue-development .orchestration-task").first()).toContainText(`第 ${assignedTask.deliveryLayer} 层`);
-    await page.locator(".queue-development").getByRole("button", { name: /生成任务包/ }).first().click();
-    const packageView = page.getByTestId("agent-task-package");
-    await expect(packageView).toBeVisible();
-    await expect(packageView).toContainText(orchestration.workingDirectory.repositoryPath);
-    await expect(packageView).toContainText("ProductDesign 只生成交接材料");
-    await expect(packageView).toContainText(assignedTask.assignee!.agentId);
-    await packageView.getByRole("button", { name: "复制启动提示词" }).click();
-    await expect(packageView.getByRole("button", { name: "提示词已复制" })).toBeVisible();
-    const downloadPromise = page.waitForEvent("download");
-    await packageView.getByRole("button", { name: "下载 JSON" }).click();
-    const download = await downloadPromise;
-    expect(download.suggestedFilename()).toMatch(/\.json$/);
-    await download.delete();
-  }
-  await page.screenshot({ path: "artifacts/regression/orchestration-integrated.png", fullPage: true });
-
-  const systemRoot = workspace.mainDiagram!.nodes.find((node) => node.kind === "system");
-  expect(systemRoot).toBeTruthy();
-  await page.goto(`/#/canvas/${workspace.mainDiagram!.id}`, { waitUntil: "domcontentloaded" });
-  const rootNode = page.locator(`g[data-node-id="${systemRoot!.id}"]`);
-  await expect(rootNode).toBeVisible();
-  await expect(rootNode).not.toContainText("开发 ·");
-  await expect(rootNode).not.toContainText("验收 ·");
-  await page.screenshot({ path: "artifacts/regression/orchestration-system-root.png", fullPage: true });
+test("integrated orchestration previews and exports a read-only external handoff without starting work", async ({ page, request, context }) => {
+  const created = await request.post("/api/projects", { data: { code: `HANDOFF-${Date.now()}`, name: "Read-only handoff fixture", summary: "Synthetic project; no runtime or model" } });
+  expect(created.ok()).toBe(true); const project = await created.json() as ProjectSummary;
+  try {
+    const response = await request.get(`/api/projects/${project.id}/agent-orchestration`);
+    expect(response.ok()).toBe(true); const orchestration = await response.json() as AgentOrchestrationResponse;
+    const workspaceResponse = await request.get(`/api/projects/${project.id}/workspace`);
+    const workspace = await workspaceResponse.json() as ProjectWorkspaceResponse;
+    const leasesBefore = await (await request.get(`/api/projects/${project.id}/agent-task-leases`)).json();
+    await page.addInitScript((id) => localStorage.setItem("pcs.workspace", id), project.id);
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await page.goto("/#/orchestration", { waitUntil: "domcontentloaded" });
+    await expect(page.locator(".orchestration-hero h1")).toHaveText(project.name);
+    await expect(page.locator(".orchestration-pulse strong")).toHaveText(`${orchestration.workflow.layerGate.activeLayer ?? "-"}/${orchestration.workflow.layerGate.totalLayers}`);
+    await expect(page.locator(".orchestration-queue")).toHaveCount(5);
+    for (const key of queueKeys) {
+      const card = page.locator(`.queue-${key}`);
+      await expect(card.locator(".orchestration-queue-head strong")).toHaveText(String(orchestration.queues[key].length));
+      await expect(card.locator(".orchestration-task")).toHaveCount(Math.min(5, orchestration.queues[key].length));
+    }
+    await expect(page.locator(".manager-card")).toContainText("HUMAN GATE");
+    expect(orchestration.queues.design.length).toBeGreaterThan(0);
+    await page.locator(".queue-design").getByRole("button", { name: "预览只读交接" }).first().click();
+    const preview = page.getByTestId("coordination-handoff-preview"); await expect(preview).toBeVisible();
+    await expect(preview).toContainText(project.id);
+    await page.getByRole("button", { name: "复制交接", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(await preview.textContent());
+    const downloadPromise = page.waitForEvent("download"); await page.getByRole("button", { name: "下载交接", exact: true }).click();
+    const download = await downloadPromise; expect(download.suggestedFilename()).toBe("coordination-handoff.json"); await download.delete();
+    expect(await (await request.get(`/api/projects/${project.id}/agent-task-leases`)).json()).toEqual(leasesBefore);
+    await page.screenshot({ path: "artifacts/regression/orchestration-integrated.png", fullPage: true });
+    const systemRoot = workspace.mainDiagram!.nodes.find((node) => node.kind === "system")!;
+    await page.goto(`/#/canvas/${workspace.mainDiagram!.id}`, { waitUntil: "domcontentloaded" });
+    const rootNode = page.locator(`g[data-node-id="${systemRoot.id}"]`); await expect(rootNode).toBeVisible();
+    await expect(rootNode).not.toContainText("开发 ·"); await expect(rootNode).not.toContainText("验收 ·");
+  } finally { expect((await request.delete(`/api/projects/${project.id}`)).ok()).toBe(true); }
 });
 
 test("each orchestration queue paginates independently and project switches reset queue boundaries", async ({ page, request }) => {
-  const projects = await loadProjects(request);
-  const source = projects.find((item) => item.code === productDesignCode);
-  const target = projects.find((item) => item.id !== source?.id);
-  expect(source).toBeTruthy();
-  expect(target).toBeTruthy();
-
+  const create = async (code: string) => {
+    const response = await request.post("/api/projects", { data: { code, name: code, summary: "Queue pagination UI fixture" } });
+    expect(response.ok()).toBe(true); return await response.json() as ProjectSummary;
+  };
+  const projects: ProjectSummary[] = [];
+  try {
+  const source = await create(`QUEUE-SOURCE-${Date.now()}`); projects.push(source);
+  const target = await create(`QUEUE-TARGET-${Date.now()}`); projects.push(target);
   const baseResponse = await request.get(`/api/projects/${source!.id}/agent-orchestration`);
   expect(baseResponse.ok()).toBeTruthy();
   const base = await baseResponse.json() as AgentOrchestrationResponse;
@@ -212,125 +188,35 @@ test("each orchestration queue paginates independently and project switches rese
   await expect(design).toContainText("design task 1");
   await expect(design).not.toContainText("design task 6");
   await expect(development).toContainText("development task 1");
-});
-
-test("integrated delivery lifecycle preserves one correlation timeline from proposal through manager acceptance", async ({ request }) => {
-  const unique = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-  const projectResponse = await request.post("/api/projects", {
-    data: {
-      code: `E2E-${unique}`.slice(0, 64),
-      name: `E2E delivery ${unique}`,
-      summary: "Agent orchestration lifecycle browser regression fixture",
-      stage: "探索",
-      health: "正常",
-      progress: 0,
-      riskLevel: "P2",
-      riskSummary: "",
-      blockerSummary: "",
-      nextStep: "",
-      startAt: "",
-      dueAt: "",
-    },
-  });
-  expect(projectResponse.ok()).toBeTruthy();
-  const project = await projectResponse.json() as ProjectSummary;
-  const correlationId = `e2e-delivery-${unique}`;
-
-  try {
-    const planResponse = await request.post("/api/plans", {
-      data: {
-        projectId: project.id,
-        kind: "task",
-        title: "E2E controlled delivery",
-        description: "Exercise the complete delivery lifecycle",
-        owner: "builder-e2e",
-        roleAssignments: {
-          designer: { agentId: "designer-e2e", displayName: "Designer E2E" },
-          builder: { agentId: "builder-e2e", displayName: "Builder E2E" },
-          auditor: { agentId: "auditor-e2e", displayName: "Auditor E2E" },
-        },
-        priority: "P0",
-      },
-    });
-    expect(planResponse.ok()).toBeTruthy();
-    const plan = await planResponse.json() as PlanResponse;
-
-    const transition = async (action: string, actor: string, extra: Record<string, unknown> = {}) => {
-      const response = await request.post(`/api/plans/${plan.id}/transition`, {
-        data: { action, actor, correlationId, clientId: "playwright-chrome", sessionId: `${actor}-session`, ...extra },
-      });
-      return response;
-    };
-
-    expect((await (await transition("submit_plan", "designer-e2e", { agentId: "designer-e2e" })).json() as PlanResponse).lifecycleStatus).toBe("pending_approval");
-    expect((await (await transition("approve_plan", "manager-e2e")).json() as PlanResponse).lifecycleStatus).toBe("approved");
-
-    const skippedStart = await transition("complete_development", "builder-e2e", { agentId: "builder-e2e", implementationRevision: "e2e-build-1" });
-    expect(skippedStart.status()).toBe(409);
-
-    expect((await (await transition("start_development", "builder-e2e", { agentId: "builder-e2e" })).json() as PlanResponse).lifecycleStatus).toBe("in_progress");
-
-    const evidenceResponse = await request.post("/api/evidence", {
-      data: {
-        projectId: project.id,
-        nodeId: null,
-        planItemId: plan.id,
-        sourceType: "playwright",
-        sourcePath: "tests/e2e/agent-orchestration-delivery.spec.ts",
-        command: "npx playwright test tests/e2e/agent-orchestration-delivery.spec.ts --project=chromium",
-        resultStatus: "pass",
-        summary: "Real Chrome controlled delivery lifecycle evidence",
-        acceptanceCriterionKey: "orchestration-delivery-lifecycle",
-        actorRole: "builder",
-        agentId: "builder-e2e",
-        sessionId: "builder-e2e-session",
-        runId: unique,
-      },
-    });
-    expect(evidenceResponse.ok()).toBeTruthy();
-
-    expect((await (await transition("complete_development", "builder-e2e", { agentId: "builder-e2e", implementationRevision: "e2e-build-1" })).json() as PlanResponse).lifecycleStatus).toBe("pending_audit");
-
-    const auditorEvidenceResponse = await request.post("/api/evidence", {
-      data: {
-        projectId: project.id,
-        nodeId: null,
-        planItemId: plan.id,
-        sourceType: "playwright",
-        sourcePath: "tests/e2e/agent-orchestration-delivery.spec.ts",
-        command: "npx playwright test tests/e2e/agent-orchestration-delivery.spec.ts",
-        resultStatus: "pass",
-        summary: "Independent auditor identity evidence",
-        acceptanceCriterionKey: "orchestration-independent-audit",
-        actorRole: "auditor",
-        agentId: "auditor-e2e",
-        sessionId: "auditor-e2e-session",
-        runId: `${unique}-audit`,
-      },
-    });
-    expect(auditorEvidenceResponse.ok()).toBeTruthy();
-
-    expect((await (await transition("pass_audit", "auditor-e2e", { agentId: "auditor-e2e" })).json() as PlanResponse).lifecycleStatus).toBe("pending_manager");
-    expect((await (await transition("approve_acceptance", "manager-e2e")).json() as PlanResponse).lifecycleStatus).toBe("accepted");
-
-    const auditResponse = await request.get(`/api/audit?projectId=${project.id}&correlationId=${correlationId}&offset=0&limit=100`);
-    expect(auditResponse.ok()).toBeTruthy();
-    const audit = await auditResponse.json() as { items: Array<{ action: string; entityType: string; sessionId?: string }> };
-    expect(audit.items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ action: "submit_plan", entityType: "plan", sessionId: "designer-e2e-session" }),
-      expect.objectContaining({ action: "approve_plan", entityType: "plan", sessionId: "manager-e2e-session" }),
-      expect.objectContaining({ action: "create", entityType: "evidence", sessionId: "builder-e2e-session" }),
-      expect.objectContaining({ action: "complete_development", entityType: "plan", sessionId: "builder-e2e-session" }),
-      expect.objectContaining({ action: "pass_audit", entityType: "plan", sessionId: "auditor-e2e-session" }),
-      expect.objectContaining({ action: "approve_acceptance", entityType: "plan", sessionId: "manager-e2e-session" }),
-    ]));
   } finally {
-    const deleted = await request.delete(`/api/projects/${project.id}`);
-    expect(deleted.ok()).toBeTruthy();
+    const cleanup = await Promise.allSettled(projects.map(async (project) => expect((await request.delete(`/api/projects/${project.id}`)).ok()).toBe(true)));
+    const failed = cleanup.filter((item) => item.status === "rejected"); expect(failed).toEqual([]);
   }
 });
 
-test("same-node higher-layer work stays out of every queue, rejects task packages, and shows its lock reason", async ({ page, request }) => {
+test("authenticated scripted delivery preserves one correlation timeline through independent acceptance", async () => {
+  const fixture = await createGovernedProject("Authenticated scripted delivery fixture");
+  try {
+    const design = await fixture.setupDesign();
+    const accepted = await fixture.deliver(design); expect(accepted.lifecycleStatus).toBe("accepted");
+    const audit = await fixture.http("GET", `/api/audit?projectId=${fixture.project.id}&correlationId=${fixture.correlationId}&offset=0&limit=100`);
+    expect(audit.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: "submit_plan", entityType: "plan", sessionId: "synthetic-designer-session" }),
+      expect.objectContaining({ action: "approve_plan", entityType: "plan", sessionId: "Main Agent-session" }),
+      expect.objectContaining({ action: "create", entityType: "evidence", sessionId: "synthetic-builder-session" }),
+      expect.objectContaining({ action: "complete_development", entityType: "plan", sessionId: "synthetic-builder-session" }),
+      expect.objectContaining({ action: "pass_audit", entityType: "plan", sessionId: "synthetic-auditor-session" }),
+      expect.objectContaining({ action: "approve_acceptance", entityType: "plan", sessionId: "Main Agent-session" }),
+    ]));
+    const workflow = await fixture.workflow(); expect(workflow.nodes.find((node: { nodeId: string }) => node.nodeId === design.nodeId).acceptanceStatus).toBe("已通过");
+  } finally { await fixture.close(); }
+});
+
+test("same-node higher-layer design can advance while development stays locked and shows its dependency", async ({ page, request }) => {
+  const governed = await createGovernedProject("Authenticated layer gate fixture");
+  try { await governed.assertDependentLayerLocked(await governed.setupDesign(true)); }
+  finally { await governed.close(); }
+
   const unique = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
   const projectResponse = await request.post("/api/projects", { data: {
     code: `LAYER-${unique}`.slice(0, 64), name: `Layer gate ${unique}`, summary: "逐层门禁回归",
@@ -366,10 +252,14 @@ test("same-node higher-layer work stays out of every queue, rejects task package
     const orchestrationResponse = await request.get(`/api/projects/${project.id}/agent-orchestration`);
     const orchestration = await orchestrationResponse.json() as AgentOrchestrationResponse;
     expect(orchestration.workflow.layerGate).toMatchObject({ activeLayer: 1, totalLayers: 2, lockedPlanCount: 1 });
-    expect(Object.values(orchestration.queues).flat().some((item) => item.planItemId === higher.id)).toBe(false);
+    // Design preparation does not wait for upstream implementation acceptance.
+    // The implementation dependency remains locked (see DEPENDENCY_STAGE_DEADLOCK_FIX.md).
+    const higherTasks = Object.values(orchestration.queues).flat().filter((item) => item.planItemId === higher.id);
+    expect(higherTasks).toEqual([expect.objectContaining({ queue: "design", actionCode: "submit_plan" })]);
     const blockedPackage = await request.get(`/api/projects/${project.id}/agent-task-package?queue=development&taskId=${encodeURIComponent(`development:${higher.id}`)}`);
     expect(blockedPackage.status()).toBe(409);
-    expect(await blockedPackage.json()).toMatchObject({ code: "PLAN_LAYER_LOCKED" });
+    // Public task-package access also requires a claimed work order; do not bypass it.
+    expect(await blockedPackage.json()).toMatchObject({ code: "TASK_CLAIM_REQUIRED" });
     const unchanged = await (await request.get(`/api/plans/${higher.id}`)).json() as PlanResponse;
     expect(unchanged.lifecycleStatus).toBe("draft");
 
@@ -377,7 +267,7 @@ test("same-node higher-layer work stays out of every queue, rejects task package
     await page.goto(`/#/projects/${project.id}?tab=plans`, { waitUntil: "domcontentloaded" });
     const row = page.locator("table.table tbody tr", { hasText: "同节点第二层" });
     await expect(row).toContainText("第 2 层");
-    await expect(row).toContainText("当前必须先完成并验收第 1 层的全部任务");
+    await expect(row).toContainText("必须先完成并验收依赖任务：同节点第一层");
     await page.screenshot({ path: "artifacts/regression/plan-layer-lock-chrome.png", fullPage: true });
   } finally {
     expect((await request.delete(`/api/projects/${project.id}`)).ok()).toBeTruthy();

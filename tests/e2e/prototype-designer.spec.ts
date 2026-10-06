@@ -266,6 +266,9 @@ test("numeric fields reject empty commits, preserve the model and still accept z
   await selectLayer(designer, "12 个设计节点");
   const card = canvas.locator(".prototype-component", { hasText: "12 个设计节点" });
   const borderWidth = designer.getByLabel("边框宽");
+  // Wait for the target inspector and card value after selection settles.
+  await expect(borderWidth).toHaveValue("1");
+  await expect(designer.getByLabel("内容 / 替代文本")).toHaveValue(/12 个设计节点/);
   await borderWidth.fill("0");
   await borderWidth.press("Enter");
   await expect(borderWidth).toHaveValue("0");
@@ -288,6 +291,46 @@ test("numeric fields reject empty commits, preserve the model and still accept z
   await expect(opacity).toHaveValue("1");
   await expect(opacity).toHaveAttribute("aria-invalid", "false");
   await expect(card).toHaveCSS("opacity", "1");
+});
+
+test("changing the selected component clears validation errors even when values match", async ({ page }) => {
+  const designer = await openDesigner(page);
+  await selectLayer(designer, "让交付状态一眼可见");
+  await expect(designer.getByLabel("内容 / 替代文本")).toHaveValue("让交付状态一眼可见");
+  const opacity = designer.getByLabel("透明度");
+  await expect(opacity).toHaveValue("1");
+  await opacity.fill("");
+  await opacity.press("Enter");
+  await expect(opacity).toHaveValue("1");
+  await expect(opacity).toHaveAttribute("aria-invalid", "true");
+
+  const cardLayer = await selectLayer(designer, "12 个设计节点");
+  await expect(cardLayer).toHaveClass(/active/);
+  await expect(designer.getByLabel("内容 / 替代文本")).toHaveValue(/12 个设计节点/);
+  await expect(opacity).toHaveValue("1");
+  await expect(opacity).toHaveAttribute("aria-invalid", "false");
+  await expect(opacity).toHaveAttribute("title", "");
+  await expect(designer.getByText("请输入数值")).toHaveCount(0);
+  await expect(designer.locator(".prototype-component", { hasText: "12 个设计节点" })).toHaveCSS("opacity", "1");
+});
+
+test("changing pages clears validation errors even when canvas dimensions match", async ({ page }) => {
+  const designer = await openDesigner(page);
+  await expect(designer.getByLabel("页面名称")).toHaveValue("运营总览");
+  const width = designer.getByLabel("画板宽");
+  await expect(width).toHaveValue("800");
+  await width.fill("");
+  await width.press("Enter");
+  await expect(width).toHaveValue("800");
+  await expect(width).toHaveAttribute("aria-invalid", "true");
+
+  await designer.locator(".prototype-screens").getByRole("button", { name: /项目详情/ }).click();
+  await expect(designer.getByLabel("页面名称")).toHaveValue("项目详情");
+  await expect(designer.locator(".prototype-layer.active")).toHaveCount(0);
+  await expect(width).toHaveValue("800");
+  await expect(width).toHaveAttribute("aria-invalid", "false");
+  await expect(width).toHaveAttribute("title", "");
+  await expect(designer.getByText("请输入数值")).toHaveCount(0);
 });
 
 test("pending properties commit before gestures and keyboard history continues on the canvas", async ({ page }) => {

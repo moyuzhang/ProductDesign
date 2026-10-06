@@ -12,7 +12,7 @@ import { claimTaskPackage } from "./claimTaskPackage.js";
 import { z } from "zod";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { timingSafeEqual, createHash, randomUUID } from "node:crypto";
-import { mkdirSync, statSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, statSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import sharp from "sharp";
 import {
@@ -71,7 +71,7 @@ import {
   nodeDatabaseBindingPatchSchema,
 } from "../shared/databaseSchemas.js";
 import { collectGitEvidence } from "./collectors.js";
-import { createBackupFile, loadBackupFile, storageRetentionSummary } from "./backups.js";
+import { createBackupFile, createRestoreProtectionFile, loadBackupFile, prepareRestoreProtection, storageRetentionSummary } from "./backups.js";
 import { ProjectRepositoryError, PrototypeDraftConflictError, PrototypeDraftCorruptError, FreeformDraftConflictError, FreeformDocumentCorruptError, FreeformAssetRejectedError, Store, nowIso } from "./db.js";
 import {
   type ServiceResult,
@@ -108,6 +108,7 @@ import {
 import { DISPLAY_TIME_ZONE, formatInstantAsShanghaiIso } from "../shared/time.js";
 import { validateDiagramDeliveryTransition, validateDocumentNodeBinding, validateDocumentReferenceTarget } from "./domain.js";
 import {
+  beginRestoreProjectFiles,
   ensureManagedProjectDirectory,
   materializeProjectDocument,
   materializeProjectJson,
@@ -1690,9 +1691,13 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
       leaseToken: z.string().trim().max(300).optional(),
       idempotencyKey: z.string().trim().max(300).optional(),
       reason: z.string().max(4000).optional(),
+      documentRevisionId: z.string().trim().max(300).optional(),
       implementationRevision: z.string().max(200).optional(),
       evidenceId: z.string().trim().max(300).optional(),
       testCommand: z.string().max(2000).optional(),
+      verdict: z.enum(["pass", "fail"]).optional(),
+      reworkConditions: z.string().max(4000).optional(),
+      authSessionToken: z.string().min(32).max(300).optional(),
       repairDisposition: z.enum(["reset", "design_change"]).optional(),
       correlationId: z.string().max(300).optional(),
       clientId: z.string().max(300).optional(),
@@ -1738,6 +1743,12 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
           evidenceId: body.evidenceId,
           testCommand: body.testCommand,
           implementationRevision: body.implementationRevision,
+          documentRevisionId: body.documentRevisionId,
+          verdict: body.verdict, reworkConditions: body.reworkConditions,
+          workOrderId: body.workOrderId, taskKey: body.taskKey, taskRevision: body.taskRevision,
+          workerId: body.workerId, role: body.role, authSessionToken: body.authSessionToken,
+          policyAckToken: body.policyAckToken, nonceId: body.nonceId,
+          bodyDigest: body.bodyDigest, connectionId: body.connectionId,
         }, { actor: body.actor, source: "web", clientId: body.clientId, sessionId: body.sessionId, model: body.model });
         return next;
       }).immediate();
@@ -2856,7 +2867,9 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     const { id } = request.params as { id: string };
     const backup = store.listBackups().find((item) => item.id === id);
     if (!backup) return reply.code(404).send({ message: "备份记录不存在" });
-    const body = parse(z.object({ confirmation: z.string(), actor: z.string().max(100).optional() }), request.body ?? {});
+    const body = parse(z.object({ confirmation: z.string(), actor: z.string().max(100).optional(),
+      protectionConfirmation: z.object({ sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/), targetFingerprint: z.string().regex(/^[a-f0-9]{64}$/), acknowledgement: z.literal("PARTIAL_PROTECTION_IS_NOT_RESTORABLE") }).optional(),
+    }), request.body ?? {});
     if (body.confirmation !== `RESTORE ${id}`) throw httpError(409, `恢复前必须输入 RESTORE ${id}`);
     let snapshot: unknown;
     try {
@@ -2864,12 +2877,51 @@ export function registerApi(app: FastifyInstance, options: ApiOptions): void {
     } catch (restoreError) {
       throw httpError(400, restoreError instanceof Error ? restoreError.message : String(restoreError));
     }
-    createBackupFile(store, dataDir, `恢复前自动备份 ${nowIso().slice(0, 19)}`, `恢复备份 ${backup.label} 前的安全快照`);
-    const restored = store.restoreBusinessSnapshot(snapshot);
-    audit(store, body, {
-      projectId: null, entityType: "backup", entityId: id,
-      action: "restore", before: null, after: { label: backup.label, restored },
-    });
-    return { ok: true, backup, restored };
+    let protectionPath: string | undefined;
+    let stagedAssetDirectory: string | undefined;
+    let committed = false;
+    let projectFiles: ReturnType<typeof beginRestoreProjectFiles> | undefined;
+    try {
+      // Hold the write reservation from fresh capture through protection registration and restore.
+      const outcome = store.db.transaction(() => {
+        let protection: ReturnType<typeof prepareRestoreProtection>;
+        try { protection = prepareRestoreProtection(store, id, snapshot); }
+        catch (error) { throw httpError(400, error instanceof Error ? error.message : String(error)); }
+        const supplied = body.protectionConfirmation;
+        const matches = supplied?.sourceFingerprint === protection.challenge.sourceFingerprint
+          && supplied?.targetFingerprint === protection.challenge.targetFingerprint;
+        if ((supplied && !matches) || (protection.challenge.issues.length && !matches)) {
+          return { statusCode: 409, payload: { code: "BACKUP_PROTECTION_CONFIRMATION_REQUIRED",
+            message: supplied ? "当前资料或目标备份已变化，请重新核对后确认。" : "当前素材缺失或损坏，只能保全部分资料；恢复后不能用这份保护快照一键回退。请核对缺损并再次确认。",
+            protection: protection.challenge } };
+        }
+        const { path: _protectionPath, ...protectionBackup } = createRestoreProtectionFile(store, dataDir, protection.snapshot, backup.label);
+        protectionPath = _protectionPath;
+        projectFiles = beginRestoreProjectFiles(store, dataDir);
+        const restored = store.restoreBusinessSnapshot(snapshot, (path) => { stagedAssetDirectory = path; });
+        projectFiles.apply();
+        audit(store, body, {
+          projectId: null, entityType: "backup", entityId: id,
+          action: "restore", before: null, after: { label: backup.label, restored, protectionBackupId: protectionBackup.id, partialProtection: protection.challenge.issues.length > 0 },
+        });
+        return { statusCode: 200, payload: { ok: true, backup, restored, protectionBackup, partialProtection: protection.challenge.issues.length > 0 } };
+      }).immediate();
+      committed = true;
+      const warnings: string[] = [];
+      try { projectFiles?.finish(); }
+      catch (archiveError) {
+        warnings.push(`业务数据及项目文件已恢复；恢复前文件保护归档整理失败，原件仍保留在 ${projectFiles?.stagingPath}。请检查后整理归档：${archiveError instanceof Error ? archiveError.message : String(archiveError)}`);
+      }
+      return reply.code(outcome.statusCode).send({ ...outcome.payload, ...(warnings.length ? { warnings } : {}) });
+    } catch (error) {
+      if (!committed) {
+        const failures: unknown[] = [];
+        try { projectFiles?.rollback(); } catch (cleanupError) { failures.push(cleanupError); }
+        try { if (protectionPath) rmSync(protectionPath, { force: true }); } catch (cleanupError) { failures.push(cleanupError); }
+        try { if (stagedAssetDirectory) rmSync(stagedAssetDirectory, { recursive: true, force: true }); } catch (cleanupError) { failures.push(cleanupError); }
+        if (failures.length) throw new AggregateError([error, ...failures], "恢复失败且文件回滚清理失败；请检查保留的恢复归档");
+      }
+      throw error;
+    }
   });
 }

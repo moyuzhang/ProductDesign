@@ -1,11 +1,12 @@
 import path from "node:path";
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./historical-fixtures";
 
-test.use({ channel: "chrome", viewport: { width: 1600, height: 1000 } });
+test.use({ launchOptions: { executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH }, viewport: { width: 1600, height: 1000 } });
 
 const diagramId = "f362be99-5733-490d-af8e-b6fb82f70a0f";
 
-test("renders intelligent routes and exposes precise edge controls", async ({ page }) => {
+test("renders intelligent routes and exposes precise edge controls", async ({ page, historicalProject }) => {
+  const { diagramId } = historicalProject;
   const consoleErrors: string[] = [];
   page.on("console", (message) => {
     const sourceUrl = message.location().url;

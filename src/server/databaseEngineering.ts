@@ -85,7 +85,7 @@ function connectionPort(connection: DatabaseConnectionInput): number {
 
 export function databaseConnectionLabel(connection: DatabaseConnectionInput): string {
   if (connection.dialect === "sqlite") return `SQLite · ${resolve(connection.filePath ?? "")}`;
-  return `${connection.dialect === "mysql" ? "MySQL" : "PostgreSQL"} · ${connection.host}:${connectionPort(connection)}/${connection.database}`;
+  return `${connection.dialect === "mysql" ? "MySQL" : "PostgreSQL"} · ${connection.host}:${connectionPort(connection)}/${connection.database}${connection.dialect === "postgresql" ? `.${connection.schema || "public"}` : ""}`;
 }
 
 async function inspectSqlite(connection: DatabaseConnectionInput, allowMissing: boolean): Promise<DatabaseSchemaSnapshot> {
@@ -156,7 +156,7 @@ async function inspectMysql(connection: DatabaseConnectionInput): Promise<Databa
     }
     const tables: DatabaseTable[] = tableRows.map((entry, index) => {
       const rows = columnRows.filter((row) => row.tableName === entry.tableName);
-      const uniqueColumns = new Set(Array.from(groupedIndexes.values()).filter((items) => items.length === 1 && Number(items[0].nonUnique) === 0).map((items) => String(items[0].columnName)));
+      const uniqueColumns = new Set(Array.from(groupedIndexes.values()).filter((items) => items[0].tableName === entry.tableName && items.length === 1 && Number(items[0].nonUnique) === 0).map((items) => String(items[0].columnName)));
       const fields = rows.map((row) => ({
         id: id(), name: String(row.columnName), ...typeDetails(String(row.columnType), row.charLength, row.numericPrecision, row.numericScale),
         nullable: row.isNullable === "YES", primaryKey: row.columnKey === "PRI", autoIncrement: String(row.extra).includes("auto_increment"),
@@ -196,13 +196,13 @@ async function inspectPostgresql(connection: DatabaseConnectionInput): Promise<D
   try {
     const tableRows = (await client.query("SELECT c.relname AS \"tableName\", COALESCE(obj_description(c.oid, 'pg_class'), '') AS \"tableComment\" FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','p') AND n.nspname = $1 ORDER BY c.relname", [schema])).rows as Array<Record<string, unknown>>;
     const columnRows = (await client.query("SELECT c.table_name AS \"tableName\", c.column_name AS \"columnName\", c.data_type AS \"dataType\", c.udt_name AS \"udtName\", c.is_nullable AS \"isNullable\", c.column_default AS \"columnDefault\", c.character_maximum_length AS \"charLength\", c.numeric_precision AS \"numericPrecision\", c.numeric_scale AS \"numericScale\", c.is_identity AS \"isIdentity\", COALESCE(pgd.description, '') AS \"columnComment\" FROM information_schema.columns c JOIN pg_catalog.pg_class pc ON pc.relname = c.table_name JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace AND pn.nspname = c.table_schema JOIN pg_catalog.pg_attribute pa ON pa.attrelid = pc.oid AND pa.attname = c.column_name LEFT JOIN pg_catalog.pg_description pgd ON pgd.objoid = pc.oid AND pgd.objsubid = pa.attnum WHERE c.table_schema = $1 ORDER BY c.table_name, c.ordinal_position", [schema])).rows as Array<Record<string, unknown>>;
-    const primaryRows = (await client.query("SELECT kcu.table_name AS \"tableName\", kcu.column_name AS \"columnName\" FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1", [schema])).rows as Array<Record<string, unknown>>;
-    const indexRows = (await client.query("SELECT t.relname AS \"tableName\", i.relname AS \"indexName\", ix.indisunique AS \"isUnique\", array_agg(a.attname ORDER BY ord.ordinality) AS \"fieldNames\" FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace JOIN pg_index ix ON t.oid = ix.indrelid JOIN pg_class i ON i.oid = ix.indexrelid CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS ord(attnum, ordinality) JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ord.attnum WHERE n.nspname = $1 AND NOT ix.indisprimary GROUP BY t.relname, i.relname, ix.indisunique ORDER BY t.relname, i.relname", [schema])).rows as Array<Record<string, unknown>>;
+    const primaryRows = (await client.query("SELECT kcu.table_name AS \"tableName\", kcu.column_name AS \"columnName\" FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema AND tc.table_name = kcu.table_name WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1", [schema])).rows as Array<Record<string, unknown>>;
+    const indexRows = (await client.query("SELECT t.relname AS \"tableName\", i.relname AS \"indexName\", ix.indisunique AS \"isUnique\", array_agg(a.attname::text ORDER BY ord.ordinality) AS \"fieldNames\" FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace JOIN pg_index ix ON t.oid = ix.indrelid JOIN pg_class i ON i.oid = ix.indexrelid CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS ord(attnum, ordinality) JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ord.attnum WHERE n.nspname = $1 AND NOT ix.indisprimary GROUP BY t.relname, i.relname, ix.indisunique ORDER BY t.relname, i.relname", [schema])).rows as Array<Record<string, unknown>>;
     const foreignRows = (await client.query("SELECT src.relname AS \"sourceTable\", sa.attname AS \"sourceColumn\", tgt.relname AS \"targetTable\", ta.attname AS \"targetColumn\", con.conname AS \"constraintName\", CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END AS \"deleteRule\" FROM pg_constraint con JOIN pg_class src ON src.oid = con.conrelid JOIN pg_namespace ns ON ns.oid = src.relnamespace JOIN pg_class tgt ON tgt.oid = con.confrelid CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS sk(attnum, ord) JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS tk(attnum, ord) ON tk.ord = sk.ord JOIN pg_attribute sa ON sa.attrelid = src.oid AND sa.attnum = sk.attnum JOIN pg_attribute ta ON ta.attrelid = tgt.oid AND ta.attnum = tk.attnum WHERE con.contype = 'f' AND ns.nspname = $1 ORDER BY src.relname, con.conname, sk.ord", [schema])).rows as Array<Record<string, unknown>>;
     const primary = new Set(primaryRows.map((row) => `${row.tableName}\0${row.columnName}`));
     const tables: DatabaseTable[] = tableRows.map((entry, index) => {
       const rows = columnRows.filter((row) => row.tableName === entry.tableName);
-      const uniqueColumns = new Set(indexRows.filter((row) => row.isUnique && Array.isArray(row.fieldNames) && row.fieldNames.length === 1).map((row) => String((row.fieldNames as unknown[])[0])));
+      const uniqueColumns = new Set(indexRows.filter((row) => row.tableName === entry.tableName && row.isUnique && Array.isArray(row.fieldNames) && row.fieldNames.length === 1).map((row) => String((row.fieldNames as unknown[])[0])));
       const fields = rows.map((row) => {
         const nativeType = String(row.dataType === "USER-DEFINED" ? row.udtName : row.dataType);
         const defaultValue = String(row.columnDefault ?? "");
@@ -339,8 +339,9 @@ export async function previewDatabaseDeploy(model: DatabaseModel, connection: Da
   const actual = await inspectDatabase(connection, true);
   const changes = diffDatabaseSchemas(model, actual);
   const actualNames = new Set(actual.tables.map((table) => table.name.toLowerCase()));
+  const desiredNames = new Set(model.tables.map((table) => table.name.toLowerCase()));
   const missingNames = new Set(model.tables.filter((table) => !actualNames.has(table.name.toLowerCase())).map((table) => table.name.toLowerCase()));
-  const blockingReasons = changes.filter((change) => change.objectKind !== "table" && change.kind !== "add" && actualNames.has(change.path.split(".")[0].toLowerCase())).map((change) => `${change.path}: ${change.detail}`);
+  const blockingReasons = changes.filter((change) => change.objectKind !== "table" && change.kind !== "add" && actualNames.has(change.path.split(".")[0].toLowerCase()) && desiredNames.has(change.path.split(".")[0].toLowerCase())).map((change) => `${change.path}: ${change.detail}`);
   for (const table of model.tables) {
     if (!actualNames.has(table.name.toLowerCase())) continue;
     const tableChanges = changes.filter((change) => change.path === table.name || change.path.startsWith(`${table.name}.`) || change.path.startsWith(`${table.name.toLowerCase()}.`));
@@ -351,37 +352,68 @@ export async function previewDatabaseDeploy(model: DatabaseModel, connection: Da
   return { target: databaseConnectionLabel(connection), ddl, statements, changes, createTableCount: missingNames.size, canApply: blockingReasons.length === 0, blockingReasons };
 }
 
-async function executeStatements(connection: DatabaseConnectionInput, statements: string[]): Promise<void> {
+async function closeExecutionClient(client: { end(): Promise<void> }, failure?: { error: unknown }): Promise<string[]> {
+  try { await client.end(); }
+  catch (closeError) {
+    const closeMessage = closeError instanceof Error ? closeError.message : String(closeError);
+    if (failure) {
+      const message = failure.error instanceof Error ? failure.error.message : String(failure.error);
+      throw new AggregateError([failure.error, closeError], `${message}；关闭数据库连接也失败：${closeMessage}`);
+    }
+    // COMMIT already succeeded: closing cannot turn the completed DDL into a failed deployment.
+    return [`DDL 已提交成功，但关闭数据库连接失败，请检查连接资源：${closeMessage}`];
+  }
+  if (failure) throw failure.error;
+  return [];
+}
+
+async function executeStatements(connection: DatabaseConnectionInput, statements: string[]): Promise<string[]> {
   if (connection.dialect === "sqlite") {
     const db = new Database(resolve(connection.filePath ?? ""));
     try {
       db.pragma("foreign_keys = ON");
       db.transaction(() => { for (const statement of statements) db.exec(statement); })();
     } finally { db.close(); }
-    return;
+    return [];
   }
   if (connection.dialect === "mysql") {
     const client = await createConnection({ host: connection.host, port: connectionPort(connection), user: connection.username, password: connection.password, database: connection.database, ssl: connection.ssl ? {} : undefined, connectTimeout: 7000 });
+    let confirmedStatements = 0;
+    let failure: { error: unknown } | undefined;
     try {
       await client.beginTransaction();
-      for (const statement of statements) await client.query(statement);
+      for (const statement of statements) { await client.query(statement); confirmedStatements += 1; }
       await client.commit();
-    } catch (cause) { await client.rollback(); throw cause; } finally { await client.end(); }
-    return;
+    } catch (cause) {
+      let rollbackFailure = "";
+      try { await client.rollback(); } catch (rollbackError) { rollbackFailure = `；ROLLBACK 也失败：${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`; }
+      failure = { error: new Error(`MySQL DDL 可能已部分提交，ROLLBACK 不能撤销已执行的 DDL；已收到 ${confirmedStatements} 条语句成功响应，请重新读取目标结构确认实际状态：${cause instanceof Error ? cause.message : String(cause)}${rollbackFailure}`, { cause }) };
+    }
+    return closeExecutionClient(client, failure);
   }
   const client = new Client({ host: connection.host, port: connectionPort(connection), database: connection.database, user: connection.username, password: connection.password, ssl: connection.ssl ? {} : undefined, connectionTimeoutMillis: 7000 });
   await client.connect();
+  let failure: { error: unknown } | undefined;
   try {
     await client.query("BEGIN");
+    const schema = connection.schema || "public";
+    await client.query("SELECT set_config('search_path', quote_ident($1), true)", [schema]);
+    const selected = await client.query("SELECT current_schema() AS schema");
+    if (selected.rows[0]?.schema !== schema) throw new Error(`目标 schema 不存在或不可访问：${schema}`);
     for (const statement of statements) await client.query(statement);
     await client.query("COMMIT");
-  } catch (cause) { await client.query("ROLLBACK"); throw cause; } finally { await client.end(); }
+  } catch (cause) {
+    failure = { error: cause };
+    try { await client.query("ROLLBACK"); }
+    catch (rollbackError) { failure = { error: new AggregateError([cause, rollbackError], `部署失败且 ROLLBACK 失败，请重新读取目标结构：${cause instanceof Error ? cause.message : String(cause)}`) }; }
+  }
+  return closeExecutionClient(client, failure);
 }
 
 export async function deployDatabaseModel(model: DatabaseModel, connection: DatabaseConnectionInput): Promise<DatabaseDeployResult> {
   const preview = await previewDatabaseDeploy(model, connection);
   if (!preview.canApply) throw new Error(`目标数据库存在结构冲突：${preview.blockingReasons.join("；")}`);
   if (!preview.statements.length) throw new Error("目标数据库已经包含当前模型，没有需要执行的建表语句");
-  await executeStatements(connection, preview.statements);
-  return { ok: true, target: preview.target, executedStatements: preview.statements.length, executedAt: new Date().toISOString() };
+  const warnings = await executeStatements(connection, preview.statements);
+  return { ok: true, target: preview.target, executedStatements: preview.statements.length, executedAt: new Date().toISOString(), ...(warnings.length ? { warnings } : {}) };
 }

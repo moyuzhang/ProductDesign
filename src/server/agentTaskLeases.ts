@@ -1498,8 +1498,23 @@ function claimSingleAgentTask(
     }
     if (!task) throw new AgentTaskLeaseError(404, "TASK_NOT_FOUND", "任务不存在、已离开执行队列、无空闲并发槽位或选择器不一致");
     if (store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_child_task_dispatches'").get()) {
-      const parent = store.db.prepare("SELECT 1 FROM agent_coordination_leases WHERE project_id=? AND status IN ('active','paused') AND lease_expires_at > ? LIMIT 1")
-        .get(input.projectId, new Date().toISOString());
+      const coordinatingWorker = store.db.prepare(`SELECT target_plan_id, main_agent_id FROM agent_coordination_leases
+        WHERE project_id=? AND lower(trim(worker_id))=lower(trim(?))
+          AND status IN ('active','paused') AND lease_expires_at>? LIMIT 1`)
+        .get(input.projectId, workerId, new Date().toISOString()) as { target_plan_id: string; main_agent_id: string } | undefined;
+      // The Main Agent may take its own plan's Approver work order, as before.
+      // Every child/unrelated approval must use a separate runner slot, or its
+      // registration/completion could overwrite another parent's liveness.
+      if (coordinatingWorker && !(input.role === "approver" && task.planItemId
+        && task.planItemId === coordinatingWorker.target_plan_id && input.agentId === coordinatingWorker.main_agent_id)) {
+        throw new AgentTaskLeaseError(409, "COORDINATION_RUNNER_BUSY", "该 Worker 正在协调其他任务；子任务和其他计划审批必须使用独立 Worker");
+      }
+      // Plan parents own only their selected plan. No-plan coordination and
+      // no-plan design tasks remain project-exclusive for compatibility.
+      const parent = store.db.prepare(`SELECT 1 FROM agent_coordination_leases
+        WHERE project_id=? AND status IN ('active','paused') AND lease_expires_at > ?
+          AND (target_plan_id='' OR target_plan_id=? OR ?='') LIMIT 1`)
+        .get(input.projectId, new Date().toISOString(), task.planItemId || "", task.planItemId || "");
       if (parent && ["designer", "builder", "auditor"].includes(input.role) && !input.coordinationDispatchId) {
         throw new AgentTaskLeaseError(409, "COORDINATION_DISPATCH_REQUIRED", "当前项目由 Main Agent 中央调度；子 Agent 禁止自行领取任务");
       }
@@ -2026,28 +2041,83 @@ export function assertAgentTaskLeaseForWrite(store: Store, input: {
   return mapLease(row);
 }
 
+type PlanActionSubmission = Partial<Omit<CompleteInput, "leaseToken">> & { action: string };
+
+/** Validate the supplied artifact itself, not another qualifying artifact in the plan. */
+function assertPlanActionSubmission(store: Store, lease: AgentTaskLease, input: PlanActionSubmission): void {
+  if (!isAgentSecurityEnforced(store, lease.agentId)) return;
+  if (!["submit_plan", "complete_development", "submit_evidence_repair", "pass_design_audit", "fail_design_audit", "pass_audit", "fail_audit"].includes(input.action)) return;
+  const planId = lease.taskId.slice(lease.taskId.indexOf(":") + 1);
+  const plan = store.getPlan(planId);
+  const mismatch = () => new AgentTaskLeaseError(409, "WORK_ORDER_SUBMISSION_MISMATCH", "提交的修订、证据、命令或审计结论与当前计划、角色及流转结果不一致");
+  if (!plan || plan.projectId !== lease.projectId) throw mismatch();
+
+  // Missing fields still fail the existing required-submission gate below. Do
+  // not infer them from the plan, a different evidence record, or the action.
+  if (input.action === "submit_plan" && input.documentRevisionId?.trim()) {
+    const revision = store.getDocumentRevision(input.documentRevisionId);
+    const document = revision ? store.getDesignDoc(revision.documentId) : undefined;
+    if (lease.role !== "designer" || !revision || revision.projectId !== plan.projectId
+      || document?.currentRevisionId !== revision.id || revision.status === "已废弃"
+      || !plan.designRevisionIds.includes(revision.id) || plan.lifecycleStatus !== "pending_approval") throw mismatch();
+  }
+  if (["complete_development", "submit_evidence_repair"].includes(input.action)
+    && input.evidenceId?.trim() && input.testCommand?.trim() && input.implementationRevision?.trim()) {
+    const evidence = store.getEvidence(input.evidenceId);
+    if (lease.role !== "builder" || !evidence || evidence.command !== input.testCommand
+      || normalizeAgentId(evidence.agentId) !== normalizeAgentId(lease.agentId)
+      || input.implementationRevision.trim() !== plan.implementationRevision
+      || plan.lifecycleStatus !== "pending_audit"
+      || !matchesImplementationEvidencePolicy(evidence, plan, { actorRole: "builder" })) throw mismatch();
+  }
+  if (["pass_design_audit", "fail_design_audit", "pass_audit", "fail_audit"].includes(input.action)
+    && input.evidenceId?.trim() && input.verdict) {
+    const evidence = store.getEvidence(input.evidenceId);
+    const design = input.action.endsWith("design_audit");
+    const verdict = input.action.startsWith("pass_") ? "pass" : "fail";
+    const status = verdict === "pass" ? "passed" : "failed";
+    const lifecycleStatus = design ? verdict === "pass" ? "pending_approval" : "rework"
+      : verdict === "pass" ? "pending_manager" : "audit_failed";
+    if (lease.role !== "auditor" || lease.actionCode !== (design ? "audit_design" : "audit_completed_plan")
+      || !evidence || evidence.status !== "active" || evidence.projectId !== plan.projectId
+      || evidence.planItemId !== plan.id || evidence.nodeId !== plan.diagramNodeId
+      || evidence.actorRole !== "auditor" || normalizeAgentId(evidence.agentId) !== normalizeAgentId(lease.agentId)
+      || normalizeAgentId(evidence.agentId) !== normalizeAgentId(plan.roleAssignments.auditor.agentId)
+      || evidence.details.auditScope !== (design ? "design" : "implementation")
+      || input.verdict !== verdict || evidence.resultStatus !== verdict
+      || plan.auditStatus !== status || plan.lifecycleStatus !== lifecycleStatus
+      || (design ? !evidence.documentRevisionId || !plan.designRevisionIds.includes(evidence.documentRevisionId)
+        || (input.documentRevisionId !== undefined && input.documentRevisionId !== evidence.documentRevisionId)
+        : !matchesImplementationEvidencePolicy(evidence, plan, { actorRole: "auditor", resultStatus: verdict })
+          || (input.implementationRevision !== undefined && input.implementationRevision.trim() !== plan.implementationRevision))) throw mismatch();
+  }
+}
+
 export function advanceAgentTaskLeaseForPlanAction(
   store: Store,
   lease: AgentTaskLease | null,
-  input: { action: string; agentId?: string; idempotencyKey?: string; resultDigest?: string;
-    evidenceId?: string; testCommand?: string; implementationRevision?: string },
+  input: PlanActionSubmission,
   context: AgentTaskLeaseContext = {},
 ): AgentTaskLease | null {
   if (!lease) return null;
   if (!input.idempotencyKey?.trim()) {
     throw new AgentTaskLeaseError(400, "IDEMPOTENCY_KEY_REQUIRED", "Agent 动作必须提供 idempotencyKey");
   }
-  const control = {
+  // Keep the submitted completion/context fields intact. In particular, do not
+  // manufacture a revision, verdict or work-order identity from the lease.
+  const { action, ...submission } = input;
+  const control: CompleteInput = {
+    ...submission,
     leaseToken: lease.leaseToken,
     agentId: input.agentId ?? lease.agentId,
-    idempotencyKey: `${input.idempotencyKey}:${input.action}`,
+    idempotencyKey: `${input.idempotencyKey}:${action}`,
   };
   if (["start_development", "reopen_rework"].includes(input.action)) {
     return startAgentTask(store, control, context);
   }
   if (["submit_plan", "complete_development", "submit_evidence_repair", "pass_design_audit", "fail_design_audit", "pass_audit", "fail_audit", "approve_plan", "reject_plan", "approve_acceptance", "reject_acceptance", "assess_evidence_repair_failure", "reset_evidence_repair_attempt", "accept_node"].includes(input.action)) {
-    return completeAgentTask(store, { ...control, resultDigest: input.resultDigest,
-      evidenceId: input.evidenceId, testCommand: input.testCommand, implementationRevision: input.implementationRevision }, context);
+    assertPlanActionSubmission(store, lease, input);
+    return completeAgentTask(store, control, context);
   }
   return lease;
 }
